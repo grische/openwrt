@@ -41,7 +41,15 @@ Signed-off-by: John Crispin <blogic@openwrt.org>
 
 --- a/arch/mips/lantiq/Kconfig
 +++ b/arch/mips/lantiq/Kconfig
-@@ -52,4 +52,13 @@ config PCI_LANTIQ
+@@ -20,6 +20,7 @@ config SOC_XWAY
+ 	bool "XWAY"
+ 	select SOC_TYPE_XWAY
+ 	select HAVE_PCI
++	select ARCH_SUPPORTS_MSI
+ 	select MFD_SYSCON
+ 	select MFD_CORE
+ 
+@@ -52,4 +53,13 @@ config PCI_LANTIQ
  	bool "PCI Support"
  	depends on SOC_XWAY && PCI
  
