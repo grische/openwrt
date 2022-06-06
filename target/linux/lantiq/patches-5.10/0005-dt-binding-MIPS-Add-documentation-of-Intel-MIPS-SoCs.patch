@@ -1,0 +1,42 @@
+From 6829d8fbb11f17dfa8aae1e5b74d84b6adf0396b Mon Sep 17 00:00:00 2001
+From: Hua Ma <hua.ma@linux.intel.com>
+Date: Fri, 3 Aug 2018 11:02:24 +0800
+Subject: [PATCH 5/8] dt-binding: MIPS: Add documentation of Intel MIPS SoCs
+
+This patch adds binding documentation for the
+compatible values of the Intel MIPS SoCs.
+
+Signed-off-by: Hua Ma <hua.ma@linux.intel.com>
+Signed-off-by: Songjun Wu <songjun.wu@linux.intel.com>
+Reviewed-by: Rob Herring <robh@kernel.org>
+---
+ .../devicetree/bindings/mips/intel.txt          | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/mips/intel.txt
+
+diff --git a/Documentation/devicetree/bindings/mips/intel.txt b/Documentation/devicetree/bindings/mips/intel.txt
+new file mode 100644
+index 000000000000..ac594ef303b7
+--- /dev/null
++++ b/Documentation/devicetree/bindings/mips/intel.txt
+@@ -0,0 +1,17 @@
++Intel MIPS SoC device tree bindings
++
++1, SoCs
++
++Each device tree must specify a compatible value for the Intel SoC
++it uses in the compatible property of the root node. The compatible
++value must be one of the following values:
++
++  intel,xrx500
++
++2, Boards
++
++Each device tree must specify a compatible value for the Intel Board
++it uses in the compatible property of the root node. The compatible
++value must be one of the following values:
++
++  intel,easy350-anywan
+-- 
+2.25.1
+

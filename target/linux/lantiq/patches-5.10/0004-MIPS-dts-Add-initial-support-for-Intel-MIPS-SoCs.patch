@@ -1,0 +1,150 @@
+From 769e5d0f2258607465800ea06febc81d6f35f89d Mon Sep 17 00:00:00 2001
+From: Hua Ma <hua.ma@linux.intel.com>
+Date: Fri, 3 Aug 2018 11:02:23 +0800
+Subject: [PATCH 4/8] MIPS: dts: Add initial support for Intel MIPS SoCs
+
+Add dts files to support Intel MIPS SoCs:
+- xrx500.dtsi is the chip dts
+- easy350_anywan.dts is the board dts
+
+Signed-off-by: Hua Ma <hua.ma@linux.intel.com>
+Signed-off-by: Songjun Wu <songjun.wu@linux.intel.com>
+---
+ arch/mips/boot/dts/Makefile                   |  1 +
+ arch/mips/boot/dts/intel-mips/Makefile        |  4 ++
+ .../boot/dts/intel-mips/easy350_anywan.dts    | 26 ++++++++
+ arch/mips/boot/dts/intel-mips/xrx500.dtsi     | 66 +++++++++++++++++++
+ 4 files changed, 97 insertions(+)
+ create mode 100644 arch/mips/boot/dts/intel-mips/Makefile
+ create mode 100644 arch/mips/boot/dts/intel-mips/easy350_anywan.dts
+ create mode 100644 arch/mips/boot/dts/intel-mips/xrx500.dtsi
+
+diff --git a/arch/mips/boot/dts/Makefile b/arch/mips/boot/dts/Makefile
+index 19027129add8..5ccfef6722ac 100644
+--- a/arch/mips/boot/dts/Makefile
++++ b/arch/mips/boot/dts/Makefile
+@@ -4,6 +4,7 @@ subdir-$(CONFIG_CAVIUM_OCTEON_SOC)	+= cavium-octeon
+ subdir-$(CONFIG_MACH_PISTACHIO)		+= img
+ subdir-$(CONFIG_FIT_IMAGE_FDT_BOSTON)	+= img
+ subdir-$(CONFIG_MACH_INGENIC)		+= ingenic
++subdir-$(CONFIG_INTEL_MIPS)			+= intel-mips
+ subdir-$(CONFIG_LANTIQ)			+= lantiq
+ subdir-$(CONFIG_MACH_LOONGSON64)	+= loongson
+ subdir-$(CONFIG_MSCC_OCELOT)		+= mscc
+diff --git a/arch/mips/boot/dts/intel-mips/Makefile b/arch/mips/boot/dts/intel-mips/Makefile
+new file mode 100644
+index 000000000000..adfaabbbb07c
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0
++dtb-$(CONFIG_DTB_INTEL_MIPS_GRX500)	+= easy350_anywan.dtb
++
++obj-$(CONFIG_BUILTIN_DTB)		+= $(addsuffix .o, $(dtb-y))
+diff --git a/arch/mips/boot/dts/intel-mips/easy350_anywan.dts b/arch/mips/boot/dts/intel-mips/easy350_anywan.dts
+new file mode 100644
+index 000000000000..e5e95f90c5e7
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/easy350_anywan.dts
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-2.0
++/dts-v1/;
++
++#include <dt-bindings/interrupt-controller/mips-gic.h>
++#include <dt-bindings/clock/intel,grx500-clk.h>
++
++#include "xrx500.dtsi"
++
++/ {
++	model = "EASY350 ANYWAN (GRX350) Main model";
++	compatible = "intel,easy350-anywan";
++
++	aliases {
++		serial0 = &asc0;
++	};
++
++	chosen {
++		bootargs = "earlycon=lantiq,0x16600000 clk_ignore_unused";
++		stdout-path = "serial0";
++	};
++
++	memory@20000000 {
++		device_type = "memory";
++		reg = <0x20000000 0x0e000000>;
++	};
++};
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+new file mode 100644
+index 000000000000..54c5f8f8b604
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/ {
++	#address-cells = <1>;
++	#size-cells = <1>;
++	compatible = "intel,xrx500";
++
++	cpus {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		cpu0: cpu@0 {
++			device_type = "cpu";
++			compatible = "mti,interaptiv";
++			clocks = <&cgu CLK_CPU>;
++			reg = <0>;
++		};
++
++		cpu1: cpu@1 {
++			device_type = "cpu";
++			compatible = "mti,interaptiv";
++			reg = <1>;
++		};
++	};
++
++	cpu_intc: interrupt-controller {
++		compatible = "mti,cpu-interrupt-controller";
++
++		interrupt-controller;
++		#interrupt-cells = <1>;
++	};
++
++	gic: gic@12320000 {
++		compatible = "mti,gic";
++		reg = <0x12320000 0x20000>;
++
++		interrupt-controller;
++		#interrupt-cells = <3>;
++		/*
++		 * Declare the interrupt-parent even though the mti,gic
++		 * binding doesn't require it, such that the kernel can
++		 * figure out that cpu_intc is the root interrupt
++		 * controller & should be probed first.
++		 */
++		interrupt-parent = <&cpu_intc>;
++		mti,reserved-ipi-vectors = <56 8>;
++	};
++
++	cgu: cgu@16200000 {
++		compatible = "intel,grx500-cgu", "syscon";
++		reg = <0x16200000 0x200>;
++		#clock-cells = <1>;
++	};
++
++	asc0: serial@16600000 {
++		compatible = "lantiq,asc";
++		reg = <0x16600000 0x100000>;
++
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 103 IRQ_TYPE_LEVEL_HIGH>,
++			<GIC_SHARED 105 IRQ_TYPE_LEVEL_HIGH>,
++			<GIC_SHARED 106 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&cgu CLK_SSX4>, <&cgu GCLK_UART>;
++		clock-names = "freq", "asc";
++	};
++};
+-- 
+2.25.1
+
