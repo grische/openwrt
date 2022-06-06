@@ -10,5 +10,5 @@ DEFAULT_PACKAGES+=kmod-leds-gpio \
 	ppp-mod-pppoa
 
 define Target/Description
-	Lantiq XRX500
+	Intel XRX500
 endef
