@@ -107,6 +107,14 @@ define Device/NAND/xrx200
   FILESYSTEMS += ubifs
 endef
 
+define Device/NAND/xrx500
+  # Values based off MX30LFxGE8AB, needs confirmation
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  SUBPAGESIZE := 2048
+  FILESYSTEMS += ubifs
+endef
+
 define Device/NAND
   $(Device/NAND/$(SUBTARGET))
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
