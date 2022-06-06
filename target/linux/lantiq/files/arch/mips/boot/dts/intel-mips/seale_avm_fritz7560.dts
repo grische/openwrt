@@ -2,6 +2,7 @@
 
 #include "seale_avm_fritz7560.dtsi"
 
+/dts-v1/;
 / {
 	compatible = "avm,fritz7560", "intel,easy350-anywan", "intel,xrx500";
 	model = "AVM FRITZ!Box 7560";
