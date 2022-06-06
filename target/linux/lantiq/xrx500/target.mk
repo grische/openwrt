@@ -10,5 +10,5 @@ DEFAULT_PACKAGES+=kmod-leds-gpio \
 	ppp-mod-pppoa
 
 define Target/Description
-	Intel XRX500
+	Intel GRX500 platform
 endef
