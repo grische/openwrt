@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR MIT
 
-#include <intel-mips/xrx500.dtsi>
+#include "xrx500.dtsi"
 
+/dts-v1/;
 / {
 	compatible = "avm,fritz7560", "intel,easy350-anywan", "intel,xrx500";
 	model = "AVM FRITZ!Box 7560";

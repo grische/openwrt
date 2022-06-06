@@ -72,7 +72,11 @@ endef
 
 DEVICE_VARS += SIGNATURE MAGIC CRC32_POLY LOADER_FLASH_OFFS
 
-DTS_DIR := $(DTS_DIR)/lantiq
+ifeq ($(SUBTARGET),xrx500)
+  DTS_DIR := $(DTS_DIR)/intel-mips
+else
+  DTS_DIR := $(DTS_DIR)/lantiq
+endif
 
 # Shared device definition: applies to every defined device
 define Device/Default
