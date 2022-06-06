@@ -1,5 +1,4 @@
 define Device/avm_fritz7560
-  $(Device/dsa-migration)
   $(Device/AVM)
   $(Device/NAND)
   DEVICE_MODEL := FRITZ!Box 7560
