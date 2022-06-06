@@ -1,0 +1,48 @@
+From 42158bf43cb81311c898c7e72fbb38994362f3da Mon Sep 17 00:00:00 2001
+From: Songjun Wu <songjun.wu@linux.intel.com>
+Date: Fri, 3 Aug 2018 11:02:34 +0800
+Subject: [PATCH 8/8] serial: intel: Support more platform
+
+Support more platform.
+
+Signed-off-by: Songjun Wu <songjun.wu@linux.intel.com>
+---
+ drivers/tty/serial/Kconfig | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/tty/serial/Kconfig b/drivers/tty/serial/Kconfig
+index 28f22e58639c..246fb8717b18 100644
+--- a/drivers/tty/serial/Kconfig
++++ b/drivers/tty/serial/Kconfig
+@@ -623,8 +623,8 @@ config PDC_CONSOLE
+ 	bool "PDC software console support"
+ 	depends on PARISC && !SERIAL_MUX && VT
+ 	help
+-	  Saying Y here will enable the software based PDC console to be 
+-	  used as the system console.  This is useful for machines in 
++	  Saying Y here will enable the software based PDC console to be
++	  used as the system console.  This is useful for machines in
+ 	  which the hardware based console has not been written yet.  The
+ 	  following steps must be completed to use the PDC console:
+ 
+@@ -820,7 +820,7 @@ config SERIAL_CPM
+ 	depends on CPM2 || CPM1
+ 	select SERIAL_CORE
+ 	help
+-	  This driver supports the SCC and SMC serial ports on Motorola 
++	  This driver supports the SCC and SMC serial ports on Motorola
+ 	  embedded PowerPC that contain a CPM1 (8xx) or CPM2 (8xxx)
+ 
+ config SERIAL_CPM_CONSOLE
+@@ -1046,7 +1046,7 @@ config SERIAL_SIFIVE_CONSOLE
+ 
+ config SERIAL_LANTIQ
+ 	tristate "Lantiq serial driver"
+-	depends on (LANTIQ || X86) || COMPILE_TEST
++	depends on (LANTIQ || X86 || INTEL_MIPS) || COMPILE_TEST
+ 	select SERIAL_CORE
+ 	help
+ 	  Support for UART on Lantiq and Intel SoCs.
+-- 
+2.25.1
+

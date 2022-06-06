@@ -1,0 +1,42 @@
+From 38fa21b0189a4bd683e9d94218a5743b35036e01 Mon Sep 17 00:00:00 2001
+From: Songjun Wu <songjun.wu@linux.intel.com>
+Date: Fri, 3 Aug 2018 11:02:29 +0800
+Subject: [PATCH 7/8] MIPS: lantiq: Unselect SWAP_IO_SPACE when LANTIQ is
+ selected
+
+SWAP_IO_SPACE macro prevents serial driver /drivers/tty/serial/lantiq.c
+to use readl/writel to replace ltq_r32/w32 which are SoC or platform
+specific APIs.
+
+readl/writel are used for this serial driver to support multiple
+platforms and multiple architectures. The legacy lantiq platform(Danube)
+enables SWAP_IO_SPACE for supporting PCI due to some hardware bugs.
+
+It's a little-endian bus plus PCI TX/RX swap enable impacted both data
+and control path for MIPS based platforms. But it is better to let PCI
+device driver to do endian swap since SWAP_IO_SPACE is a global wide macro
+which potentially impacts other peripheral like USB.
+ltq_r32/ltq_w32 is not impacted in other device drivers based on MIPS when
+SWAP_IO_SPACE is not selected as they use non-byte swapping OS API
+(__raw_read/__raw_writel).
+
+Signed-off-by: Songjun Wu <songjun.wu@linux.intel.com>
+---
+ arch/mips/Kconfig | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index 7d627c25eba9..28cd768f236a 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -439,7 +439,6 @@ config LANTIQ
+ 	select SYS_SUPPORTS_VPE_LOADER
+ 	select SYS_HAS_EARLY_PRINTK
+ 	select GPIOLIB
+-	select SWAP_IO_SPACE
+ 	select BOOT_RAW
+ 	select CLKDEV_LOOKUP
+ 	select HAVE_LEGACY_CLK
+-- 
+2.25.1
+
