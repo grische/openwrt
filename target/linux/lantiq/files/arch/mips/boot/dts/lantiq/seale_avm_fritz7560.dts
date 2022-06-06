@@ -1,0 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+
+#include "seale_avm_fritz7560.dtsi"
+
+/ {
+	compatible = "avm,fritz7560", "lantiq,xrx500", "lantiq,grx500";
+	model = "AVM FRITZ!Box 7560";
+};
