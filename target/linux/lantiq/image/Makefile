@@ -164,4 +164,9 @@ DEFAULT_SOC := falcon
 include falcon.mk
 endif
 
+ifeq ($(SUBTARGET),xrx500)
+DEFAULT_SOC := seale
+include seale.mk
+endif
+
 $(eval $(call BuildImage))
