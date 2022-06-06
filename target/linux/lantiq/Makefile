@@ -5,7 +5,7 @@
 include $(TOPDIR)/rules.mk
 
 BOARD:=lantiq
-BOARDNAME:=Lantiq
+BOARDNAME:=Lantiq/Intel-MIPS
 FEATURES:=squashfs
 SUBTARGETS:=xrx500 xrx200 xway xway_legacy falcon ase
 
@@ -13,7 +13,7 @@ KERNEL_PATCHVER:=5.10
 KERNEL_TESTING_PATCHVER:=5.10
 
 define Target/Description
-	Build firmware images for Lantiq SoC
+	Build firmware images for Lantiq and Intel-MIPS SoC
 endef
 
 include $(INCLUDE_DIR)/target.mk
