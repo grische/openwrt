@@ -1314,7 +1314,9 @@ CONFIG_INIT_STACK_NONE=y
 # end of Kernel hardening options
 # end of Security options
 
-# CONFIG_CRYPTO is not set
+CONFIG_CRYPTO=y
+CONFIG_CRYPTO_ALGAPI=y
+CONFIG_CRYPTO_ALGAPI2=y
 
 #
 # Library routines
