@@ -1,7 +1,7 @@
 From 3683d16fb65d01aef2237fd8c29d07ab605a8bca Mon Sep 17 00:00:00 2001
 From: Yixin Zhu <yixin.zhu@linux.intel.com>
 Date: Fri, 3 Aug 2018 11:02:21 +0800
-Subject: [PATCH 2/8] clk: intel: Add clock driver for Intel MIPS SoCs
+Subject: [PATCH 02/17] clk: intel: Add clock driver for Intel MIPS SoCs
 
 This driver provides PLL clock registration as well as various clock
 branches, e.g. MUX clock, gate clock, divider clock and so on.

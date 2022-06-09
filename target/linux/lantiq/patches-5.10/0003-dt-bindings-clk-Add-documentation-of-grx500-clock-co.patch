@@ -1,7 +1,7 @@
 From 7570c9d2c662fcb1562b708ad5143c3cb15e9e6c Mon Sep 17 00:00:00 2001
 From: Yixin Zhu <yixin.zhu@linux.intel.com>
 Date: Fri, 3 Aug 2018 11:02:22 +0800
-Subject: [PATCH 3/8] dt-bindings: clk: Add documentation of grx500 clock
+Subject: [PATCH 03/17] dt-bindings: clk: Add documentation of grx500 clock
  controller
 
 This patch adds binding documentation for grx500 clock controller.

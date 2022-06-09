@@ -1,0 +1,27 @@
+From aee924beee1c7e0c2ec3e608a40010f51180c2a3 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 9 Jun 2022 02:12:25 +0200
+Subject: [PATCH 13/17] Remove redundant __pa_symbol
+
+Can you explain why you need this, rather than the default definition of
+__pa_symbol()? The comment doesn't seem to describe much of anything.
+---
+ arch/mips/include/asm/mach-intel-mips/spaces.h | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/arch/mips/include/asm/mach-intel-mips/spaces.h b/arch/mips/include/asm/mach-intel-mips/spaces.h
+index d28f881a59b8..3076c67e6533 100644
+--- a/arch/mips/include/asm/mach-intel-mips/spaces.h
++++ b/arch/mips/include/asm/mach-intel-mips/spaces.h
+@@ -17,8 +17,5 @@
+ 
+ #define FIXADDR_TOP		((unsigned long)(long)(int)0xcffe0000)
+ 
+-/* IO space one */
+-#define __pa_symbol(x)		__pa(x)
+-
+ #include <asm/mach-generic/spaces.h>
+ #endif /* __ASM_INTEL_MIPS_SPACES_H */
+-- 
+2.25.1
+

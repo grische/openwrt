@@ -1,0 +1,84 @@
+From 1a2a6b954815cedb28b9014e4506b42d3a63f300 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 9 Jun 2022 02:10:02 +0200
+Subject: [PATCH 10/17] Drop redundant CPU overrides
+
+If you rebase atop linux-next or mips-next then you should find that
+many of these defines are now redundant, especially after removing the
+SYS_HAS_CPU_MIPS32_R1 select which means your kernel build will always
+target MIPS32r2.
+
+Due to architectural restrictions on where various options can be
+present, you should be able to remove:
+
+  - cpu_has_4kex
+  - cpu_has_3k_cache
+  - cpu_has_4k_cache
+  - cpu_has_32fpr
+  - cpu_has_divec
+  - cpu_has_prefetch
+  - cpu_has_llsc
+
+cpu_has_mmips defaults to a compile-time zero unless you select
+CONFIG_SYS_SUPPORTS_MICROMIPS, so please remove that one.
+
+cpu_has_64bit_gp_regs & cpu_has_64bit_addresses both default to zero
+already for 32bit kernel builds, so please remove those.
+
+cpu_has_cm2 & cpu_has_cm2_l2sync don't exist anywhere in-tree, so please
+remove those.
+
+Additionally cpu_has_sb1_cache is not used anywhere, or defined by
+asm/cpu-features.h & seems to just be left over in some platform
+override files including presumably one you based yours on. Please
+remove it too.
+---
+ .../asm/mach-intel-mips/cpu-feature-overrides.h     | 13 -------------
+ 1 file changed, 13 deletions(-)
+
+diff --git a/arch/mips/include/asm/mach-intel-mips/cpu-feature-overrides.h b/arch/mips/include/asm/mach-intel-mips/cpu-feature-overrides.h
+index ac5f3b943d2a..592b96a2d212 100644
+--- a/arch/mips/include/asm/mach-intel-mips/cpu-feature-overrides.h
++++ b/arch/mips/include/asm/mach-intel-mips/cpu-feature-overrides.h
+@@ -10,26 +10,17 @@
+ #define __ASM_MACH_INTEL_MIPS_CPU_FEATURE_OVERRIDES_H
+ 
+ #define cpu_has_tlb		1
+-#define cpu_has_4kex		1
+-#define cpu_has_3k_cache	0
+-#define cpu_has_4k_cache	1
+ #define cpu_has_tx39_cache	0
+-#define cpu_has_sb1_cache	0
+ #define cpu_has_fpu		0
+-#define cpu_has_32fpr		0
+ #define cpu_has_counter		1
+ #define cpu_has_watch		1
+-#define cpu_has_divec		1
+ 
+-#define cpu_has_prefetch	1
+ #define cpu_has_ejtag		1
+-#define cpu_has_llsc		1
+ 
+ #define cpu_has_mips16		0
+ #define cpu_has_mdmx		0
+ #define cpu_has_mips3d		0
+ #define cpu_has_smartmips	0
+-#define cpu_has_mmips		0
+ #define cpu_has_vz		0
+ 
+ #define cpu_has_mips32r1	1
+@@ -46,11 +37,7 @@
+ 
+ #define cpu_has_64bits		0
+ #define cpu_has_64bit_zero_reg	0
+-#define cpu_has_64bit_gp_regs	0
+-#define cpu_has_64bit_addresses	0
+ 
+-#define cpu_has_cm2		1
+-#define cpu_has_cm2_l2sync	1
+ #define cpu_has_eva		1
+ #define cpu_has_tlbinv		1
+ 
+-- 
+2.25.1
+

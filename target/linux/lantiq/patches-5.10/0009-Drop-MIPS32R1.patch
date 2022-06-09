@@ -1,0 +1,27 @@
+From 56aa59ced4170009b1154104e0f4b74c58d3c322 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 9 Jun 2022 02:05:07 +0200
+Subject: [PATCH 09/17] Drop MIPS32R1
+
+Paul Burton:
+For a system based on interAptiv you should never need to build a
+MIPS32r1 kernel, so you should remove the above select.
+---
+ arch/mips/Kconfig | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index 28cd768f236a..9a54128010bb 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -465,7 +465,6 @@ config INTEL_MIPS
+ 	select MFD_SYSCON
+ 	select MIPS_CPU_SCACHE
+ 	select MIPS_GIC
+-	select SYS_HAS_CPU_MIPS32_R1
+ 	select SYS_HAS_CPU_MIPS32_R2
+ 	select SYS_HAS_CPU_MIPS32_R3_5
+ 	select SYS_SUPPORTS_BIG_ENDIAN
+-- 
+2.25.1
+

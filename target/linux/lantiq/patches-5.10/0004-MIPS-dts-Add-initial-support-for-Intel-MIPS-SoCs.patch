@@ -1,7 +1,7 @@
 From 769e5d0f2258607465800ea06febc81d6f35f89d Mon Sep 17 00:00:00 2001
 From: Hua Ma <hua.ma@linux.intel.com>
 Date: Fri, 3 Aug 2018 11:02:23 +0800
-Subject: [PATCH 4/8] MIPS: dts: Add initial support for Intel MIPS SoCs
+Subject: [PATCH 04/17] MIPS: dts: Add initial support for Intel MIPS SoCs
 
 Add dts files to support Intel MIPS SoCs:
 - xrx500.dtsi is the chip dts

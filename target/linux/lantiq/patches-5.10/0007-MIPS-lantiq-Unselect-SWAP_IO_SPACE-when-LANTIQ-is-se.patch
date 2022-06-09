@@ -1,7 +1,7 @@
 From 38fa21b0189a4bd683e9d94218a5743b35036e01 Mon Sep 17 00:00:00 2001
 From: Songjun Wu <songjun.wu@linux.intel.com>
 Date: Fri, 3 Aug 2018 11:02:29 +0800
-Subject: [PATCH 7/8] MIPS: lantiq: Unselect SWAP_IO_SPACE when LANTIQ is
+Subject: [PATCH 07/17] MIPS: lantiq: Unselect SWAP_IO_SPACE when LANTIQ is
  selected
 
 SWAP_IO_SPACE macro prevents serial driver /drivers/tty/serial/lantiq.c

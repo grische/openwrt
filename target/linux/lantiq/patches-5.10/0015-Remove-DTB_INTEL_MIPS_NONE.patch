@@ -1,0 +1,28 @@
+From 38d9ad724e4077ffca1f48e23ad306bd072fccc2 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 9 Jun 2022 02:14:20 +0200
+Subject: [PATCH 15/17] Remove DTB_INTEL_MIPS_NONE
+
+> So do you actually have both styles of bootloader?
+this patch only support the build-in, will do a clean up.
+---
+ arch/mips/intel-mips/Kconfig | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/arch/mips/intel-mips/Kconfig b/arch/mips/intel-mips/Kconfig
+index 35d2ae2b5408..a4b69d0b5be3 100644
+--- a/arch/mips/intel-mips/Kconfig
++++ b/arch/mips/intel-mips/Kconfig
+@@ -10,9 +10,6 @@ choice
+ 	  The builtin DTB will only be used if the firmware does not supply
+ 	  a valid DTB.
+ 
+-config DTB_INTEL_MIPS_NONE
+-	bool "None"
+-
+ config DTB_INTEL_MIPS_GRX500
+ 	bool "Intel MIPS GRX500 Board"
+ 	select BUILTIN_DTB
+-- 
+2.25.1
+

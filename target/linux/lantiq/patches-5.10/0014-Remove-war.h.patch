@@ -1,0 +1,39 @@
+From e3ef7cae334f15c9001952170a460e675523e0dc Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 9 Jun 2022 02:13:06 +0200
+Subject: [PATCH 14/17] Remove war.h
+
+Since you need none of these workarounds, you shouldn't need war.h at
+all.
+---
+ arch/mips/include/asm/mach-intel-mips/war.h | 18 ------------------
+ 1 file changed, 18 deletions(-)
+ delete mode 100644 arch/mips/include/asm/mach-intel-mips/war.h
+
+diff --git a/arch/mips/include/asm/mach-intel-mips/war.h b/arch/mips/include/asm/mach-intel-mips/war.h
+deleted file mode 100644
+index 1c95553151e1..000000000000
+--- a/arch/mips/include/asm/mach-intel-mips/war.h
++++ /dev/null
+@@ -1,18 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0 */
+-#ifndef __ASM_MIPS_MACH_INTEL_MIPS_WAR_H
+-#define __ASM_MIPS_MACH_INTEL_MIPS_WAR_H
+-
+-#define R4600_V1_INDEX_ICACHEOP_WAR	0
+-#define R4600_V1_HIT_CACHEOP_WAR	0
+-#define R4600_V2_HIT_CACHEOP_WAR	0
+-#define R5432_CP0_INTERRUPT_WAR		0
+-#define BCM1250_M3_WAR			0
+-#define SIBYTE_1956_WAR			0
+-#define MIPS4K_ICACHE_REFILL_WAR	0
+-#define MIPS_CACHE_SYNC_WAR		0
+-#define TX49XX_ICACHE_INDEX_INV_WAR	0
+-#define ICACHE_REFILLS_WORKAROUND_WAR	0
+-#define R10000_LLSC_WAR			0
+-#define MIPS34K_MISSED_ITLB_WAR		0
+-
+-#endif /* __ASM_MIPS_MACH_INTEL_MIPS_WAR_H */
+-- 
+2.25.1
+

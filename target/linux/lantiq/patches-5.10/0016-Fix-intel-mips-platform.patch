@@ -1,0 +1,41 @@
+From 5ea819d04b963911999a348421117a9af4fe6e8e Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 9 Jun 2022 02:54:43 +0200
+Subject: [PATCH 16/17] Fix intel-mips platform
+
+Fixup of bec19607f920e8e4db8c7265991a4d1e041a02d6
+
+Based on 26bff9eb49201aeb4e1b32d698c191831a39f5d4
+---
+ arch/mips/Kbuild.platforms    | 2 +-
+ arch/mips/intel-mips/Platform | 1 -
+ 2 files changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/arch/mips/Kbuild.platforms b/arch/mips/Kbuild.platforms
+index 987a3eb27d27..efc6d20a6254 100644
+--- a/arch/mips/Kbuild.platforms
++++ b/arch/mips/Kbuild.platforms
+@@ -12,7 +12,7 @@ platform-$(CONFIG_CAVIUM_OCTEON_SOC)	+= cavium-octeon/
+ platform-$(CONFIG_MIPS_COBALT)		+= cobalt/
+ platform-$(CONFIG_MACH_DECSTATION)	+= dec/
+ platform-$(CONFIG_MIPS_GENERIC)		+= generic/
+-platforms$(CONFIG_INTEL_MIPS)		+= intel-mips/
++platform-$(CONFIG_INTEL_MIPS)		+= intel-mips/
+ platform-$(CONFIG_MACH_JAZZ)		+= jazz/
+ platform-$(CONFIG_LANTIQ)		+= lantiq/
+ platform-$(CONFIG_MACH_LOONGSON2EF)	+= loongson2ef/
+diff --git a/arch/mips/intel-mips/Platform b/arch/mips/intel-mips/Platform
+index 3976788698e3..0bea4198dc5f 100644
+--- a/arch/mips/intel-mips/Platform
++++ b/arch/mips/intel-mips/Platform
+@@ -3,7 +3,6 @@
+ # MIPS SoC platform
+ #
+ 
+-platform-$(CONFIG_INTEL_MIPS)			+= intel-mips/
+ cflags-$(CONFIG_INTEL_MIPS)			+= -I$(srctree)/arch/mips/include/asm/mach-intel-mips
+ ifdef CONFIG_EVA
+ 	load-$(CONFIG_INTEL_MIPS)		= 0xffffffff60020000
+-- 
+2.25.1
+

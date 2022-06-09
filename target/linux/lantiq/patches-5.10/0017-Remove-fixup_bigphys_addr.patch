@@ -1,0 +1,30 @@
+From 8e21a072859c0fca5004747894849b0b124f1b00 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 9 Jun 2022 02:58:39 +0200
+Subject: [PATCH 17/17] Remove fixup_bigphys_addr
+
+See d399157283fb457cdc3ae03f2897070f0bd5d7c6
+---
+ arch/mips/include/asm/mach-intel-mips/ioremap.h | 6 ------
+ 1 file changed, 6 deletions(-)
+
+diff --git a/arch/mips/include/asm/mach-intel-mips/ioremap.h b/arch/mips/include/asm/mach-intel-mips/ioremap.h
+index 99b20ed0b457..584d22acb009 100644
+--- a/arch/mips/include/asm/mach-intel-mips/ioremap.h
++++ b/arch/mips/include/asm/mach-intel-mips/ioremap.h
+@@ -8,12 +8,6 @@
+ 
+ #include <linux/types.h>
+ 
+-static inline phys_addr_t fixup_bigphys_addr(phys_addr_t phys_addr,
+-					     phys_addr_t size)
+-{
+-	return phys_addr;
+-}
+-
+ /*
+  * TOP IO Space definition for SSX7 components /PCIe/ToE/Memcpy
+  * physical 0xa0000000 --> virtual 0xe0000000
+-- 
+2.25.1
+

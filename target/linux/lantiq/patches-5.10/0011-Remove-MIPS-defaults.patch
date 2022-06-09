@@ -1,0 +1,26 @@
+From ca186b8e4bb02556def4c2ef9c199db9823148b8 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 9 Jun 2022 02:11:20 +0200
+Subject: [PATCH 11/17] Remove MIPS defaults
+
+These 2 defines are the defaults anyway, so please remove them.
+---
+ arch/mips/include/asm/mach-intel-mips/irq.h | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/arch/mips/include/asm/mach-intel-mips/irq.h b/arch/mips/include/asm/mach-intel-mips/irq.h
+index 12a949084856..1bb25b3712c2 100644
+--- a/arch/mips/include/asm/mach-intel-mips/irq.h
++++ b/arch/mips/include/asm/mach-intel-mips/irq.h
+@@ -7,8 +7,6 @@
+ #ifndef __INTEL_MIPS_IRQ_H
+ #define __INTEL_MIPS_IRQ_H
+ 
+-#define MIPS_CPU_IRQ_BASE	0
+-#define MIPS_GIC_IRQ_BASE	(MIPS_CPU_IRQ_BASE + 8)
+ 
+ #define NR_IRQS 256
+ 
+-- 
+2.25.1
+
