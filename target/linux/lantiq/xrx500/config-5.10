@@ -544,7 +544,7 @@ CONFIG_DEFAULT_MMAP_MIN_ADDR=4096
 # CONFIG_GUP_BENCHMARK is not set
 # end of Memory Management options
 
-# CONFIG_NET is not set
+CONFIG_NET=y
 CONFIG_HAVE_CBPF_JIT=y
 
 #
