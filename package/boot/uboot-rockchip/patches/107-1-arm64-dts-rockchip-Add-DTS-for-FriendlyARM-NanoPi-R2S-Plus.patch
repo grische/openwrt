@@ -1,0 +1,59 @@
+From d6a55cc9e7e7d44b4b357818a9690e05af5d87e2 Mon Sep 17 00:00:00 2001
+From: Sergey Bostandzhyan <jin@mediatomb.cc>
+Date: Fri, 1 Nov 2024 22:21:29 +0000
+Subject: [PATCH 1/2] arm64: dts: rockchip: Add DTS for FriendlyARM NanoPi R2S
+ Plus
+
+The R2S Plus is basically an R2S with additional eMMC.
+
+The eMMC configuration for the DTS has been extracted and copied from
+rk3328-nanopi-r2.dts, v2017.09 branch from the friendlyarm/uboot-rockchip
+repository.
+
+Signed-off-by: Sergey Bostandzhyan <jin@mediatomb.cc>
+Link: https://lore.kernel.org/r/20240814170048.23816-2-jin@mediatomb.cc
+Signed-off-by: Heiko Stuebner <heiko@sntech.de>
+[ upstream commit: b8c02878292200ebb5b4a8cfc9dbf227327908bd ]
+(cherry picked from commit c9bf98827964441f4dd16faa45bd4046f472e693)
+Signed-off-by: Jonas Karlman <jonas@kwiboo.se>
+Reviewed-by: Kever Yang <kever.yang@rock-chips.com>
+---
+ .../src/arm64/rockchip/rk3328-nanopi-r2s-plus.dts  | 32 ++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+ create mode 100644 dts/upstream/src/arm64/rockchip/rk3328-nanopi-r2s-plus.dts
+
+--- /dev/null
++++ b/dts/upstream/src/arm64/rockchip/rk3328-nanopi-r2s-plus.dts
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * (C) Copyright 2018 FriendlyElec Computer Tech. Co., Ltd.
++ * (http://www.friendlyarm.com)
++ *
++ * (C) Copyright 2016 Rockchip Electronics Co., Ltd
++ */
++
++/dts-v1/;
++#include "rk3328-nanopi-r2s.dts"
++
++/ {
++	compatible = "friendlyarm,nanopi-r2s-plus", "rockchip,rk3328";
++	model = "FriendlyElec NanoPi R2S Plus";
++
++	aliases {
++		mmc1 = &emmc;
++	};
++};
++
++&emmc {
++	bus-width = <8>;
++	cap-mmc-highspeed;
++	disable-wp;
++	mmc-hs200-1_8v;
++	non-removable;
++	num-slots = <1>;
++	pinctrl-names = "default";
++	pinctrl-0 = <&emmc_clk &emmc_cmd &emmc_bus8>;
++	supports-emmc;
++	status = "okay";
++};
