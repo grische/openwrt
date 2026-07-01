@@ -1,0 +1,54 @@
+From e353107f43cd4b5d55151d12cd83145ca617679a Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 1 Jul 2026 17:24:54 +0000
+Subject: [PATCH 2/2] net: stmmac: dwmac1000: stop hardware from dropping
+ checksum-error packets
+
+Tell the MAC not to discard frames that fail TCP/IP checksum validation.
+
+By default, when the checksum offload engine (CoE) is enabled, the
+dwmac1000 MAC silently drops any frame for which the engine detects a
+checksum error, before it is passed to the driver. These frames are not
+reported and are not counted as dropped.
+
+Set the DMA_CONTROL_DT bit when initializing the Rx operation mode so
+that such frames are delivered instead of dropped. CoE remains enabled;
+the descriptor error status is propagated and stmmac_rx() marks the skb
+CHECKSUM_NONE, letting the stack verify and drop the packet while
+updating statistics. This is the dwmac1000 equivalent of
+commit fe4042797651 ("net: stmmac: dwmac4: stop hardware from dropping
+checksum-error packets").
+
+Without this, a frame carrying a zero UDP-over-IPv6 checksum (legal for
+tunnels per RFC 6935/6936, e.g. VXLAN with udp6zerocsumtx) is treated as
+a payload checksum error and dropped in the Rx FIFO. This was observed on
+a Qualcomm ipq806x GMAC: a peer's 171 such frames produced zero
+rx_packets/rx_errors on the receiver.
+
+Link: https://lore.kernel.org/all/20250625132117.1b3264e8@kernel.org/
+
+It depends on the previous patch that avoids discarding checksum-error
+frames in the descriptor parser.
+
+Assisted-by: Claude:claude-opus-4-8
+Signed-off-by: Grische <github@grische.xyz>
+---
+ drivers/net/ethernet/stmicro/stmmac/dwmac1000_dma.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac1000_dma.c b/drivers/net/ethernet/stmicro/stmmac/dwmac1000_dma.c
+index daf79cdbd3ec..abcf5abefa0c 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac1000_dma.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac1000_dma.c
+@@ -155,6 +155,8 @@ static void dwmac1000_dma_operation_mode_rx(struct stmmac_priv *priv,
+ {
+ 	u32 csr6 = readl(ioaddr + DMA_CONTROL);
+ 
++	csr6 |= DMA_CONTROL_DT;
++
+ 	if (mode == SF_DMA_MODE) {
+ 		pr_debug("GMAC: enable RX store and forward mode\n");
+ 		csr6 |= DMA_CONTROL_RSF;
+-- 
+2.54.0
+

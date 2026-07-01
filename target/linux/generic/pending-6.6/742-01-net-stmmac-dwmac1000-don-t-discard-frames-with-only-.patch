@@ -1,0 +1,52 @@
+From c62ec335ed8252a079539f9fdff50aebe6f84d57 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 1 Jul 2026 17:24:49 +0000
+Subject: [PATCH 1/2] net: stmmac: dwmac1000: don't discard frames with only a
+ checksum error
+
+Do not drop an otherwise-good frame when the hardware only reports a
+checksum error.
+
+enh_desc_get_rx_status() returns discard_frame whenever the Rx
+descriptor Error Summary (ES) bit is set. On the GMAC the ES bit is also
+raised for an L3/L4 checksum mismatch on its own, as the existing comment
+above the enh_desc_coe_rdes0() call already notes. Such frames are
+therefore discarded in the driver before their checksum status is
+evaluated, instead of being delivered with CHECKSUM_NONE for the stack to
+verify.
+
+Only return discard_frame when a genuine L2 error bit is set. A
+checksum-only error then falls through to enh_desc_coe_rdes0(), which
+already reports csum_none, so stmmac_rx() marks the skb CHECKSUM_NONE.
+This aligns enh_desc with dwmac4, whose Error Summary check does not
+cover the checksum bits.
+
+This is a preparatory step for disabling the hardware filter that drops
+frames which do not pass checksum validation.
+
+Assisted-by: Claude:claude-opus-4-8
+Signed-off-by: Grische <github@grische.xyz>
+---
+ drivers/net/ethernet/stmicro/stmmac/enh_desc.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/enh_desc.c b/drivers/net/ethernet/stmicro/stmmac/enh_desc.c
+index 937b7a0466fc..6b7a59e2d6de 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/enh_desc.c
++++ b/drivers/net/ethernet/stmicro/stmmac/enh_desc.c
+@@ -214,7 +214,11 @@ static int enh_desc_get_rx_status(struct stmmac_extra_stats *x,
+ 		if (unlikely(rdes0 & RDES0_CRC_ERROR)) {
+ 			x->rx_crc_errors++;
+ 		}
+-		ret = discard_frame;
++		if (rdes0 & (RDES0_DESCRIPTOR_ERROR | RDES0_OVERFLOW_ERROR |
++			     RDES0_COLLISION | RDES0_RECEIVE_WATCHDOG |
++			     RDES0_MII_ERROR | RDES0_CRC_ERROR |
++			     RDES0_LENGTH_ERROR))
++			ret = discard_frame;
+ 	}
+ 
+ 	/* After a payload csum error, the ES bit is set.
+-- 
+2.54.0
+
