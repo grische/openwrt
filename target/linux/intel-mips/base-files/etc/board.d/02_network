@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Network-detection hook for intel-mips/xrx500.
+#
+# The GSWIP-3.0 switch is driven as a single netdev, so this only names
+# the LAN interface; there is no per-port wiring to declare. MAC address
+# assignment is not handled here either — the addresses live in the AVM
+# TFFS partition and are not yet read out at boot.
+
+. /lib/functions.sh
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+case "$(board_name)" in
+avm,fritz7560)
+	ucidef_set_interface_lan "eth0"
+	;;
+esac
+
+board_config_flush
+
+exit 0

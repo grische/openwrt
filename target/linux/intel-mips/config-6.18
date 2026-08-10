@@ -1,0 +1,164 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Board-level kernel config for the intel-mips target.
+# Applies to all intel-mips subtargets; subtarget-specific options
+# (CPU count, board DTB selection) live in <subtarget>/config-default.
+#
+# Notably absent: CONFIG_LANTIQ. INTEL_MIPS and LANTIQ are mutually
+# exclusive in arch/mips/Kconfig's "System type" choice block — that
+# is the structural reason this target was split out of lantiq/.
+
+CONFIG_INTEL_MIPS=y
+CONFIG_MIPS_CPS=y
+# MIPS_MT_SMP is the legacy MIPS-MT SMP scheme (1 TC per VPE).
+# interAptiv with CPS uses CPS-SMP instead — keep MT_SMP off so the
+# two SMP schemes don't fight at boot.
+# CONFIG_MIPS_MT_SMP is not set
+# DTB delivery: BUILTIN at __dtb_start. With the dual-kernel EVA
+# packing (eva-image pack, kernel-bin | append-dtb | avm-preamble |
+# eva-dual-kernel) the corruption pattern moved: __dtb_start is now intact
+# at runtime, while the appended-DTB position is overwritten by EVA's
+# DTB-selection fallback (it writes its own SubRev=0 DTB into the slot
+# pointed-to by the avm-preamble table after our SubRev=1 lookup "fails").
+# Keep `append-dtb` in the KERNEL pipeline so that EVA's substitution lands
+# on the appended-DTB position (sacrificial) and __dtb_start (which the
+# kernel actually reads) is left alone.
+# CONFIG_MIPS_RAW_APPENDED_DTB is not set
+CONFIG_MIPS_NO_APPENDED_DTB=y
+# GRX500/GRX350 CGU clock controller. The DT `cgu: cgu@16200000` node
+# (xrx500.dtsi) is referenced by `clocks = <&cgu CLK_CPU>` from cpu0/1,
+# and the v6.18 timer subsystem requests `cpu_clk` very early. Without
+# this driver, the kernel hangs after `sched_clock` with `Failed to get
+# CPU clock: -517` (-EPROBE_DEFER that never resolves). 5.10 matches.
+CONFIG_INTEL_CGU_CLK=y
+CONFIG_INTEL_GRX500_CGU_CLK=y
+# CONFIG_MIPS_CPS_NS16550_BOOL is not set
+# Batch of v6.18 defaults that surface as NEW prompts in syncconfig
+# because the parent target's config-6.18 doesn't cover them.
+CONFIG_COMPAT_32BIT_TIME=y
+CONFIG_CPU_NEEDS_NO_SMARTMIPS_OR_MICROMIPS=y
+CONFIG_CPU_MIPS32_R2=y
+CONFIG_CPU_MIPS32_3_5_FEATURES=y
+CONFIG_CPU_MIPS32_3_5_EVA=y
+CONFIG_CPU_HAS_SYNC=y
+CONFIG_CPU_R4K_FPU=y
+CONFIG_CPU_R4K_CACHE_TLB=y
+CONFIG_GENERIC_CSUM=y
+CONFIG_MIPS_L1_CACHE_SHIFT=5
+CONFIG_PAGE_SIZE_4KB=y
+# Appended-DTB lookup is off entirely (MIPS_NO_APPENDED_DTB above); the
+# kernel reads the built-in DTB. Leave ELF_APPENDED off too so it doesn't
+# look in the vmlinux .appended_dtb ELF section either.
+# CONFIG_MIPS_ELF_APPENDED_DTB is not set
+CONFIG_HZ_250=y
+CONFIG_PAGE_BLOCK_MAX_ORDER=11
+CONFIG_FUTEX=y
+CONFIG_FUTEX_PI=y
+CONFIG_HARDLOCKUP_DETECTOR_PERF=y
+CONFIG_HARDLOCKUP_CHECK_TIMESTAMP=y
+# CONFIG_KEXEC is not set
+# CONFIG_CRASH_DUMP is not set
+# CONFIG_CPU_HAS_LOAD_STORE_LR is not set
+CONFIG_GENERIC_GETTIMEOFDAY=y
+CONFIG_GENERIC_VDSO_32=y
+CONFIG_HAVE_ARCH_VMAP_STACK=y
+CONFIG_VMAP_STACK=y
+CONFIG_HAVE_ARCH_KASAN_VMALLOC=y
+# CONFIG_KASAN is not set
+# RANDOMIZE_BASE + RELOCATABLE relocate the kernel at boot to a (possibly
+# randomized) runtime address — but MIPS's get_fdt() returns &__dtb_start
+# resolved at compile time (the LINK address). After relocation that pointer
+# is stale: it points at whatever stale RAM now sits at the old link address
+# (LZMA decompression artifacts or pre-relocation kernel data), not at the
+# DTB the kernel actually copied to its new location. Symptom: early_init_dt
+# warns "No '#size-cells' in root node" and panics in
+# early_init_dt_alloc_memory_arch, despite the on-disk DTB being well-formed.
+# Disable both; revisit if intel-mips/prom.c grows a plat_get_fdt()
+# (used by the relocate path in arch/mips/kernel/relocate.c).
+# CONFIG_RANDOMIZE_BASE is not set
+# CONFIG_RELOCATABLE is not set
+# Network NEW prompts surfaced during world build
+CONFIG_RPS=y
+CONFIG_RFS_ACCEL=y
+# NET_FLOW_LIMIT depends on RPS=y; promote to explicit =y so syncconfig
+# doesn't prompt for it.
+CONFIG_NET_FLOW_LIMIT=y
+# CONFIG_ZBOOT_LOAD_ADDRESS leaks in from arch/mips/Kconfig.debug when
+# SYS_SUPPORTS_ZBOOT is selected; 0x0 is the default and we don't use
+# the zboot (compressed-self-extracting) path — BUILTIN_DTB + lzma + EVA
+# loader handles compression at the OpenWrt image layer instead.
+CONFIG_ZBOOT_LOAD_ADDRESS=0x0
+CONFIG_SMP=y
+CONFIG_SERIAL_LANTIQ=y
+CONFIG_SERIAL_LANTIQ_CONSOLE=y
+CONFIG_EARLY_PRINTK=y
+CONFIG_CMDLINE_BOOL=y
+CONFIG_MIPS_CMDLINE_BUILTIN_EXTEND=y
+# CONFIG_CMDLINE_OVERRIDE is not set
+# Explicitly unset every other option in the MIPS_CMDLINE choice block
+# so syncconfig doesn't hang prompting which NEW sibling to pick.
+# CONFIG_MIPS_CMDLINE_FROM_DTB is not set
+# CONFIG_MIPS_CMDLINE_DTB_EXTEND is not set
+# CONFIG_MIPS_CMDLINE_FROM_BOOTLOADER is not set
+
+# NAND / UBI / UBIFS stack. NAND chip is Macronix MX30LF1GE8AB
+# (128 MiB SLC, 2 KiB page, 64 page/block) wired to EBU CS0 on the
+# xRX500 SoC. The MTD layer carries the AVM 5-partition map declared
+# in seale_avm_fritz7560.dtsi; UBI sits on the 'ubi' partition.
+CONFIG_MTD=y
+CONFIG_MTD_BLOCK=y
+CONFIG_MTD_RAW_NAND=y
+CONFIG_MTD_NAND_LANTIQ_XRX500=y
+CONFIG_MTD_NAND_CORE=y
+CONFIG_MTD_NAND_ECC=y
+CONFIG_MTD_NAND_ECC_SW_HAMMING=y
+CONFIG_MTD_UBI=y
+CONFIG_MTD_UBI_BLOCK=y
+# UBI sub-options. Resolve every prompt UBI/UBIFS surfaces in syncconfig
+# to avoid kconfig auto-default churn between rebuilds.
+CONFIG_MTD_UBI_WL_THRESHOLD=4096
+CONFIG_MTD_UBI_BEB_LIMIT=20
+# CONFIG_MTD_UBI_FASTMAP is not set
+# CONFIG_MTD_UBI_GLUEBI is not set
+# CONFIG_MTD_UBI_FAULT_INJECTION is not set
+CONFIG_UBIFS_FS=y
+# CONFIG_UBIFS_FS_ADVANCED_COMPR is not set
+CONFIG_UBIFS_FS_LZO=y
+CONFIG_UBIFS_FS_ZLIB=y
+CONFIG_UBIFS_FS_ZSTD=y
+CONFIG_UBIFS_FS_XATTR=y
+CONFIG_UBIFS_FS_SECURITY=y
+# CONFIG_UBIFS_ATIME_SUPPORT is not set
+# CONFIG_UBIFS_FS_AUTHENTICATION is not set
+CONFIG_LZO_COMPRESS=y
+CONFIG_LZO_DECOMPRESS=y
+CONFIG_ZSTD_COMPRESS=y
+CONFIG_ZSTD_DECOMPRESS=y
+CONFIG_CRYPTO=y
+CONFIG_CRYPTO_DEFLATE=y
+CONFIG_CRYPTO_LZO=y
+CONFIG_INTEL_XRX500_NET=y
+# Built-in rather than =m: there is no modules.mk in this target yet, so a
+# Package/kmod-* entry does not exist and the .ko would not be shipped in
+# the rootfs. Switch to =m once modules.mk lands.
+CONFIG_INTEL_XRX500_GSWIP_API=y
+# The GSWIP-MDIO scan finds the 4 XWAY VR9 GPHYs
+# at addresses 0x02..0x05, but with no XWAY/lantiq PHY driver enabled they
+# bind to the "Generic PHY" fallback. Generic PHY does autoneg correctly in
+# the simple case BUT does not handle the GPHY's GBE_LBADR/MBADR (firmware
+# load anchor) nor the GPHYF status quirks. End result observed on hardware:
+# kernel reaches phylink_start, MDIO bus is up, but the netdev never gets
+# carrier=1 and `ip link` stays NO-CARRIER. Enable INTEL_XWAY_PHY to bind
+# the proper driver to the gswip-mdio:0[2..5] devices.
+CONFIG_INTEL_XWAY_PHY=y
+
+# rcu_reset0 (reset-controller@10 inside rcu@16000000,
+# compatible "lantiq,xrx200-reset") binds via reset-lantiq.c which depends on
+# MFD_SYSCON + REGMAP_MMIO. CONFIG_RESET_LANTIQ defaults to SOC_TYPE_XWAY,
+# which the intel-mips target does NOT set (we are INTEL_MIPS, not LANTIQ).
+# Enable explicitly. Without this, devm_reset_control_get("phyN") returns
+# -EPROBE_DEFER forever, the GPHY firmware never loads, MDIO bus probe
+# defers, and intel-xrx500 ndo_open never reaches the 4-step ordering.
+CONFIG_RESET_LANTIQ=y
+CONFIG_MFD_SYSCON=y
+CONFIG_REGMAP_MMIO=y

@@ -1,0 +1,446 @@
+From 8a973e374d5dd12fcfc560eed6fe6002660f97aa Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:08:49 +0000
+Subject: MIPS: dts: intel-mips: add xRX500 SoC dtsi and EASY350 ANYWAN board
+
+Add the xRX500 SoC device tree include and the Intel EASY350 ANYWAN
+(GRX350 reference board) DTS.
+
+The dtsi describes the SoC as brought up on real hardware: cpuintc +
+GIC, the CGU clock controller, the RCU syscon (reset controller and
+GPHY reset provider), serial, the SSX4 localbus with the EBU NAND
+controller window at 0x17c00000 (chip-select 1), the two GSWIP-3.0
+switch instances (gswl@1c000000, gswr@1a000000), the GSWIP MDIO bus,
+the GPHY firmware loader node, the four central DMA controllers, and
+the CBM (central buffer manager) node with its twelve register
+windows - the disabled-at-SoC-scope nodes are enabled per board.
+
+Based on the initial xrx500.dtsi from the 2018 intel-mips submission
+by Songjun Wu <songjun.wu@linux.intel.com>:
+
+  https://lore.kernel.org/all/20180803030237.3366-1-songjun.wu@linux.intel.com/
+
+extended during FRITZ!Box 7560 bring-up with the nodes listed above.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ arch/mips/boot/dts/Makefile                   |   1 +
+ arch/mips/boot/dts/intel-mips/Makefile        |   4 +
+ .../boot/dts/intel-mips/easy350_anywan.dts    |  26 ++
+ arch/mips/boot/dts/intel-mips/xrx500.dtsi     | 351 ++++++++++++++++++
+ 4 files changed, 382 insertions(+)
+ create mode 100644 arch/mips/boot/dts/intel-mips/Makefile
+ create mode 100644 arch/mips/boot/dts/intel-mips/easy350_anywan.dts
+ create mode 100644 arch/mips/boot/dts/intel-mips/xrx500.dtsi
+
+diff --git a/arch/mips/boot/dts/Makefile b/arch/mips/boot/dts/Makefile
+index 6d9dbe9455417..eba9d9f4dd66a 100644
+--- a/arch/mips/boot/dts/Makefile
++++ b/arch/mips/boot/dts/Makefile
+@@ -6,6 +6,7 @@ subdir-$(CONFIG_EYEQ)			+= mobileye
+ subdir-$(CONFIG_FIT_IMAGE_FDT_MARDUK)   += img
+ subdir-$(CONFIG_FIT_IMAGE_FDT_BOSTON)	+= img
+ subdir-$(CONFIG_MACH_INGENIC)		+= ingenic
++subdir-$(CONFIG_INTEL_MIPS)			+= intel-mips
+ subdir-$(CONFIG_LANTIQ)			+= lantiq
+ subdir-$(CONFIG_MACH_LOONGSON64)	+= loongson
+ subdir-$(CONFIG_MACH_LOONGSON32)	+= loongson
+diff --git a/arch/mips/boot/dts/intel-mips/Makefile b/arch/mips/boot/dts/intel-mips/Makefile
+new file mode 100644
+index 0000000000000..adfaabbbb07ca
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0
++dtb-$(CONFIG_DTB_INTEL_MIPS_GRX500)	+= easy350_anywan.dtb
++
++obj-$(CONFIG_BUILTIN_DTB)		+= $(addsuffix .o, $(dtb-y))
+diff --git a/arch/mips/boot/dts/intel-mips/easy350_anywan.dts b/arch/mips/boot/dts/intel-mips/easy350_anywan.dts
+new file mode 100644
+index 0000000000000..e5e95f90c5e72
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/easy350_anywan.dts
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-2.0
++/dts-v1/;
++
++#include <dt-bindings/interrupt-controller/mips-gic.h>
++#include <dt-bindings/clock/intel,grx500-clk.h>
++
++#include "xrx500.dtsi"
++
++/ {
++	model = "EASY350 ANYWAN (GRX350) Main model";
++	compatible = "intel,easy350-anywan";
++
++	aliases {
++		serial0 = &asc0;
++	};
++
++	chosen {
++		bootargs = "earlycon=lantiq,0x16600000 clk_ignore_unused";
++		stdout-path = "serial0";
++	};
++
++	memory@20000000 {
++		device_type = "memory";
++		reg = <0x20000000 0x0e000000>;
++	};
++};
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+new file mode 100644
+index 0000000000000..2fa7930cd9879
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -0,0 +1,351 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/ {
++	#address-cells = <1>;
++	#size-cells = <1>;
++	compatible = "intel,xrx500";
++
++	/*
++	 * Sub-4B ST-002: aliases block driving of_alias_get_id("dma")
++	 * in ltq_dma_probe (drivers/net/ethernet/lantiq/dma/hdma.c).
++	 * Mapping is silicon-honoured per AVM xrx500.dtsi aliases block —
++	 *   dma1 → DMA1TX (cid=1)
++	 *   dma2 → DMA1RX (cid=2)
++	 *   dma3 → DMA2TX (cid=3)
++	 * indexing enum dma_controller { DMA1TX=1, DMA1RX=2, DMA2TX=3 }
++	 * into the static ltq_dma_controller[DMAMAX] array. DMA0 / DMA2RX /
++	 * DMA3 / DMA4 aliases are intentionally absent — those cids are out
++	 * of scope per CQ-002 C / AS-008 (the DMA0=SPI/HSNAND/MEMCOPY,
++	 * DMA3=TOE-memcopy, DMA4=MPE-memcopy controllers are not bound by
++	 * Sub-4B and DMA2RX is FB7560-irrelevant per the wholesale-port-
++	 * stripped scope).
++	 */
++	aliases {
++		dma1 = &dma1tx;
++		dma2 = &dma1rx;
++		dma3 = &dma2tx;
++		dma4 = &dma2rx;
++	};
++
++	cpus {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		cpu0: cpu@0 {
++			device_type = "cpu";
++			compatible = "mti,interaptiv";
++			clocks = <&cgu CLK_CPU>;
++			reg = <0>;
++		};
++
++		cpu1: cpu@1 {
++			device_type = "cpu";
++			compatible = "mti,interaptiv";
++			reg = <1>;
++		};
++	};
++
++	cpu_intc: interrupt-controller {
++		compatible = "mti,cpu-interrupt-controller";
++
++		interrupt-controller;
++		#interrupt-cells = <1>;
++	};
++
++	gic: gic@12320000 {
++		compatible = "mti,gic";
++		reg = <0x12320000 0x20000>;
++
++		interrupt-controller;
++		#interrupt-cells = <3>;
++		/*
++		 * Declare the interrupt-parent even though the mti,gic
++		 * binding doesn't require it, such that the kernel can
++		 * figure out that cpu_intc is the root interrupt
++		 * controller & should be probed first.
++		 */
++		interrupt-parent = <&cpu_intc>;
++		mti,reserved-ipi-vectors = <56 8>;
++	};
++
++	cgu: cgu@16200000 {
++		compatible = "intel,grx500-cgu", "syscon";
++		reg = <0x16200000 0x200>;
++		#clock-cells = <1>;
++	};
++
++	/*
++	 * Phase 3 / Sub-6 EVAL-FIX-ROUND-1 (AC-001-4 critical): RCU (Reset
++	 * Control Unit) syscon parent + reset-controller child binding for
++	 * the xRX500 silicon family.
++	 *
++	 * The mainline drivers/reset/reset-lantiq.c driver (compatible
++	 * "lantiq,xrx200-reset") expects to be a CHILD of a syscon parent.
++	 * It uses syscon_node_to_regmap(dev->of_node->parent) at probe time
++	 * and treats its own reg = <reset_offset_in_parent, status_offset_in_parent>
++	 * as byte offsets into that syscon regmap.
++	 *
++	 * The xRX500 RCU register layout matches xRX200 verbatim (per the
++	 * AVM 4.9 drivers/char/ltq_reset/ltq_rcu/ltq_rcu.h header — the
++	 * relevant LTQ_RCU_RST_REQ/STAT offsets are 0x0010/0x0014 on both
++	 * SoC families), so the "lantiq,xrx200-reset" binding applies
++	 * unchanged. The physical base address of the RCU is 0x16000000
++	 * (the AVM ssx4@16000000 wrapper that contains rcu0, sysconf,
++	 * cgu0, etc in the AVM 4.9 source tree). We expose only the
++	 * 0x100-byte register window needed for the RST_REQ / RST_STAT
++	 * registers — the chiptop/cgu nodes at +0x80000 / +0x200000 keep
++	 * their own independent platform_device bindings.
++	 *
++	 * #reset-cells = <2>: args are [set_bit, status_bit]. The mainline
++	 * driver writes BIT(set_bit) to reset_offset and reads BIT(status_bit)
++	 * from status_offset to verify the assert/deassert took effect.
++	 *
++	 * GPHY reset-bit assignments are defined in
++	 * drivers/net/ethernet/lantiq/xrx500_phy_fw.c:127-131 as
++	 * RCU_RD_GPHY{2,3,4,5,F}_XRX500 = BIT({29,28,26,25,31}). Set and
++	 * status bits coincide (the same bit position in RST_REQ and
++	 * RST_STAT serves both purposes), so each GPHY's resets entry uses
++	 * <&rcu_reset0 N N>.
++	 *
++	 * Closes ST-001 blocked_issue #1 (xrx500.dtsi did not declare a
++	 * reset-controller phandle). AS-006 forbade inline-adding this in
++	 * the original ST-001 scope; the Evaluator's eval-fix-round-1 fix
++	 * request explicitly authorises landing it here (Sub-6.1 follow-up
++	 * scope per the Evaluator's recommendation).
++	 */
++	rcu: rcu@16000000 {
++		compatible = "lantiq,xrx200-rcu", "simple-mfd", "syscon";
++		reg = <0x16000000 0x100>;
++		ranges = <0x0 0x16000000 0x100>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++
++		rcu_reset0: reset-controller@10 {
++			compatible = "lantiq,xrx200-reset";
++			reg = <0x10 0x4>, <0x14 0x4>;
++			#reset-cells = <2>;
++		};
++	};
++
++	asc0: serial@16600000 {
++		compatible = "lantiq,asc";
++		reg = <0x16600000 0x100000>;
++
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 103 IRQ_TYPE_LEVEL_HIGH>,
++			<GIC_SHARED 105 IRQ_TYPE_LEVEL_HIGH>,
++			<GIC_SHARED 106 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&cgu CLK_SSX4>, <&cgu GCLK_UART>;
++		clock-names = "freq", "asc";
++	};
++
++	ebu_nand: nand-controller@16f00000 {
++		compatible = "lantiq,nand-xrx500";
++		/*
++		 * Two reg blocks: the EBU register window (256 bytes at
++		 * 0x16f00000) and the chip-select-1 NAND data window
++		 * (1 MiB at 0x17c00000). The CS1 window is fixed by the
++		 * EBU's ADDR_SEL1 region map (ADDR_MASK(5) on xRX500
++		 * selects a 1 MiB aperture starting at 0x17c00000).
++		 */
++		reg = <0x16f00000 0x100>,
++		      <0x17c00000 0x100000>;
++		reg-names = "ebunand", "nand_cs1";
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "disabled";
++	};
++
++	/*
++	 * GSWIP-3.x register windows. Two independent instances per the
++	 * Intel xRX500 datasheet and the AVM 4.9 ltq_gsw_api_register()
++	 * dual-device code path: GSW-L at physical 0x1c000000 and GSW-R
++	 * at physical 0x1a000000. Physical addresses are used here (not
++	 * the KSEG1 CPU-virtual aliases sometimes quoted in vendor
++	 * headers) so that devm_ioremap_resource() can map them through
++	 * the kernel's standard MMIO path, matching the pattern used by
++	 * gic@12320000 and cgu@16200000 above. Each node starts disabled
++	 * at SoC scope; board DTSIs flip status="okay" via the &gswl /
++	 * &gswr labels.
++	 */
++	gswl: gswip@1c000000 {
++		compatible = "intel,xrx500-gswip-3.0";
++		reg = <0x1c000000 0x4000>;
++		lantiq,gswip-instance = <0>;
++		status = "disabled";
++	};
++
++	gswr: gswip@1a000000 {
++		compatible = "intel,xrx500-gswip-3.0";
++		reg = <0x1a000000 0x4000>;
++		lantiq,gswip-instance = <1>;
++		status = "disabled";
++	};
++
++	/*
++	 * Phase 3 / Sub-4 (ST-002): CBM (Central Buffer Manager) SoC-scope
++	 * skeleton. Bound by the lantiq-cbm-xrx500 platform_driver in
++	 * drivers/net/ethernet/lantiq/cqm/grx500/cbm.c.
++	 *
++	 * Status is "disabled" at SoC scope per CQ-002 C / IG-013: Sub-4
++	 * ships only the register-window topology (compatible / reg /
++	 * interrupts / clocks). Sub-6 will land the &cbm overlay in the
++	 * board DTSI (seale_avm_fritz7560.dtsi) that flips status to "okay"
++	 * and injects the reserved-memory phandles per IG-006 / IG-012.
++	 * While the node is disabled the platform_driver never .probe()s,
++	 * which keeps Sub-4 a build-only / DTC-only deliverable and
++	 * satisfies AC-002-9 (zero new dmesg lines from the CBM driver on
++	 * normal boot).
++	 *
++	 * The 12-tuple reg list mirrors AVM xrx500.dtsi:150-174 verbatim
++	 * (TMU first at 0x1E700000 = AVM ssx0@1E000000 + 0x700000 offset;
++	 * DMA_DESC last at 0x1E500000 + 0x100000). reg-names MUST match
++	 * the ioremap order in cbm_xrx500_probe (cbm.c cbm_ioremap_table)
++	 * — review_focus enforces this. The 5 GIC SHARED interrupt numbers
++	 * (174, 178, 179, 180, 181) are sourced from AVM xrx500.dtsi:165-169
++	 * and are LEVEL_HIGH on this silicon family.
++	 *
++	 * clocks property: AVM declares <&pll0aclk CBM_CLK>, <&clkgate1
++	 * GATE_CBM_CLK>; the linux-6.18.y intel,grx500-cgu binding rolls
++	 * those into a single cgu phandle with CLK_CBM / GCLK_CBM cell
++	 * values. See dt-bindings/clock/intel,grx500-clk.h.
++	 */
++	cbm: cbm@1e700000 {
++		compatible = "lantiq,cbm-xrx500";
++		reg = <0x1e700000 0x1000>,    /* tmu      */
++		      <0x1e710000 0x10000>,   /* cbm      */
++		      <0x1e720000 0x4000>,    /* qidt     */
++		      <0x1e730000 0x14000>,   /* sbim     */
++		      <0x1e750000 0x400>,     /* qeqcnt   */
++		      <0x1e750800 0x400>,     /* qdqcnt   */
++		      <0x1e760000 0x10000>,   /* ls       */
++		      <0x1e780000 0x20000>,   /* eqm      */
++		      <0x1e7c0000 0x30000>,   /* dqm      */
++		      <0x1e800000 0x100000>,  /* fsqm0    */
++		      <0x1e900000 0x100000>,  /* fsqm1    */
++		      <0x1e500000 0x100000>;  /* dma_desc */
++		reg-names = "tmu", "cbm", "qidt", "sbim",
++			    "qeqcnt", "qdqcnt", "ls", "eqm", "dqm",
++			    "fsqm0", "fsqm1", "dma_desc";
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 174 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SHARED 178 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SHARED 179 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SHARED 180 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SHARED 181 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&cgu CLK_CBM>, <&cgu GCLK_CBM>;
++		clock-names = "freq", "cbm";
++		status = "disabled";
++	};
++
++	/*
++	 * Sub-4B ST-002: three GSWIP-3.0 DMA controller register windows
++	 * bound by the lantiq,dma-xrx500 platform_driver
++	 * (drivers/net/ethernet/lantiq/dma/hdma.c). Absolute physical
++	 * addresses verified against AVM xrx500.dtsi per AS-005:
++	 *
++	 *   dma1tx @ 0x1a100000  ← AVM ssx2@1a000000 + 0x100000 offset
++	 *   dma1rx @ 0x1a200000  ← AVM ssx2@1a000000 + 0x200000 offset
++	 *   dma2tx @ 0x1c100000  ← AVM ssx1@1c000000 + 0x100000 offset
++	 *
++	 * GIC SHARED interrupt numbers 65 / 66 / 67 are taken verbatim
++	 * from AVM xrx500.dtsi:117 / :280 / :297 (AS-006). LEVEL_HIGH on
++	 * this silicon family.
++	 *
++	 * Per-controller property values are silicon-mandatory calibration
++	 * values (AS-007): dma1tx is desc-in-sram=1 + lab-cnt=2 +
++	 * polling-cnt=108 + byte-en=1 (mandatory A21 silicon settings);
++	 * dma1rx is desc-in-sram=0 + byte-en=0 + chan-fc=0; dma2tx is the
++	 * full AVM property block.
++	 *
++	 * status="okay" (NOT "disabled") on all three nodes — controllers
++	 * MUST probe to bind their irq lines and reg windows for ST-003 to
++	 * program (review_focus).
++	 *
++	 * DMA0 / DMA2RX / DMA3 / DMA4 nodes intentionally absent per CQ-002
++	 * C / AS-008.
++	 */
++	dma1tx: dma@1a100000 {
++		compatible = "lantiq,dma-xrx500";
++		reg = <0x1a100000 0x10000>;
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 65 IRQ_TYPE_LEVEL_HIGH>;
++		lantiq,dma-pkt-arb = <2>; /* 0 - burst, 1 - mulitburst, 2 - pkt */
++		lantiq,dma-burst = <16>; /* 2, 4, 8, 16 */
++		lantiq,dma-polling-cnt = <108>;
++		lantiq,dma-chan-fc = <1>;
++		lantiq,dma-desc-fod = <1>;
++		lantiq,dma-desc-in-sram = <1>; /* A11 - 0, A21 - 1 */
++		lantiq,dma-drb = <0>;
++		lantiq,dma-byte-en = <1>;
++		lantiq,budget = <20>;
++		lantiq,dma-lab-cnt = <2>; /* 0, 1, 2, 3 */
++		lantiq,dma-txendi = <3>;
++		lantiq,dma-rxendi = <3>;
++		status = "okay";
++	};
++
++	dma1rx: dma@1a200000 {
++		compatible = "lantiq,dma-xrx500";
++		reg = <0x1a200000 0x10000>;
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 66 IRQ_TYPE_LEVEL_HIGH>;
++		lantiq,dma-pkt-arb = <2>; /* 0 - burst, 1 - mulitburst, 2 - pkt */
++		lantiq,dma-burst = <16>; /* 2, 4, 8, 16 */
++		lantiq,dma-polling-cnt = <24>;
++		lantiq,dma-chan-fc = <0>;
++		lantiq,dma-desc-fod = <1>;
++		lantiq,dma-desc-in-sram = <0>;
++		lantiq,dma-drb = <0>;
++		lantiq,dma-byte-en = <0>;
++		lantiq,dma-txendi = <3>;
++		lantiq,dma-rxendi = <3>;
++		lantiq,budget = <20>;
++		status = "okay";
++	};
++
++	dma2tx: dma@1c100000 {
++		compatible = "lantiq,dma-xrx500";
++		reg = <0x1c100000 0x10000>;
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 67 IRQ_TYPE_LEVEL_HIGH>;
++		lantiq,dma-pkt-arb = <2>; /* 0 - burst, 1 - mulitburst, 2 - pkt */
++		lantiq,dma-burst = <16>; /* 2, 4, 8, 16 */
++		lantiq,dma-polling-cnt = <24>;
++		lantiq,dma-chan-fc = <1>;
++		lantiq,dma-desc-fod = <1>;
++		lantiq,dma-desc-in-sram = <0>;
++		lantiq,dma-drb = <0>;
++		lantiq,dma-byte-en = <1>;
++		lantiq,dma-txendi = <3>;
++		lantiq,dma-rxendi = <3>;
++		lantiq,budget = <20>;
++		status = "okay";
++	};
++
++	/*
++	 * IG-068: DMA2RX controller (cid=DMA2RX=4), the RX half of the AVM
++	 * DMA1TX<->DMA2RX peripheral-to-peripheral bridge brought up by
++	 * setup_DMA_p2p() (cqm/grx500/cbm.c). AVM ssx1@1c000000 + 0x200000
++	 * offset == 0x1c200000, interrupt GIC_SHARED 68 (= dma2tx 67 + 1).
++	 * lantiq,dma-chan-fc = <0> per AVM dma2rx (vs dma2tx's chan-fc=1).
++	 */
++	dma2rx: dma@1c200000 {
++		compatible = "lantiq,dma-xrx500";
++		reg = <0x1c200000 0x10000>;
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 68 IRQ_TYPE_LEVEL_HIGH>;
++		lantiq,dma-pkt-arb = <2>; /* 0 - burst, 1 - mulitburst, 2 - pkt */
++		lantiq,dma-burst = <16>; /* 2, 4, 8, 16 */
++		lantiq,dma-polling-cnt = <24>;
++		lantiq,dma-chan-fc = <0>;
++		lantiq,dma-desc-fod = <1>;
++		lantiq,dma-desc-in-sram = <0>;
++		lantiq,dma-drb = <0>;
++		lantiq,dma-byte-en = <1>;
++		lantiq,dma-txendi = <3>;
++		lantiq,dma-rxendi = <3>;
++		lantiq,budget = <20>;
++		status = "okay";
++	};
++};

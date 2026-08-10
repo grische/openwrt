@@ -1,0 +1,569 @@
+From 0cb3f5449e3cd9ed91e20cb926c5b67d796bcf52 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:09:19 +0000
+Subject: MIPS: dts: intel-mips: add AVM FRITZ!Box 7560 board
+
+Add the board DTS/dtsi for the AVM FRITZ!Box 7560 (AVM codename
+"seale", HW221), a GRX350-based DSL gateway, and the matching
+built-in-DTB Kconfig option (the AVM EVA bootloader does not pass a
+DTB, so the kernel carries one).
+
+Board description highlights:
+
+ - 128 MiB DDR at physical 0x20000000 (EVA layout).
+
+ - Macronix MX30LF1GE8AB NAND on EBU chip-select 1 (data window at
+   0x17c00000), using the chip's on-die BCH ECC via the legacy
+   "nand-ecc-mode" string property (the modern "nand-ecc-engine"
+   binding takes a phandle, which cannot name the on-die engine),
+   with the AVM partition layout.
+
+ - Reserved-memory carve-outs for the CBM packet-buffer pools
+   (18 MiB standard + 8 MiB jumbo, no-map) and the cbm node enabled
+   with those pools attached.
+
+ - GPHY firmware loader node (lantiq,phy-xrx500) loading the LAN
+   PHY11G firmware into GPHYs 2-5 through the RCU reset provider,
+   and the GSWIP MDIO bus with PHY addresses aligned to the
+   datapath port numbering. Front-panel LAN port N connects to
+   GPHY (6-N) on this board.
+
+ - avm-hw-revision node matching the vendor firmware's expectations.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ arch/mips/boot/dts/intel-mips/Makefile        |   1 +
+ .../dts/intel-mips/seale_avm_fritz7560.dts    |  70 +++
+ .../dts/intel-mips/seale_avm_fritz7560.dtsi   | 420 ++++++++++++++++++
+ arch/mips/intel-mips/Kconfig                  |   4 +
+ 4 files changed, 495 insertions(+)
+ create mode 100644 arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+ create mode 100644 arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+
+diff --git a/arch/mips/boot/dts/intel-mips/Makefile b/arch/mips/boot/dts/intel-mips/Makefile
+index adfaabbbb07ca..71b3a953d5a27 100644
+--- a/arch/mips/boot/dts/intel-mips/Makefile
++++ b/arch/mips/boot/dts/intel-mips/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
+ dtb-$(CONFIG_DTB_INTEL_MIPS_GRX500)	+= easy350_anywan.dtb
++dtb-$(CONFIG_DTB_INTEL_MIPS_FRITZ7560)	+= seale_avm_fritz7560.dtb
+ 
+ obj-$(CONFIG_BUILTIN_DTB)		+= $(addsuffix .o, $(dtb-y))
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+new file mode 100644
+index 0000000000000..edaa03612f5d7
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+@@ -0,0 +1,70 @@
++// SPDX-License-Identifier: GPL-2.0
++/dts-v1/;
++
++#include <dt-bindings/interrupt-controller/mips-gic.h>
++#include <dt-bindings/clock/intel,grx500-clk.h>
++
++#include "xrx500.dtsi"
++#include "seale_avm_fritz7560.dtsi"
++
++/ {
++	model = "AVM Fritz!Box 7560";
++	compatible = "avm,fritz7560", "intel,xrx500";
++
++	/*
++	 * SubRevision tag consumed by the AVM urlader's DTB-table scanner
++	 * (via the inject_avm_preamble.py preamble injected at image-build
++	 * time). The urlader rejects the boot with "Device Tree Blob for
++	 * SubRevision 1 not found" unless this node is present.
++	 * HW221=FB7560 SubRevision 1.
++	 */
++	avm-hw-revision {
++		compatible = "avm,avm_hw_revision";
++		revision = "221";
++		subrevision = "1";
++	};
++
++	/*
++	 * xrx500.dtsi already declares cpu0/cpu1 (interAptiv). The FB7560
++	 * has a 4-core interAptiv cluster ("VPE topology {2,2} total 4" per
++	 * v108dk-raw.txt line 197), so augment the inherited cpus block
++	 * with cpu2/cpu3. The cpus node is merged by dtc with the same path
++	 * declared in xrx500.dtsi; #address-cells / #size-cells are inherited.
++	 */
++	cpus {
++		cpu2: cpu@2 {
++			device_type = "cpu";
++			compatible = "mti,interaptiv";
++			reg = <2>;
++		};
++
++		cpu3: cpu@3 {
++			device_type = "cpu";
++			compatible = "mti,interaptiv";
++			reg = <3>;
++		};
++	};
++
++	/*
++	 * 128 MiB DDR at PHYS_OFFSET 0x20000000. Match the 5.10 reference
++	 * DTS for this board. The chip has 256 MiB physical but AVM's 4Kec
++	 * bootcore (kernel2 at load 0x8DFFFFFC) lives in the upper region;
++	 * conservative Phase 1 exposes only the bottom 128 MiB to the
++	 * InterAptiv kernel.
++	 * Reserved-memory regions (gphy_fw, cbm_std_pool, cbm_jbo_pool from
++	 * the 5.10 DTS) are deferred to Phase 2/3 where they're load-bearing.
++	 */
++	memory@20000000 {
++		device_type = "memory";
++		reg = <0x20000000 0x08000000>;
++	};
++
++	aliases {
++		serial0 = &asc0;
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++		bootargs = "";
++	};
++};
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+new file mode 100644
+index 0000000000000..dae51157be222
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+@@ -0,0 +1,420 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * AVM FRITZ!Box 7560 (HW221, GRX350) board-specific shared definitions.
++ *
++ * Phase 2 layers a persistent NAND-backed rootfs onto the Phase-1 RAM-boot
++ * baseline. This DTSI enables the SoC-scope EBU NAND controller (declared
++ * with status = "disabled" in xrx500.dtsi) and attaches a single chip child
++ * node carrying the verbatim AVM 5-partition map taken from the FB7560 boot
++ * log (ff/6.18-port/boot-logs/v108dk-raw.txt). Partition labels, offsets,
++ * and sizes are reproduced byte-for-byte from AVM's stock layout so that
++ * a vendor recovery (TFTP via the urlader) can hand the kernel back to
++ * AVM-firmware without remapping flash.
++ */
++
++&ebu_nand {
++	status = "okay";
++
++	/* FB7560's Macronix NAND is wired to EBU chip-select 1. */
++	lantiq,cs = <1>;
++
++	nand@0 {
++		reg = <0>;
++		label = "nand0";
++
++		/*
++		 * Macronix MX30LF1GE8AB on-die 4-bit BCH ECC. Selected via
++		 * the legacy "nand-ecc-mode" binding; the modern
++		 * "nand-ecc-engine" property is a phandle, not a string,
++		 * and is not applicable when the chip itself is the ECC
++		 * engine.
++		 */
++		nand-ecc-mode = "on-die";
++
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			/*
++			 * AVM urlader (first-stage bootloader). Read-only:
++			 * overwriting it bricks the device past the point of
++			 * recovery without JTAG/SPI-flashing the chip.
++			 */
++			partition@0 {
++				label = "urlader";
++				reg = <0x0 0x100000>;
++				read-only;
++			};
++
++			/*
++			 * AVM TFFS environment (serial, MAC, calibration). Kept
++			 * writable so the fritz-tffs userspace package can fix
++			 * up serial/MAC entries in some recovery flows.
++			 */
++			partition@100000 {
++				label = "nand-tffs";
++				reg = <0x100000 0x400000>;
++			};
++
++			/* Primary kernel slot. Written by sysupgrade. */
++			partition@500000 {
++				label = "kernel";
++				reg = <0x500000 0x800000>;
++			};
++
++			/* AVM secondary/recovery kernel slot. Written by sysupgrade. */
++			partition@d00000 {
++				label = "reserved-kernel";
++				reg = <0xd00000 0x800000>;
++			};
++
++			/* UBI volume hosting rootfs / rootfs_data. */
++			partition@1500000 {
++				label = "ubi";
++				reg = <0x1500000 0x6b00000>;
++			};
++		};
++	};
++};
++
++/*
++ * Phase 3 / Sub-1 (ST-001): bind both GSWIP-3.x instances declared at
++ * SoC scope in xrx500.dtsi. Status is enabled per board here for the
++ * passive register-access HAL probe stub; the actual switch core
++ * bring-up lands in ST-002/ST-003.
++ */
++&gswl {
++	status = "okay";
++};
++
++&gswr {
++	status = "okay";
++};
++
++/*
++ * Phase 3 / Sub-6 (ST-001 + EVAL-FIX-ROUND-1): GPHY firmware loader DT
++ * node, bound by the lantiq,phy-xrx500 platform_driver
++ * (drivers/net/ethernet/lantiq/xrx500_phy_fw.c).
++ *
++ * reg = <0x1c003c00 0x280>: sub-aperture into the GSW-L register window
++ * covering the GPHY*_LBADR / GPHY*_MBADR pairs (AVM offsets
++ * 0x228..0x26C, GSWIP-3.0 layout per gsw30_reg_top.h). The size was
++ * BUMPED FROM 0x80 to 0x280 in evaluation-fix-round-1: the original
++ * 0x80 ended the ioremap at 0x1c003c80, leaving the AVM-source
++ * GPHY register writes at offsets 0x228..0x26F OUTSIDE the mapped
++ * region — the moment the driver could reach the writel() (i.e. once
++ * the rcu0 binding lands; see below) the kernel would oops. 0x280
++ * covers offsets 0x000..0x280 from base, encompassing the full
++ * GPHY*_LBADR/MBADR register range (0x228..0x26F). Documented as
++ * ST-001 blocked_issue #2; fixed in EVAL-FIX-ROUND-1 per Evaluator
++ * fix request (AC-001-4 high).
++ *
++ * The window overlaps gswl@1c000000's <0x1c000000 0x4000> reg claim by
++ * design — the GPHY base-address registers physically live inside the
++ * GSW-L silicon block, and dtc tolerates sibling-node reg overlaps at
++ * root scope (no /soc{ranges} arbitration applies here). AS-006
++ * forbids editing xrx500.dtsi to shrink gswl's claim, so the
++ * sub-aperture sibling form is the only available encoding.
++ *
++ * Per CQ-004 closure (review_focus #4): GPHY register writes land on
++ * the L instance ONLY — never gswr@1a000000.
++ *
++ * firmware = "lantiq/xrx500-phy-fw.bin": the OpenWrt rootfs ships this
++ * blob (the xRx3xx A21 PHY11G firmware from FB7560-07.11's GPL drop)
++ * at /lib/firmware/lantiq/ per AC-001-12 — request_firmware searches
++ * that path.
++ *
++ * phy_id = <0x02 0x03 0x04 0x05 0x0F>: silicon ids per CQ-002 A. The
++ * driver maps these to xrx500_gphy[] indices via a sparse-lookup
++ * helper (0x02->0, 0x03->1, 0x04->2, 0x05->3, 0x0F->4); any other id
++ * returns -EINVAL per AC-001-2.
++ *
++ * resets / reset-names (EVAL-FIX-ROUND-1): wired against the new rcu0
++ * reset-controller declared at SoC scope in xrx500.dtsi
++ * (lantiq,xrx200-reset binding). Bit assignments come from AVM
++ * xrx500_phy_fw.c RCU_RD_GPHY{2,3,4,5,F}_XRX500 macros (drivers/net/
++ * ethernet/lantiq/xrx500_phy_fw.c:127-131):
++ *   phy2 -> bit 29  (RCU_RD_GPHY2_XRX500 = BIT(29))
++ *   phy3 -> bit 28  (RCU_RD_GPHY3_XRX500 = BIT(28))
++ *   phy4 -> bit 26  (RCU_RD_GPHY4_XRX500 = BIT(26))
++ *   phy5 -> bit 25  (RCU_RD_GPHY5_XRX500 = BIT(25))
++ *   phyF -> bit 31  (RCU_RD_GPHYF_XRX500 = BIT(31))
++ * The mainline lantiq,xrx200-reset binding uses #reset-cells = <2>:
++ * args = [set_bit, status_bit]. For these GPHY reset bits the set
++ * register and the status register share the same bit position (the
++ * RST_REQ bit at N triggers the reset and the RST_STAT bit at N
++ * reports the achieved state). The closes-Sub-6 fix landed in
++ * evaluation-fix-round-1 (AC-001-4 critical).
++ */
++/ {
++	phy-xrx500@1c003c00 {
++		compatible = "lantiq,phy-xrx500";
++		reg = <0x1c003c00 0x280>;
++		firmware = "lantiq/xrx500-phy-fw.bin";
++		/*
++		 * IG-026 fix: dropped the 0x0F (GPHYF, RCU bit 31) entry. Bit
++		 * 31 is the GPHY-GROUP MASTER reset, NOT a per-PHY GE reset. AVM
++		 * 4.9 loads only the four GE PHYs (phy_id = [00 01 02 03]) and
++		 * never touches bit 31 during firmware load. Including 0x0F made
++		 * the loader's last iteration toggle RCU_RST_REQ bit 31, which
++		 * topples the GPHY clock group the four GE cores just booted
++		 * from — they revert to ROM (MDIO PHY_ID falls back to the
++		 * 0x10201020 default) and autoneg never completes. Only the four
++		 * front-panel LAN GE PHYs (0x02..0x05 = bits 29/28/26/25) exist
++		 * on FB7560.
++		 */
++		phy_id = <0x02 0x03 0x04 0x05>;
++		resets = <&rcu_reset0 29 29>,
++			 <&rcu_reset0 28 28>,
++			 <&rcu_reset0 26 26>,
++			 <&rcu_reset0 25 25>;
++		reset-names = "phy2", "phy3", "phy4", "phy5";
++		status = "okay";
++	};
++
++	/*
++	 * Phase 3 / Sub-6 (ST-002b): GSWIP-3.0 MDIO bus.
++	 *
++	 * Closes Plan-Reviewer critical-1 — Sub-1's switch-api/ shipped
++	 * zero MDIO bus driver, so phylink_of_phy_connect always returned
++	 * -ENODEV at ST-003 bring-up. This node binds the
++	 * lantiq,gswip-mdio platform_driver
++	 * (drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c).
++	 *
++	 * Form choice (AC-002b-4): standalone platform_device sibling
++	 * rather than a child of &gswl. Rationale:
++	 *   1. Matches the form ST-001 used for phy-xrx500@1c003c00 —
++	 *      both sub-aperture peripherals of gswl@1c000000 are encoded
++	 *      as root-scope siblings with overlapping reg claims (dtc
++	 *      tolerates root-scope sibling-node reg overlaps; the kernel
++	 *      resource subsystem honours per-node ioremap regardless).
++	 *   2. of_mdiobus_register's contract is per-platform_device:
++	 *      pdev->dev.of_node is the natural anchor for the mdio
++	 *      child ethernet-phy@N nodes the framework auto-discovers
++	 *      (AC-002b-3, review focus #3).
++	 *   3. &gswl already has its own platform_driver bound to its
++	 *      lantiq,gswip-instance — embedding mdio as a child would
++	 *      force that driver to walk children, an architectural
++	 *      change outside ST-002b's file_scope.
++	 *
++	 * reg = <0x1c003c10 0x20>: sub-aperture into the GSW-T "top"
++	 * window of the GSWIP-3.0 register block. BUGFIX (Sub-6.1): the
++	 * earlier <0x1c000020 0x20> pointed at the GSWIP-2.x MDIO register
++	 * map (DWORD 0x008 from gswl base) — but the FB7560 GSWIP-L is
++	 * GSWIP-3.0, whose MDIO master registers live at the GSWT_MD*
++	 * DWORD offsets plus GSW30_TOP_OFFSET (0xF00). The hardware byte
++	 * address is gswl_base + (DWORD * 4):
++	 *   MDCTRL   = (0x004 + 0xF00) * 4 = 0x3C10
++	 *   MDREAD   = (0x005 + 0xF00) * 4 = 0x3C14
++	 *   MDWRITE  = (0x006 + 0xF00) * 4 = 0x3C18
++	 *   MDCCFG_0 = (0x007 + 0xF00) * 4 = 0x3C1C
++	 *   MDCCFG_1 = (0x008 + 0xF00) * 4 = 0x3C20
++	 * matching AVM GSW_MDIO_DataRead/DataWrite LTQ_GSWIP_3_0 branch
++	 * (switch-api/gsw_flow_core.c:12012-12026,12065-12077) and
++	 * gsw30_reg_top.h. The old aperture returned a constant 0x1020
++	 * per register because it read the wrong (GSWIP-2.x) block.
++	 *
++	 * This window (0x3c10..0x3c2f) sits inside phy-xrx500's
++	 * <0x1c003c00 0x280> sub-aperture; both are devm_ioremap-only
++	 * sub-apertures of gswl (no devm_request_mem_region resource
++	 * claim), so the overlap is intentional and harmless.
++	 *
++	 * Probe-order dependency (AC-002b-7): the mdio_xrx500.c probe
++	 * checks xrx500_gphy_fw_is_loaded() at entry and returns
++	 * -EPROBE_DEFER while the ST-001 firmware loader has not yet
++	 * completed. Without this gate, MDIO reads from un-firmware-loaded
++	 * GPHYs return 0xFFFF and of_mdiobus_register would silently
++	 * accept that as "PHY present, identity unreadable" — masquerading
++	 * a load-order bug as a hardware-failure mode.
++	 *
++	 * Child ethernet-phy@N silicon addresses {0x02, 0x03, 0x04, 0x05}
++	 * per CQ-002 A: these are the four GE PHYs serving the FB7560
++	 * LAN1..LAN4 ports. ST-003's per-port netdev DT nodes attach
++	 * phy-handle = <&gphy_lan1..&gphy_lan4> against the phandle
++	 * labels declared here (AC-002b-5).
++	 *
++	 * No "ethernet-phy-ieee802.3-c22" compatible string on the child
++	 * nodes: of_mdiobus treats a child with no compatible property as
++	 * a clause-22 PHY by default (see of_mdiobus_child_is_phy in
++	 * drivers/net/mdio/of_mdio.c) — the bare reg-only form is the
++	 * canonical encoding.
++	 */
++	gswip_mdio: gswip-mdio@1c003c10 {
++		compatible = "lantiq,gswip-mdio";
++		reg = <0x1c003c10 0x20>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "okay";
++
++		/*
++		 * Each label is consumed by the port whose intel,dp-port-id
++		 * equals the GSWIP port number, and GSWIP port N == GPHY-N ==
++		 * MDIO addr N. So the PHY address MUST match the consuming
++		 * port's dp-port-id, NOT ascending order:
++		 *   gphy_lan1 -> port@0 (dp-port-id 5) -> MDIO addr 5
++		 *   gphy_lan2 -> port@1 (dp-port-id 4) -> MDIO addr 4
++		 *   gphy_lan3 -> port@2 (dp-port-id 3) -> MDIO addr 3
++		 *   gphy_lan4 -> port@3 (dp-port-id 2) -> MDIO addr 2
++		 * The earlier ascending wiring (lan1->addr2 .. lan4->addr5)
++		 * made each netdev's phylink monitor the WRONG GPHY: eth0
++		 * (datapath GSWIP port 5) watched the PHY on port 2, so a
++		 * cable on the port-5 jack never raised carrier on eth0.
++		 */
++		gphy_lan1: ethernet-phy@5 {
++			reg = <0x05>;
++		};
++
++		gphy_lan2: ethernet-phy@4 {
++			reg = <0x04>;
++		};
++
++		gphy_lan3: ethernet-phy@3 {
++			reg = <0x03>;
++		};
++
++		gphy_lan4: ethernet-phy@2 {
++			reg = <0x02>;
++		};
++	};
++
++	/*
++	 * Phase 3 / Sub-6 (ST-003): netdev / phylink integration parent node.
++	 *
++	 * Bound by the intel-xrx500-net platform_driver
++	 * (drivers/net/ethernet/lantiq/intel_xrx500.c). The driver
++	 * instantiates one net_device per child port@N node; the four
++	 * LAN ports map to eth0..eth3 in registration order.
++	 *
++	 * AVM-orientation per-port mapping (AC-003-10), cited against
++	 * ff/sources/source-files-FRITZ.Box_7560-07.30/sources/kernel/
++	 * linux/arch/mips/boot/dts/lantiq/avm/grx_common.dtsi (the four
++	 * interface@N nodes carrying avm,name = "eth0".."eth3" labels):
++	 *
++	 *   port@0 -> eth0 = LAN1 = dp_port_id 5 = phy@5 (&gphy_lan1)
++	 *   port@1 -> eth1 = LAN2 = dp_port_id 4 = phy@4 (&gphy_lan2)
++	 *   port@2 -> eth2 = LAN3 = dp_port_id 3 = phy@3 (&gphy_lan3)
++	 *   port@3 -> eth3 = LAN4 = dp_port_id 2 = phy@2 (&gphy_lan4)
++	 *
++	 * The eth0=LAN1 to dp_port_id=5 orientation is INVERSE the
++	 * natural silicon-counting order (eth0=dp_port_id=2 would be
++	 * natural). AVM grx_common.dtsi at the interface@4 (lan1) node
++	 * declares avm,name = "eth0", intel,dp-port-id = <5>,
++	 * phy-handle = <&phy5> — the chassis-side ground truth.
++	 *
++	 * No parent-level reg property — this is a virtual grouping node.
++	 * The driver does not ioremap any register window of its own; the
++	 * per-port MAC register writes go through the GSW-L sub-module
++	 * via gsw_w32 (the gswl@1c000000 reg claim covers MAC_CTRL_0[N]
++	 * for N in 0..6).
++	 *
++	 * Compatible-string collision audit (AC-003-1 / review focus #3):
++	 * grep across /project/linux-6.18.y/drivers for the literal
++	 * strings 'intel,xrx500-net' and 'lantiq,xrx500-net' returns zero
++	 * hits at commit time.
++	 */
++	intel_xrx500_net: ethernet {
++		compatible = "intel,xrx500-net";
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "okay";
++
++		port@0 {
++			reg = <0>;
++			intel,dp-port-id = <5>;
++			phy-handle = <&gphy_lan1>;
++		};
++
++		port@1 {
++			reg = <1>;
++			intel,dp-port-id = <4>;
++			phy-handle = <&gphy_lan2>;
++		};
++
++		port@2 {
++			reg = <2>;
++			intel,dp-port-id = <3>;
++			phy-handle = <&gphy_lan3>;
++		};
++
++		port@3 {
++			reg = <3>;
++			intel,dp-port-id = <2>;
++			phy-handle = <&gphy_lan4>;
++		};
++	};
++
++	/*
++	 * Phase 3 / Sub-6 (ST-002): CBM std/jumbo buffer pool reservations.
++	 *
++	 * Addresses are taken VERBATIM from the 5.10 reference DTS for this
++	 * board, which the AVM testbed verified against working FB7560
++	 * silicon (an earlier reverse-engineering read notes that data-pointer
++	 * phys addresses 0x238x and 0x24ax are inside the CBM bus-master read
++	 * window while v5.10's at-the-time value 0x25cx was rejected). Per
++	 * CQ-003 A:
++	 *
++	 *   cbm_std_pool @ 0x23800000 size 0x1200000 (18 MiB; 9216 × 2 KiB)
++	 *   cbm_jbo_pool @ 0x24a00000 size 0x800000  ( 8 MiB; 1024 × 8 KiB)
++	 *
++	 * top of cbm_std_pool = 0x23800000 + 0x1200000 = 0x24a00000  (touches
++	 *                       cbm_jbo_pool base — no overlap, no gap)
++	 * top of cbm_jbo_pool = 0x24a00000 +  0x800000 = 0x25200000  (well
++	 *                       inside memory@20000000's <0x20000000 0x08000000>
++	 *                       128 MiB range whose top is 0x28000000 — 0x2e00000
++	 *                       / 46 MiB of headroom, IG-019 risk noted).
++	 *
++	 * `no-map` keeps the regions out of the buddy allocator entirely so
++	 * cbm_buf.c's carve allocator owns the only access path; the kernel
++	 * does not establish a linear mapping for these pages, hence cbm_buf.c
++	 * must call memremap()/devm_memremap() at probe time and cannot rely
++	 * on virt_to_phys() against the resulting kernel-virtual pointer.
++	 *
++	 * gphy_fw reservation INTENTIONALLY OMITTED per CQ-003 A: ST-001's
++	 * GPHY firmware loader uses dma_alloc_coherent (AVM-design path), so
++	 * the EVA-deposited 320 KiB region at 0x20000000 has no consumer in
++	 * Sub-6. The legacy 5.10 reserved-memory entry for gphy_fw is dead
++	 * weight on the v6.18 port.
++	 */
++	reserved-memory {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++
++		cbm_std_pool: cbm-std-pool@23800000 {
++			reg = <0x23800000 0x1200000>;
++			no-map;
++		};
++
++		cbm_jbo_pool: cbm-jbo-pool@24a00000 {
++			reg = <0x24a00000 0x800000>;
++			no-map;
++		};
++	};
++};
++
++/*
++ * Phase 3 / Sub-6 (ST-002): bind the cbm@1e700000 SoC-scope node to
++ * the two reserved-memory pools above and flip status to "okay".
++ *
++ * The node was declared with status="disabled" by Sub-4 (xrx500.dtsi
++ * cbm@1e700000) per CQ-002 C / IG-013 — it shipped as a build-only
++ * skeleton because cbm_xrx500_probe pulled placeholder buffer pools
++ * from __get_free_pages, diverging from the stock firmware's OFSC
++ * oracle. ST-002 wires the real reserved-memory pools, IG-012's
++ * placeholder __get_free_pages path is removed from cbm_buf.c, and
++ * the IG-013 unguarded-base audit was run before this flip — see the
++ * ST-002 commit message for the audit log.
++ *
++ * memory-region-names is consumed by cbm_buf_init_pools() in
++ * cbm_buf.c via of_property_match_string() / of_parse_phandle() +
++ * of_reserved_mem_lookup() per AC-002-2. The framework's auto-attach
++ * (of_dma_set_restricted_buffer in drivers/of/device.c) fires ONLY
++ * for nodes compatible="restricted-dma-pool" — our cbm-{std,jbo}-pool
++ * nodes carry no compatible string, so explicit lookup is mandatory.
++ */
++&cbm {
++	memory-region = <&cbm_std_pool>, <&cbm_jbo_pool>;
++	memory-region-names = "cbm-std-pool", "cbm-jbo-pool";
++	status = "okay";
++};
+diff --git a/arch/mips/intel-mips/Kconfig b/arch/mips/intel-mips/Kconfig
+index a4b69d0b5be3a..ef1f9fe681b68 100644
+--- a/arch/mips/intel-mips/Kconfig
++++ b/arch/mips/intel-mips/Kconfig
+@@ -14,6 +14,10 @@ config DTB_INTEL_MIPS_GRX500
+ 	bool "Intel MIPS GRX500 Board"
+ 	select BUILTIN_DTB
+ 
++config DTB_INTEL_MIPS_FRITZ7560
++	bool "AVM FRITZ!Box 7560"
++	select BUILTIN_DTB
++
+ endchoice
+ 
+ endif

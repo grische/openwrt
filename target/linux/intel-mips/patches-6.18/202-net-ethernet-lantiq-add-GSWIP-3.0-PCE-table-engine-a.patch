@@ -1,0 +1,1034 @@
+From 5692a579175598a588849058d364f47fc3bd4934 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:17:00 +0000
+Subject: net: ethernet: lantiq: add GSWIP-3.0 PCE table engine and parser
+ microcode
+
+Add the PCE (Packet Classification Engine) indirect-table access
+engine and the parser microcode load for the GSWIP-3.0 switch cores:
+
+ - gsw_flow_pce.c: the four indirect-table helpers
+   (gsw_pce_table_read/write and the key-search variants) driving
+   the PCE_TBL_* register window with busy-poll timeouts, the
+   GSWIP-3.0 table-shape descriptor and register-offset arrays, and
+   gsw_pmicro_code_init(), which loads the 256-row parser microcode
+   at probe time in the hardware-required order: disable per-port
+   FDMA/SDMA, arm the switch arbiter (GCTRL.SE=1) BEFORE clearing
+   MC_VALID, load the 256 rows, set MC_VALID, enable the BM RMON
+   counters, and select the GSWIP-3.0 GL_MOD queue mode. Reversing
+   the arbiter/MC_VALID order leaves the FDMA arbiter unarmed - a
+   regression documented from the earlier v5.10 port.
+
+ - pce_microcode_table.h: the 256-entry parser microcode array,
+   reproduced verbatim from the vendor source.
+
+Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
+switch-api module (gsw_tbl_rw.c, gsw_flow_core.c, gsw_flow_pce.c) -
+Copyright (c) 2012-2015 Lantiq Deutschland GmbH, (c) 2016-2017
+Intel Corporation; notices added to both files. GSWIP-2.2/3.1
+branches are not ported; error returns are strengthened so a failed
+row write aborts the load instead of leaving MC_VALID asserted over
+partial microcode.
+
+The per-port enable tail (FDMA/SDMA re-enable, PMAC tables,
+special-tag ingress) follows in the next patch.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/lantiq/Makefile          |   2 +-
+ .../ethernet/lantiq/switch-api/gsw_flow_pce.c | 671 ++++++++++++++++++
+ .../lantiq/switch-api/pce_microcode_table.h   | 297 ++++++++
+ 3 files changed, 969 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c
+ create mode 100644 drivers/net/ethernet/lantiq/switch-api/pce_microcode_table.h
+
+diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
+index e3ca093d9fe23..9eef653be1df4 100644
+--- a/drivers/net/ethernet/lantiq/Makefile
++++ b/drivers/net/ethernet/lantiq/Makefile
+@@ -16,4 +16,4 @@
+ 
+ obj-$(CONFIG_INTEL_XRX500_GSWIP_API) += intel-xrx500-gswip.o
+ 
+-intel-xrx500-gswip-y := switch-api/gsw_init.o switch-api/gsw_flow_core.o
++intel-xrx500-gswip-y := switch-api/gsw_init.o switch-api/gsw_flow_core.o switch-api/gsw_flow_pce.o
+diff --git a/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c
+new file mode 100644
+index 0000000000000..7576df83e2b40
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c
+@@ -0,0 +1,671 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/switch-api/gsw_tbl_rw.c and gsw_flow_core.c:
++ * Copyright (c) 2012, 2014, 2015 Lantiq Deutschland GmbH
++ * Copyright (c) 2016, 2017 Intel Corporation
++ */
++/*
++ * Intel xRX500 GSWIP-3.0 PCE table-rw helpers + PCE register-offset arrays.
++ *
++ * ST-001 ports four AVM 4.9 PCE indirect-table helpers from
++ *   drivers/net/ethernet/lantiq/switch-api/gsw_tbl_rw.c:465-737
++ * verbatim, with two deliberate deltas (per phase-3 sub-2 plan, CQ-003 answer
++ * B + architectural constraint GSWIP-3.0 only):
++ *
++ *   (1) Every inline `do { gsw_r32_raw(...PCE_TBL_CTRL_BAS_OFFSET...); }
++ *       while (gsw_field_r32(...BAS...));` busy-poll is replaced with the
++ *       Sub-1-ported CHECK_BUSY macro (gsw_flow_core.h:85-101), invoked with
++ *       RETURN_FROM_FUNCTION so a stuck BAS causes the helper to bail with
++ *       GSW_statusErr rather than spin forever in the kernel.
++ *
++ *   (2) Each helper guards `ptdata->table > 30` with WARN_ONCE + -EINVAL.
++ *       The GSWIP-3.0 PCE_TBL_CTRL.ADDR field is 5 bits wide (gsw_reg.h:1565);
++ *       indices 0..30 cover the entire GSWIP-3.0 ptbl_cmds_t / ptbl_3_1_cmds_t
++ *       range we port here (gsw_flow_core.h:453-486). Index 0x1F (31) maps
++ *       to PCE_PMAP_INDEX which is GSWIP-3.1-only (as observed on the stock
++ *       firmware); rejecting it at the helper boundary keeps GSWIP-3.1-only
++ *       call sites from accidentally programming a GSWIP-3.0 chip.
++ *
++ * The three static-const PCE register-offset arrays (gsw_pce_tbl_reg_key[22],
++ * gsw_pce_tbl_reg_mask[4], gsw_pce_tbl_reg_value[26]) and the 31-entry
++ * gsw_pce_tbl_info_30[] table-shape descriptor are lifted byte-identical from
++ * AVM gsw_flow_core.c:47-78 / :110-142. gsw_pce_tbl_info_22 (the GSWIP-2.2
++ * shape table) and gsw_pce_tbl_info_31 (the GSWIP-3.1 shape table) are NOT
++ * ported - architectural constraint GSWIP-3.0 only.
++ *
++ * gsw_pce_attach_tbl_30 wires those arrays + the info table into a probe-time
++ * ethsw_api_dev_t; it is called from ST-004's probe path before the microcode
++ * loader runs. Five plain assignments, no log lines, no gipver reads.
++ *
++ * ST-003 appends gsw_pmicro_code_init (the GSWIP-3.0 microcode load sequence)
++ * at the bottom of this file. The 256-entry parser-microcode array consumed
++ * by that loader ships as a single-translation-unit header (ST-002).
++ */
++
++#include <linux/bug.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++
++#include "gsw_init.h"
++#include "pce_microcode_table.h"
++
++/*
++ * The non-static functions defined in this TU - gsw_pce_attach_tbl_30,
++ * gsw_pmicro_code_init, gsw_pce_table_{read,write,key_read,key_write} - are
++ * declared via the gsw_init.h -> gsw_flow_core.h / gsw_tbl_rw.h header chain
++ * already included above (Sub-2 ST-004 moved the gsw_pce_attach_tbl_30 +
++ * gsw_pmicro_code_init prototypes out of the transient in-file forward decls
++ * and into gsw_flow_core.h so the gsw_init.c probe call sites can resolve
++ * them without any new top-level #include directive in that TU).
++ */
++
++/*
++ * PCE table register-offset arrays - verbatim from AVM gsw_flow_core.c:47-78.
++ * The three counts (22 / 4 / 26) match the GSWIP-3.x PCE table-rw register
++ * window in gsw_reg.h (PCE_TBL_KEY_0..21 / PCE_TBL_MASK_0..3 / PCE_TBL_VAL_0..25).
++ */
++static const u32 gsw_pce_tbl_reg_key[] = {
++	PCE_TBL_KEY_0_KEY0_OFFSET, PCE_TBL_KEY_1_KEY1_OFFSET,
++	PCE_TBL_KEY_2_KEY2_OFFSET, PCE_TBL_KEY_3_KEY3_OFFSET,
++	PCE_TBL_KEY_4_KEY4_OFFSET, PCE_TBL_KEY_5_KEY5_OFFSET,
++	PCE_TBL_KEY_6_KEY6_OFFSET, PCE_TBL_KEY_7_KEY7_OFFSET,
++	PCE_TBL_KEY_8_KEY8_OFFSET, PCE_TBL_KEY_9_KEY9_OFFSET,
++	PCE_TBL_KEY_10_KEY10_OFFSET, PCE_TBL_KEY_11_KEY11_OFFSET,
++	PCE_TBL_KEY_12_KEY12_OFFSET, PCE_TBL_KEY_13_KEY13_OFFSET,
++	PCE_TBL_KEY_14_KEY14_OFFSET, PCE_TBL_KEY_15_KEY15_OFFSET,
++	PCE_TBL_KEY_16_KEY16_OFFSET, PCE_TBL_KEY_17_KEY17_OFFSET,
++	PCE_TBL_KEY_18_KEY18_OFFSET, PCE_TBL_KEY_19_KEY19_OFFSET,
++	PCE_TBL_KEY_20_KEY20_OFFSET, PCE_TBL_KEY_21_KEY21_OFFSET
++};
++static const u32 gsw_pce_tbl_reg_mask[] = {
++	PCE_TBL_MASK_0_MASK0_OFFSET, PCE_TBL_MASK_1_MASK1_OFFSET,
++	PCE_TBL_MASK_2_MASK2_OFFSET, PCE_TBL_MASK_3_MASK3_OFFSET
++};
++static const u32 gsw_pce_tbl_reg_value[] = {
++	PCE_TBL_VAL_0_VAL0_OFFSET, PCE_TBL_VAL_1_VAL1_OFFSET,
++	PCE_TBL_VAL_2_VAL2_OFFSET, PCE_TBL_VAL_3_VAL3_OFFSET,
++	PCE_TBL_VAL_4_VAL4_OFFSET, PCE_TBL_VAL_5_VAL5_OFFSET,
++	PCE_TBL_VAL_6_VAL6_OFFSET, PCE_TBL_VAL_7_VAL7_OFFSET,
++	PCE_TBL_VAL_8_VAL8_OFFSET, PCE_TBL_VAL_9_VAL9_OFFSET,
++	PCE_TBL_VAL_10_VAL10_OFFSET, PCE_TBL_VAL_11_VAL11_OFFSET,
++	PCE_TBL_VAL_12_VAL12_OFFSET, PCE_TBL_VAL_13_VAL13_OFFSET,
++	PCE_TBL_VAL_14_VAL14_OFFSET, PCE_TBL_VAL_15_VAL15_OFFSET,
++	PCE_TBL_VAL_16_VAL16_OFFSET, PCE_TBL_VAL_17_VAL17_OFFSET,
++	PCE_TBL_VAL_18_VAL18_OFFSET, PCE_TBL_VAL_19_VAL19_OFFSET,
++	PCE_TBL_VAL_20_VAL20_OFFSET, PCE_TBL_VAL_21_VAL21_OFFSET,
++	PCE_TBL_VAL_22_VAL22_OFFSET, PCE_TBL_VAL_23_VAL23_OFFSET,
++	PCE_TBL_VAL_24_VAL24_OFFSET, PCE_TBL_VAL_25_VAL25_OFFSET
++};
++
++/*
++ * GSWIP-3.0 PCE table-shape descriptor - verbatim from AVM gsw_flow_core.c:110-142.
++ * Indexed by ptdata->table (the GSWIP PCE ADDR field, ptbl_cmds_t enum at
++ * gsw_flow_core.h:453-486). Each triplet {num_key, num_mask, num_val} tells the
++ * four helpers below how many KEY / MASK / VAL registers to push or pull for
++ * the selected PCE sub-table.
++ *
++ * 31 entries (indices 0..30) cover the entire GSWIP-3.0 PCE ADDR range. Index
++ * 31 (PCE_PMAP_INDEX = 0x1F) and above are GSWIP-3.1-only and are guarded by
++ * each helper's `ptdata->table > 30` check.
++ */
++static const gsw_pce_tbl_info_t gsw_pce_tbl_info_30[] = {
++	{ 0, 0, 4 },
++	{ 1, 1, 0 },
++	{ 0, 0, 3 },
++	{ 1, 0, 0 },
++	{ 1, 1, 0 },
++	{ 1, 1, 0 },
++	{ 4, 4, 0 },
++	{ 4, 4, 0 },
++	{ 1, 1, 0 },
++	{ 0, 0, 1 },
++	{ 0, 0, 1 },
++	{ 4, 0, 2 },
++	{ 0, 0, 0 },
++	{ 3, 0, 2 },
++	{ 2, 0, 5 },
++	{ 16, 0, 10 },
++	{ 0, 0, 0 },
++	{ 0, 0, 1 },
++	{ 1, 1, 1 },
++	{ 1, 1, 1 },
++	{ 0, 0, 0 },
++	{ 0, 0, 0 },
++	{ 3, 1, 0 },
++	{ 3, 1, 0 },
++	{ 1, 1, 0 },
++	{ 0, 0, 0 },
++	{ 0, 0, 1 },
++	{ 0, 0, 1 },
++	{ 0, 0, 2 },
++	{ 1, 1, 0 },
++	{ 0, 0, 2 }
++};
++
++/**
++ * gsw_pce_attach_tbl_30 - wire the GSWIP-3.0 PCE table-shape + register-offset
++ * arrays into a per-instance ethsw_api_dev_t.
++ *
++ * Called by ST-004's probe path immediately before gsw_pmicro_code_init runs,
++ * so that the four helpers below can dereference pethdev->pce_tbl_info /
++ * pethdev->pce_tbl_reg.{key,mask,value} when the microcode loader (or any
++ * later PCE-table consumer) invokes them. Five plain pointer/size assignments;
++ * no register IO, no log emission.
++ *
++ * Non-static so ST-004 can call it from gsw_init.c's probe path in a
++ * different TU; see the forward prototype near the top of this file.
++ */
++void gsw_pce_attach_tbl_30(ethsw_api_dev_t *pethdev)
++{
++	pethdev->pce_tbl_reg.key = gsw_pce_tbl_reg_key;
++	pethdev->pce_tbl_reg.mask = gsw_pce_tbl_reg_mask;
++	pethdev->pce_tbl_reg.value = gsw_pce_tbl_reg_value;
++	pethdev->pce_tbl_info = gsw_pce_tbl_info_30;
++	pethdev->num_of_pce_tbl = ARRAY_SIZE(gsw_pce_tbl_info_30);
++}
++
++/**
++ * gsw_pce_table_write - program one PCE sub-table row by address.
++ * @cdev: ethsw_api_dev_t * cast to void * (see GSW_PDATA_GET).
++ * @ptdata: PCE table programming descriptor; ptdata->table selects the
++ *          sub-table, ptdata->pcindex the row, ptdata->key/mask/val carry
++ *          the payload to write. Must be non-NULL.
++ *
++ * Returns -EINVAL if ptdata->table > 30 (GSWIP-3.1-only ADDR), GSW_statusErr
++ * if the BAS busy-bit fails to clear within MAX_BUSY_RETRY iterations on
++ * either the pre-write or post-write poll, GSW_statusOk on success.
++ *
++ * Ported from AVM gsw_tbl_rw.c:465-535. Caller is responsible for serialising
++ * concurrent invocations via pethdev->lock_pce (helpers themselves do not
++ * touch the spinlock - matches AVM convention).
++ */
++int gsw_pce_table_write(void *cdev, pctbl_prog_t *ptdata)
++{
++	u32 ctrlval;
++	u16 i, j;
++	/*
++	 * Sub-1's gsw_r32_raw / gsw_w32_raw (gsw_flow_core.c:155, :177) cast
++	 * cdev directly to (ethsw_api_dev_t *), and ST-004's probe path passes
++	 * pethdev (the struct pointer itself, not &pethdev->ops). Match that
++	 * accessor convention here -- GSW_PDATA_GET's container_of would
++	 * compute a wild pointer offset by -offsetof(ethsw_api_dev_t, ops)
++	 * from pethdev, corrupting all subsequent gswdev->{pnum, sdev, gipver,
++	 * pce_tbl_info, pce_tbl_reg.{key,mask,value}, num_of_pce_tbl} reads.
++	 */
++	ethsw_api_dev_t *gswdev = (ethsw_api_dev_t *)cdev;
++
++	if (gswdev == NULL)
++		return GSW_statusErr;
++
++	if (ptdata->table > 30) {
++		WARN_ONCE(1,
++			  "gsw_pce_table_write: GSWIP-3.0 PCE ADDR must be <=30, got %u (PCE_PMAP_INDEX=0x1F and above are GSWIP-3.1-only)\n",
++			  ptdata->table);
++		return -EINVAL;
++	}
++
++	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
++		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++	/*
++	 * Re-seed ctrlval from PCE_TBL_CTRL post-poll. The AVM do/while loop
++	 * we replaced left ctrlval holding the polled register value as a
++	 * side-effect; CHECK_BUSY's busy-bit value lives in a macro-local
++	 * variable that we cannot see, so we read PCE_TBL_CTRL once explicitly
++	 * to preserve the AVM behavior where the subsequent gsw_field_w32
++	 * calls compose onto the chip's current register state (notably the
++	 * EXTOP bit, which AVM never explicitly writes). Without this read,
++	 * gsw_field_w32(ctrlval, ...) would consume an uninitialized auto
++	 * variable - which both -Wuninitialized would flag fatal and would
++	 * write stack garbage into the PCE_TBL_CTRL register on the
++	 * subsequent gsw_w32_raw(..., ctrlval).
++	 */
++	gsw_r32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, &ctrlval);
++
++	gsw_w32_raw(cdev, PCE_TBL_ADDR_ADDR_OFFSET, ptdata->pcindex);
++	/*TABLE ADDRESS*/
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_ADDR_SHIFT,
++				PCE_TBL_CTRL_ADDR_SIZE, ptdata->table);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_OPMOD_SHIFT,
++				PCE_TBL_CTRL_OPMOD_SIZE, PCE_OP_MODE_ADWR);
++	/*KEY REG*/
++	j = gswdev->pce_tbl_info[ptdata->table].num_key;
++
++	if (ptdata->kformat)
++		j *= 4;
++
++	for (i = 0; i < j; i++) {
++		gsw_w32_raw(cdev, gswdev->pce_tbl_reg.key[i], ptdata->key[i]);
++	}
++
++	/*MASK REG*/
++	j = gswdev->pce_tbl_info[ptdata->table].num_mask;
++
++	for (i = 0; i < j; i++) {
++		gsw_w32_raw(cdev, gswdev->pce_tbl_reg.mask[i], ptdata->mask[i]);
++	}
++
++	/*VAL REG*/
++	j = gswdev->pce_tbl_info[ptdata->table].num_val;
++
++	for (i = 0; i < j; i++) {
++		gsw_w32_raw(cdev, gswdev->pce_tbl_reg.value[i], ptdata->val[i]);
++	}
++
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_KEYFORM_SHIFT,
++				PCE_TBL_CTRL_KEYFORM_SIZE, ptdata->kformat);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_TYPE_SHIFT,
++				PCE_TBL_CTRL_TYPE_SIZE, ptdata->type);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_VLD_SHIFT,
++				PCE_TBL_CTRL_VLD_SIZE, ptdata->valid);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_GMAP_SHIFT,
++				PCE_TBL_CTRL_GMAP_SIZE, ptdata->group);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_BAS_SHIFT,
++				PCE_TBL_CTRL_BAS_SIZE, 1);
++	gsw_w32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, ctrlval);
++
++	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
++		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++
++	gsw_w32_raw(cdev, PCE_TBL_CTRL_ADDR_OFFSET, 0);
++
++	return GSW_statusOk;
++}
++
++/**
++ * gsw_pce_table_read - read one PCE sub-table row by address.
++ * @cdev: ethsw_api_dev_t * cast to void *.
++ * @ptdata: PCE table programming descriptor; ptdata->table + ptdata->pcindex
++ *          select the row to read; ptdata->key/mask/val + ptdata->type +
++ *          ptdata->valid + ptdata->group receive the read-back data.
++ *
++ * Returns -EINVAL, GSW_statusErr, or GSW_statusOk per the same contract as
++ * gsw_pce_table_write.
++ *
++ * Ported from AVM gsw_tbl_rw.c:537-608. OPMOD uses the symbolic enum literal
++ * PCE_OP_MODE_ADRD (== 0 per gsw_flow_core.h:512), NOT the retracted v5.10
++ * literal 2 that the v108ih correction flagged as a bug class.
++ */
++int gsw_pce_table_read(void *cdev, pctbl_prog_t *ptdata)
++{
++	u32 ctrlval, value;
++	u16 i, j;
++	/* See gsw_pce_table_write for the cdev-accessor rationale. */
++	ethsw_api_dev_t *gswdev = (ethsw_api_dev_t *)cdev;
++
++	if (gswdev == NULL)
++		return GSW_statusErr;
++
++	if (ptdata->table > 30) {
++		WARN_ONCE(1,
++			  "gsw_pce_table_read: GSWIP-3.0 PCE ADDR must be <=30, got %u (PCE_PMAP_INDEX=0x1F and above are GSWIP-3.1-only)\n",
++			  ptdata->table);
++		return -EINVAL;
++	}
++
++	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
++		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++	/* See gsw_pce_table_write for the rationale for this re-seed. */
++	gsw_r32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, &ctrlval);
++
++	gsw_w32_raw(cdev, PCE_TBL_ADDR_ADDR_OFFSET, ptdata->pcindex);
++	/*TABLE ADDRESS*/
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_ADDR_SHIFT,
++				PCE_TBL_CTRL_ADDR_SIZE, ptdata->table);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_OPMOD_SHIFT,
++				PCE_TBL_CTRL_OPMOD_SIZE, PCE_OP_MODE_ADRD);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_KEYFORM_SHIFT,
++				PCE_TBL_CTRL_KEYFORM_SIZE, ptdata->kformat);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_BAS_SHIFT,
++				PCE_TBL_CTRL_BAS_SIZE, 1);
++	gsw_w32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, ctrlval);
++
++	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
++		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++	/*
++	 * Re-seed ctrlval after the post-read poll: the AVM do/while left
++	 * ctrlval holding the read-back PCE_TBL_CTRL register state, which
++	 * the gsw_field_r32 extractions for ptdata->type / valid / group
++	 * (below) depend on.
++	 */
++	gsw_r32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, &ctrlval);
++
++	/*KEY REG*/
++	j = gswdev->pce_tbl_info[ptdata->table].num_key;
++
++	if (ptdata->kformat)
++		j *= 4;
++
++	for (i = 0; i < j; i++) {
++		gsw_r32_raw(cdev, gswdev->pce_tbl_reg.key[i], &value);
++		ptdata->key[i] = value;
++	}
++
++	/*MASK REG*/
++	j = gswdev->pce_tbl_info[ptdata->table].num_mask;
++
++	for (i = 0; i < j; i++) {
++		gsw_r32_raw(cdev, gswdev->pce_tbl_reg.mask[i], &value);
++		ptdata->mask[i] = value;
++	}
++
++	/*VAL REG*/
++	j = gswdev->pce_tbl_info[ptdata->table].num_val;
++
++	for (i = 0; i < j; i++) {
++		gsw_r32_raw(cdev, gswdev->pce_tbl_reg.value[i], &value);
++		ptdata->val[i] = value;
++	}
++
++	ptdata->type = gsw_field_r32(ctrlval, PCE_TBL_CTRL_TYPE_SHIFT,
++				     PCE_TBL_CTRL_TYPE_SIZE);
++	ptdata->valid = gsw_field_r32(ctrlval, PCE_TBL_CTRL_VLD_SHIFT,
++				      PCE_TBL_CTRL_VLD_SIZE);
++	ptdata->group = gsw_field_r32(ctrlval, PCE_TBL_CTRL_GMAP_SHIFT,
++				      PCE_TBL_CTRL_GMAP_SIZE);
++	gsw_w32_raw(cdev, PCE_TBL_CTRL_ADDR_OFFSET, 0);
++
++	return GSW_statusOk;
++}
++
++/**
++ * gsw_pce_table_key_read - look up a PCE sub-table row by key, then read.
++ * @cdev: ethsw_api_dev_t * cast to void *.
++ * @ptdata: PCE table programming descriptor; ptdata->table + ptdata->key[]
++ *          identify the row; ptdata->val/type/valid/group + ptdata->pcindex
++ *          receive the read-back data.
++ *
++ * Returns -EINVAL, GSW_statusErr, or GSW_statusOk per the same contract as
++ * gsw_pce_table_write.
++ *
++ * Ported from AVM gsw_tbl_rw.c:610-669. OPMOD uses PCE_OP_MODE_KSRD (== 2).
++ */
++int gsw_pce_table_key_read(void *cdev, pctbl_prog_t *ptdata)
++{
++	u32 ctrlval, value;
++	u16 i, j;
++	/* See gsw_pce_table_write for the cdev-accessor rationale. */
++	ethsw_api_dev_t *gswdev = (ethsw_api_dev_t *)cdev;
++
++	if (gswdev == NULL)
++		return GSW_statusErr;
++
++	if (ptdata->table > 30) {
++		WARN_ONCE(1,
++			  "gsw_pce_table_key_read: GSWIP-3.0 PCE ADDR must be <=30, got %u (PCE_PMAP_INDEX=0x1F and above are GSWIP-3.1-only)\n",
++			  ptdata->table);
++		return -EINVAL;
++	}
++
++	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
++		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++	/* See gsw_pce_table_write for the rationale for this re-seed. */
++	gsw_r32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, &ctrlval);
++
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_ADDR_SHIFT,
++				PCE_TBL_CTRL_ADDR_SIZE, ptdata->table);
++
++	/*KEY REG*/
++	j = gswdev->pce_tbl_info[ptdata->table].num_key;
++
++	for (i = 0; i < j; i++) {
++		gsw_w32_raw(cdev, gswdev->pce_tbl_reg.key[i], ptdata->key[i]);
++	}
++
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_OPMOD_SHIFT,
++				PCE_TBL_CTRL_OPMOD_SIZE, PCE_OP_MODE_KSRD);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_KEYFORM_SHIFT,
++				PCE_TBL_CTRL_KEYFORM_SIZE, 0);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_BAS_SHIFT,
++				PCE_TBL_CTRL_BAS_SIZE, 1);
++	gsw_w32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, ctrlval);
++
++	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
++		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++	/*
++	 * Re-seed ctrlval after the post-read poll: the gsw_field_r32
++	 * extractions for ptdata->type / valid / group below depend on the
++	 * read-back PCE_TBL_CTRL register state.
++	 */
++	gsw_r32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, &ctrlval);
++
++	/*VAL REG*/
++	j = gswdev->pce_tbl_info[ptdata->table].num_val;
++
++	for (i = 0; i < j; i++) {
++		gsw_r32_raw(cdev, gswdev->pce_tbl_reg.value[i], &value);
++		ptdata->val[i] = value;
++	}
++
++	ptdata->type = gsw_field_r32(ctrlval, PCE_TBL_CTRL_TYPE_SHIFT,
++				     PCE_TBL_CTRL_TYPE_SIZE);
++	ptdata->valid = gsw_field_r32(ctrlval, PCE_TBL_CTRL_VLD_SHIFT,
++				      PCE_TBL_CTRL_VLD_SIZE);
++	ptdata->group = gsw_field_r32(ctrlval, PCE_TBL_CTRL_GMAP_SHIFT,
++				      PCE_TBL_CTRL_GMAP_SIZE);
++	gsw_r32_raw(cdev, PCE_TBL_ADDR_ADDR_OFFSET, &value);
++	ptdata->pcindex = value;
++	gsw_w32_raw(cdev, PCE_TBL_CTRL_ADDR_OFFSET, 0);
++
++	return GSW_statusOk;
++}
++
++/**
++ * gsw_pce_table_key_write - program a PCE sub-table row keyed by ptdata->key[].
++ * @cdev: ethsw_api_dev_t * cast to void *.
++ * @ptdata: PCE table programming descriptor; key/mask/val all push to HW.
++ *
++ * Returns -EINVAL, GSW_statusErr, or GSW_statusOk per the same contract as
++ * gsw_pce_table_write.
++ *
++ * Ported from AVM gsw_tbl_rw.c:672-736. OPMOD uses PCE_OP_MODE_KSWR (== 3).
++ */
++int gsw_pce_table_key_write(void *cdev, pctbl_prog_t *ptdata)
++{
++	u32 ctrlval;
++	u16 i, j;
++	/* See gsw_pce_table_write for the cdev-accessor rationale. */
++	ethsw_api_dev_t *gswdev = (ethsw_api_dev_t *)cdev;
++
++	if (gswdev == NULL)
++		return GSW_statusErr;
++
++	if (ptdata->table > 30) {
++		WARN_ONCE(1,
++			  "gsw_pce_table_key_write: GSWIP-3.0 PCE ADDR must be <=30, got %u (PCE_PMAP_INDEX=0x1F and above are GSWIP-3.1-only)\n",
++			  ptdata->table);
++		return -EINVAL;
++	}
++
++	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
++		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++	/* See gsw_pce_table_write for the rationale for this re-seed. */
++	gsw_r32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, &ctrlval);
++
++	/*TABLE ADDRESS*/
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_ADDR_SHIFT,
++				PCE_TBL_CTRL_ADDR_SIZE, ptdata->table);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_OPMOD_SHIFT,
++				PCE_TBL_CTRL_OPMOD_SIZE, PCE_OP_MODE_KSWR);
++
++	/*KEY REG*/
++	j = gswdev->pce_tbl_info[ptdata->table].num_key;
++
++	for (i = 0; i < j; i++) {
++		gsw_w32_raw(cdev, gswdev->pce_tbl_reg.key[i], ptdata->key[i]);
++	}
++
++	/*MASK REG*/
++	j = gswdev->pce_tbl_info[ptdata->table].num_mask;
++
++	for (i = 0; i < j; i++) {
++		gsw_w32_raw(cdev, gswdev->pce_tbl_reg.mask[i], ptdata->mask[i]);
++	}
++
++	/*VAL REG*/
++	j = gswdev->pce_tbl_info[ptdata->table].num_val;
++
++	for (i = 0; i < j; i++) {
++		gsw_w32_raw(cdev, gswdev->pce_tbl_reg.value[i], ptdata->val[i]);
++	}
++
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_KEYFORM_SHIFT,
++				PCE_TBL_CTRL_KEYFORM_SIZE, 0);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_TYPE_SHIFT,
++				PCE_TBL_CTRL_TYPE_SIZE, ptdata->type);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_VLD_SHIFT,
++				PCE_TBL_CTRL_VLD_SIZE, ptdata->valid);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_GMAP_SHIFT,
++				PCE_TBL_CTRL_GMAP_SIZE, ptdata->group);
++	ctrlval = gsw_field_w32(ctrlval, PCE_TBL_CTRL_BAS_SHIFT,
++				PCE_TBL_CTRL_BAS_SIZE, 1);
++	gsw_w32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, ctrlval);
++
++	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
++		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++
++	gsw_w32_raw(cdev, PCE_TBL_CTRL_ADDR_OFFSET, 0);
++
++	return GSW_statusOk;
++}
++
++/**
++ * gsw_pmicro_code_init - load the GSWIP-3.0 PCE parser microcode at probe time.
++ * @cdev: ethsw_api_dev_t * cast to void * (see GSW_PDATA_GET).
++ *
++ * Returns GSW_statusOk on success, GSW_statusErr on NULL gswdev or row-write
++ * failure.
++ *
++ * Ported from AVM 4.9 gsw_flow_pce.c:1488-1616 (GSWIP-3.0 branch only;
++ * the GSWIP-2.2 and GSWIP-3.1 branches at AVM lines 1538-1581 are NOT ported
++ * per the architectural constraint that this driver is GSWIP-3.0 only).
++ *
++ * v108rn-mandated ordering (silicon arbiter contract):
++ *   (1) NULL-check; (2) compute no_ports = gswdev->pnum;
++ *   (3) FDMA/SDMA disable loop with GSW-R hole-skip;
++ *   (4) GSWT_GCTRL_SE = 1  (FDMA arbiter activation gate, MUST precede
++ *       MC_VALID writes - reversing (4) and (5) re-introduces the v5.10
++ *       silicon-FDMA-arbiter-not-armed bug retracted in v108rn);
++ *   (5) PCE_GCTRL_0.MC_VALID = 0;
++ *   (6) 256-row microcode load via gsw_pce_table_write (PCE_PARS_INDEX);
++ *   (7) PCE_GCTRL_0.MC_VALID = 1;
++ *   (8) RMON enable pair-of-loops (BM_PCFG_CNTEN + BM_RMON_CTRL_BCAST_CNT)
++ *       with GSW-R hole-skip, gated on gipver == LTQ_GSWIP_3_0;
++ *   (9) BM_QUEUE_GCTRL.GL_MOD = 0 (using the 2-bit _SIZE2 width).
++ *
++ * AVM's `printk("Enter PCE micro-code init\n")` (AVM line 1506) and
++ * `pr_err("Exit PCE micro-code init\n")` (AVM line 1614) are intentionally
++ * dropped; ST-004's probe path emits the consolidated UART marker instead.
++ * AVM's commented-out per-row pr_err at line 1536 is dead code and is not
++ * ported. AVM's silent ignore of gsw_pce_table_write's return value
++ * (AVM line 1535) is strengthened here: a non-zero return aborts the load
++ * loop with pr_err + GSW_statusErr so the upstream probe path can unwind
++ * cleanly rather than leaving MC_VALID asserted over a partial microcode.
++ *
++ * pce_table_init (AVM gsw_flow_pce.c:1474-1486) is NOT called: that helper
++ * is a pure memset/zero-init function whose effect is already provided by
++ * Sub-1's devm_kzalloc allocation of the ethsw_api_dev_t (per AS-014).
++ * pethdev->lock_pce is NOT taken: probe context is implicitly single-threaded
++ * per devid (per AS-015).
++ */
++int gsw_pmicro_code_init(void *cdev)
++{
++	/* See gsw_pce_table_write for the cdev-accessor rationale. */
++	ethsw_api_dev_t *gswdev = (ethsw_api_dev_t *)cdev;
++	pctbl_prog_t tbl_entry;
++	u16 i, j;
++	u8 Gl_Mod_Size = 0;
++	u32 no_ports = 0;
++	int ret;
++
++	if (gswdev == NULL)
++		return GSW_statusErr;
++
++	/*
++	 * GSWIP-3.0-only port: the AVM IS_VRSN_31 branch that would otherwise
++	 * pick gswdev->tpnum is dropped (architectural constraint, GSWIP-3.0).
++	 */
++	no_ports = gswdev->pnum;
++
++	/*
++	 * TODO-Sub-3: pnum is hardcoded to 8 by ST-004 per CQ-001 answer A. On
++	 * GSW-R (sdev=LTQ_FLOW_DEV_INT_R) the AVM hole-skip pattern jumps from
++	 * j=1 to j=15 -- outside the pnum=8 loop bound -- so GSW-R disables
++	 * FDMA/SDMA only on port 0 here. Sub-3 will replace this with a
++	 * cap-read from ETHSW_CAP_1_PPORTS (AVM gsw_flow_core.c:379) to recover
++	 * the silicon-real pnum and cover any GSW-R ports at j>=15.
++	 */
++	/* Disable all physical port */
++	for (j = 0; j < no_ports; j++) {
++		if (gswdev->sdev == LTQ_FLOW_DEV_INT_R && j == 1)
++			j = 15;
++		gsw_w32(cdev, (FDMA_PCTRL_EN_OFFSET + (j * 0x6)),
++			FDMA_PCTRL_EN_SHIFT, FDMA_PCTRL_EN_SIZE, 0);
++		gsw_w32(cdev, (SDMA_PCTRL_PEN_OFFSET + (j * 0x6)),
++			SDMA_PCTRL_PEN_SHIFT, SDMA_PCTRL_PEN_SIZE, 0);
++	}
++
++	/*
++	 * v108rn-critical FDMA arbiter activation gate. MUST come BEFORE the
++	 * MC_VALID=0 write below; reversing the two re-introduces the v5.10
++	 * silicon bug class where the FDMA arbiter is not armed when the
++	 * parser is taken out of reset.
++	 */
++	gsw_w32(cdev, (GSWT_GCTRL_SE_OFFSET + GSW30_TOP_OFFSET),
++		GSWT_GCTRL_SE_SHIFT, GSWT_GCTRL_SE_SIZE, 1);
++
++	/* Micro code set invalid */
++	gsw_w32(cdev, PCE_GCTRL_0_MC_VALID_OFFSET,
++		PCE_GCTRL_0_MC_VALID_SHIFT, PCE_GCTRL_0_MC_VALID_SIZE, 0);
++
++	/* Download the microcode */
++	for (i = 0; i < 256 /* PCE_MICRO_TABLE_SIZE */; i++) {
++		memset(&tbl_entry, 0, sizeof(pctbl_prog_t));
++		tbl_entry.val[3] = pce_microcode_table[i].val_3;
++		tbl_entry.val[2] = pce_microcode_table[i].val_2;
++		tbl_entry.val[1] = pce_microcode_table[i].val_1;
++		tbl_entry.val[0] = pce_microcode_table[i].val_0;
++		tbl_entry.pcindex = i;
++		tbl_entry.table = PCE_PARS_INDEX;
++		ret = gsw_pce_table_write(cdev, &tbl_entry);
++		if (ret) {
++			pr_err("gsw_pmicro_code_init: row %u write failed: %d\n",
++			       i, ret);
++			return GSW_statusErr;
++		}
++	}
++
++	/* Micro code set valid */
++	gsw_w32(cdev, PCE_GCTRL_0_MC_VALID_OFFSET,
++		PCE_GCTRL_0_MC_VALID_SHIFT, PCE_GCTRL_0_MC_VALID_SIZE, 1);
++
++	/* Enable RMON Counter for all ports */
++	if (gswdev->gipver == LTQ_GSWIP_3_0) {
++		for (j = 0; j < gswdev->pnum; j++) {
++			if (gswdev->sdev == LTQ_FLOW_DEV_INT_R && j == 1)
++				j = 15;
++			gsw_w32(cdev, (BM_PCFG_CNTEN_OFFSET + (j * 0x2)),
++				BM_PCFG_CNTEN_SHIFT, BM_PCFG_CNTEN_SIZE, 1);
++		}
++
++		for (j = 0; j < gswdev->pnum; j++) {
++			if (gswdev->sdev == LTQ_FLOW_DEV_INT_R && j == 1)
++				j = 15;
++			gsw_w32(cdev, (BM_RMON_CTRL_BCAST_CNT_OFFSET + (j * 0x2)),
++				BM_RMON_CTRL_BCAST_CNT_SHIFT,
++				BM_RMON_CTRL_BCAST_CNT_SIZE, 1);
++		}
++	}
++
++	/*
++	 * GSWIP-3.0 selects the 2-bit GL_MOD width (BM_QUEUE_GCTRL_GL_MOD_SIZE2,
++	 * gsw_reg.h:663). AVM's gipver branch at lines 1604-1609 collapses to
++	 * a single assignment under the GSWIP-3.0-only architectural constraint.
++	 */
++	Gl_Mod_Size = BM_QUEUE_GCTRL_GL_MOD_SIZE2;
++	gsw_w32(cdev, BM_QUEUE_GCTRL_GL_MOD_OFFSET, BM_QUEUE_GCTRL_GL_MOD_SHIFT,
++		Gl_Mod_Size, 0);
++
++
++	return GSW_statusOk;
++}
+diff --git a/drivers/net/ethernet/lantiq/switch-api/pce_microcode_table.h b/drivers/net/ethernet/lantiq/switch-api/pce_microcode_table.h
+new file mode 100644
+index 0000000000000..d2764ede0a9e9
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/switch-api/pce_microcode_table.h
+@@ -0,0 +1,297 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Imported from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c:
++ * Copyright (c) 2012, 2014, 2015 Lantiq Deutschland GmbH
++ * Copyright (c) 2016, 2017 Intel Corporation
++ */
++/*
++ * pce_microcode_table.h - GSWIP-3.0 parser microcode table.
++ *
++ * The PCE_MC_M3 row macro and the 256-entry pce_microcode_table array
++ * initialiser are reproduced verbatim from the AVM/Lantiq vendor source
++ * shipped with FRITZ!Box 7560 07.30:
++ *   sources/kernel/linux/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c
++ *   lines 14-18  (PCE_MC_M3 macro)
++ *   lines 282-537 (256-entry pce_mc_max_ifx_tag_m_30 array, renamed here
++ *                  to pce_microcode_table per the v6.18 port).
++ *
++ * This header is a single-translation-unit constant table. It must be
++ * included by exactly one .c file (gsw_flow_pce.c). The PCE_MC_M3
++ * arguments are symbolic enum / define references whose definitions
++ * live in gsw_flow_core.h (OUT_*, FLAG_*, INSTR, and the
++ * PCE_MICROCODE / pce_uc_row_t typedef).
++ */
++#ifndef _PCE_MICROCODE_TABLE_H_
++#define _PCE_MICROCODE_TABLE_H_
++
++#include <linux/types.h>
++#include "gsw_flow_core.h"
++
++#define PCE_MC_M3(val, msk, ns, out, len, type, flags, ipv4_len)       \
++	{                                                              \
++		val, msk, (ns << 8 | out << 0),                        \
++			(len | type << 5 | flags << 8 | ipv4_len << 7) \
++	}
++
++static const PCE_MICROCODE pce_microcode_table = {
++	/* V30_13 */
++	PCE_MC_M3(0x88C3, 0xFFFF, 1, OUT_ITAG0, 4, INSTR, FLAG_ITAG, 0),
++	PCE_MC_M3(0x8100, 0xFFFF, 4, OUT_1VTAG0, 2, INSTR, FLAG_1VLAN, 0),
++	PCE_MC_M3(0x88A8, 0xFFFF, 4, OUT_1VTAG0, 2, INSTR, FLAG_1VLAN, 0),
++	PCE_MC_M3(0x0000, 0x0000, 15, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x8100, 0xFFFF, 7, OUT_2VTAG0, 2, INSTR, FLAG_2VLAN, 0),
++	PCE_MC_M3(0x88A8, 0xFFFF, 7, OUT_2VTAG0, 2, INSTR, FLAG_2VLAN, 0),
++	PCE_MC_M3(0x0000, 0x0000, 15, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x8100, 0xFFFF, 10, OUT_3VTAG0, 2, INSTR, FLAG_3VLAN, 0),
++	PCE_MC_M3(0x88A8, 0xFFFF, 10, OUT_3VTAG0, 2, INSTR, FLAG_3VLAN, 0),
++	PCE_MC_M3(0x0000, 0x0000, 15, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x8100, 0xFFFF, 13, OUT_4VTAG0, 2, INSTR, FLAG_4VLAN, 0),
++	PCE_MC_M3(0x88A8, 0xFFFF, 13, OUT_4VTAG0, 2, INSTR, FLAG_4VLAN, 0),
++	PCE_MC_M3(0x0000, 0x0000, 15, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x8100, 0xFFFF, 13, OUT_NONE, 2, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x88A8, 0xFFFF, 13, OUT_NONE, 2, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x0000, 0xF800, 17, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 23, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0600, 0x0600, 23, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 19, OUT_ETYPE, 1, INSTR, FLAG_LEN, 0),
++	PCE_MC_M3(0xAAAA, 0xFFFF, 21, OUT_APP0, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 198, OUT_APP0, 2, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0300, 0xFF00, 23, OUT_APP1, 2, INSTR, FLAG_SNAP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 198, OUT_APP1, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x8864, 0xFFFF, 28, OUT_ETYPE, 4, INSTR, FLAG_PPPOES, 0),
++	PCE_MC_M3(0x0800, 0xFFFF, 31, OUT_ETYPE, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x86DD, 0xFFFF, 56, OUT_ETYPE, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x888E, 0xFFFF, 197, OUT_ETYPE, 1, INSTR, FLAG_EAPOL, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_ETYPE, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0021, 0xFFFF, 31, OUT_PPP, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0057, 0xFFFF, 56, OUT_PPP, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_PPP, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x4000, 0xF000, 33, OUT_NONE, 0, INSTR, FLAG_1IPV4, 1),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0500, 0x0F00, 38, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0600, 0x0600, 37, OUT_NONE, 0, INSTR, FLAG_IPV4OPT, 0),
++	PCE_MC_M3(0x0800, 0x0800, 37, OUT_NONE, 0, INSTR, FLAG_IPV4OPT, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_1IP0, 10, INSTR, FLAG_IPV4OPT, 0),
++	PCE_MC_M3(0x0000, 0x0000, 38, OUT_NONE, 0, INSTR, FLAG_LROEXP, 0),
++	PCE_MC_M3(0x0003, 0x0003, 40, OUT_1IP0, 3, INSTR, FLAG_LROEXP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 40, OUT_1IP0, 3, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x3FFF, 42, OUT_1IP3, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 42, OUT_1IP3, 1, INSTR, FLAG_IPFRAG, 0),
++	PCE_MC_M3(0x0000, 0xFE00, 43, OUT_NONE, 0, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x0011, 0x00FF, 122, OUT_1IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0006, 0x00FF, 110, OUT_1IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0002, 0x00FF, 136, OUT_1IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0029, 0x00FF, 94, OUT_1IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0004, 0x00FF, 82, OUT_1IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x002F, 0x00FF, 153, OUT_1IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0032, 0x00FF, 51, OUT_1IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_1IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 52, OUT_APP0, 4, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x4000, 0xF000, 54, OUT_NONE, 6, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 55, OUT_NONE, 10, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_1PL, 2, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_1PL, 2, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x6000, 0xF000, 58, OUT_NONE, 0, INSTR, FLAG_1IPV6, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0030, 0x0030, 60, OUT_1IP0, 3, INSTR, FLAG_LROEXP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 60, OUT_1IP0, 3, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x00FE, 61, OUT_NONE, 0, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x1100, 0xFF00, 122, OUT_1IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0600, 0xFF00, 110, OUT_1IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 64, OUT_NONE, 0, INSTR, FLAG_LROEXP, 0),
++	PCE_MC_M3(0x0400, 0xFF00, 82, OUT_1IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x2900, 0xFF00, 94, OUT_1IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x2F00, 0xFF00, 153, OUT_1IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x3200, 0xFF00, 51, OUT_1IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0xFF00, 72, OUT_1IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x2B00, 0xFF00, 72, OUT_1IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x3C00, 0xFF00, 72, OUT_1IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_1IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x00F8, 74, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0xFF00, 72, OUT_1LNH, 1, IPV6, FLAG_1IPV6EXT, 0),
++	PCE_MC_M3(0x2B00, 0xFF00, 72, OUT_1LNH, 1, IPV6, FLAG_1IPV6EXT, 0),
++	PCE_MC_M3(0x3C00, 0xFF00, 72, OUT_1LNH, 1, IPV6, FLAG_1IPV6EXT, 0),
++	PCE_MC_M3(0x1100, 0xFF00, 122, OUT_1LNH, 1, IPV6, FLAG_1IPV6EXT, 0),
++	PCE_MC_M3(0x0600, 0xFF00, 110, OUT_1LNH, 1, IPV6, FLAG_1IPV6EXT, 0),
++	PCE_MC_M3(0x0400, 0xFF00, 82, OUT_1LNH, 1, IPV6, FLAG_1IPV6EXT, 0),
++	PCE_MC_M3(0x2900, 0xFF00, 94, OUT_1LNH, 1, IPV6, FLAG_1IPV6EXT, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_1LNH, 1, IPV6, FLAG_1IPV6EXT, 0),
++	PCE_MC_M3(0x0000, 0x0000, 83, OUT_NONE, 0, INSTR, FLAG_2IPV4, 1),
++	PCE_MC_M3(0x0500, 0x0F00, 87, OUT_2IP0, 3, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0600, 0x0600, 87, OUT_2IP0, 3, INSTR, FLAG_IPV4OPT, 0),
++	PCE_MC_M3(0x0800, 0x0800, 87, OUT_2IP0, 3, INSTR, FLAG_IPV4OPT, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_2IP0, 10, INSTR, FLAG_IPV4OPT, 0),
++	PCE_MC_M3(0x0000, 0x3FFF, 89, OUT_2IP3, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 89, OUT_2IP3, 1, INSTR, FLAG_IPFRAG, 0),
++	PCE_MC_M3(0x0000, 0xFE00, 90, OUT_NONE, 0, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x0011, 0x00FF, 133, OUT_2IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0006, 0x00FF, 110, OUT_2IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0002, 0x00FF, 136, OUT_2IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_2IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 95, OUT_2IP0, 3, INSTR, FLAG_2IPV6, 0),
++	PCE_MC_M3(0x0000, 0x00FE, 96, OUT_NONE, 0, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x1100, 0xFF00, 133, OUT_2IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0600, 0xFF00, 110, OUT_2IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0xFF00, 102, OUT_2IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x2B00, 0xFF00, 102, OUT_2IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x3C00, 0xFF00, 102, OUT_2IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_2IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x00F8, 104, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0xFF00, 102, OUT_2LNH, 1, IPV6, FLAG_2IPV6EXT, 0),
++	PCE_MC_M3(0x2B00, 0xFF00, 102, OUT_2LNH, 1, IPV6, FLAG_2IPV6EXT, 0),
++	PCE_MC_M3(0x3C00, 0xFF00, 102, OUT_2LNH, 1, IPV6, FLAG_2IPV6EXT, 0),
++	PCE_MC_M3(0x1100, 0xFF00, 133, OUT_2LNH, 1, IPV6, FLAG_2IPV6EXT, 0),
++	PCE_MC_M3(0x0600, 0xFF00, 110, OUT_2LNH, 1, IPV6, FLAG_2IPV6EXT, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_2LNH, 1, IPV6, FLAG_2IPV6EXT, 0),
++	PCE_MC_M3(0x0000, 0x0000, 111, OUT_APP0, 6, INSTR, FLAG_TCP, 0),
++	PCE_MC_M3(0x0040, 0x0040, 112, OUT_NONE, 0, INSTR, FLAG_LROEXP, 0),
++	PCE_MC_M3(0x0080, 0x0080, 113, OUT_NONE, 0, INSTR, FLAG_LROEXP, 0),
++	PCE_MC_M3(0x0020, 0x0020, 114, OUT_NONE, 0, INSTR, FLAG_LROEXP, 0),
++	PCE_MC_M3(0x0008, 0x0008, 115, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0001, 0x0001, 116, OUT_NONE, 0, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x0001, 0x0001, 117, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0004, 0x0004, 118, OUT_NONE, 0, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x0004, 0x0004, 119, OUT_NONE, 0, INSTR, FLAG_LROEXP, 0),
++	PCE_MC_M3(0x0002, 0x0002, 120, OUT_NONE, 0, INSTR, FLAG_LROEXP, 0),
++	PCE_MC_M3(0x0010, 0x0010, 200, OUT_APP6, 4, INSTR, FLAG_TCPACK, 0),
++	PCE_MC_M3(0x0000, 0x0010, 200, OUT_APP6, 4, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 123, OUT_APP0, 1, INSTR, FLAG_1UDP, 0),
++	PCE_MC_M3(0x06A5, 0xFFFF, 125, OUT_APP1, 2, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 127, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0xFFFF, 126, OUT_NONE, 0, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 137, OUT_APP3, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x147F, 0xFFFF, 131, OUT_APP1, 2, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 129, OUT_APP1, 2, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0xFFFF, 130, OUT_NONE, 0, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 198, OUT_APP3, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0xFFFF, 132, OUT_NONE, 0, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 149, OUT_APP3, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 134, OUT_APP0, 3, INSTR, FLAG_2UDP, 0),
++	PCE_MC_M3(0x0000, 0xFFFF, 135, OUT_NONE, 0, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 198, OUT_APP3, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 198, OUT_APP0, 4, INSTR, FLAG_IGMP, 0),
++	PCE_MC_M3(0x0000, 0xCA00, 144, OUT_NONE, 3, INSTR, FLAG_L2TP, 0),
++	PCE_MC_M3(0x4000, 0xCA00, 144, OUT_NONE, 4, INSTR, FLAG_L2TP, 0),
++	PCE_MC_M3(0x0200, 0xCA00, 142, OUT_NONE, 3, INSTR, FLAG_L2TP, 0),
++	PCE_MC_M3(0x4200, 0xCA00, 142, OUT_NONE, 4, INSTR, FLAG_L2TP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 198, OUT_NONE, 0, INSTR, FLAG_L2TP, 0),
++	PCE_MC_M3(0x0000, 0xFFFF, 144, OUT_NONE, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 198, OUT_NONE, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0xFF03, 0xFFFF, 146, OUT_NONE, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 198, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0021, 0xFFFF, 82, OUT_NONE, 1, INSTR, FLAG_L2TPNEXP, 0),
++	PCE_MC_M3(0x0057, 0xFFFF, 94, OUT_NONE, 1, INSTR, FLAG_L2TPNEXP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 198, OUT_NONE, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0010, 0x00F8, 151, OUT_NONE, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 198, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x01F8, 198, OUT_NONE, 0, INSTR, FLAG_CAPWAP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 198, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x2000, 0xFFFF, 156, OUT_NONE, 1, INSTR, FLAG_GREK, 0),
++	PCE_MC_M3(0x0000, 0xFFFF, 174, OUT_NONE, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x6558, 0xFFFF, 160, OUT_NONE, 1, INSTR, FLAG_GRE, 0),
++	PCE_MC_M3(0x0800, 0xFFFF, 172, OUT_NONE, 1, INSTR, FLAG_GRE, 0),
++	PCE_MC_M3(0x86DD, 0xFFFF, 173, OUT_NONE, 1, INSTR, FLAG_GRE, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 161, OUT_1PL, 2, INSTR, FLAG_L2TPNEXP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 162, OUT_NONE, 6, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x8100, 0xFFFF, 164, OUT_NONE, 2, INSTR, FLAG_GRE_VLAN1, 0),
++	PCE_MC_M3(0x0000, 0x0000, 165, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x8100, 0xFFFF, 165, OUT_NONE, 2, INSTR, FLAG_GRE_VLAN2, 0),
++	PCE_MC_M3(0x8864, 0xFFFF, 169, OUT_NONE, 4, INSTR, FLAG_GRE_PPPOE, 0),
++	PCE_MC_M3(0x0800, 0xFFFF, 178, OUT_NONE, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x86DD, 0xFFFF, 189, OUT_NONE, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0021, 0xFFFF, 178, OUT_NONE, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0057, 0xFFFF, 189, OUT_NONE, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 178, OUT_1PL, 2, INSTR, FLAG_L2TPNEXP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 189, OUT_1PL, 2, INSTR, FLAG_L2TPNEXP, 0),
++	PCE_MC_M3(0x6558, 0xFFFF, 161, OUT_NONE, 1, INSTR, FLAG_GRE, 0),
++	PCE_MC_M3(0x0800, 0xFFFF, 178, OUT_NONE, 1, INSTR, FLAG_GRE, 0),
++	PCE_MC_M3(0x86DD, 0xFFFF, 189, OUT_NONE, 1, INSTR, FLAG_GRE, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_NONE, 0, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 179, OUT_NONE, 0, INSTR, FLAG_2IPV4, 1),
++	PCE_MC_M3(0x0500, 0x0F00, 183, OUT_2IP0, 3, INSTR, FLAG_L2TPNEXP, 0),
++	PCE_MC_M3(0x0600, 0x0600, 183, OUT_2IP0, 3, INSTR, FLAG_IPV4OPT, 0),
++	PCE_MC_M3(0x0800, 0x0800, 183, OUT_2IP0, 3, INSTR, FLAG_IPV4OPT, 0),
++	PCE_MC_M3(0x0000, 0x0000, 197, OUT_2IP0, 10, INSTR, FLAG_IPV4OPT, 0),
++	PCE_MC_M3(0x0000, 0x3FFF, 185, OUT_2IP3, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 185, OUT_2IP3, 1, INSTR, FLAG_IPFRAG, 0),
++	PCE_MC_M3(0x0000, 0xFE00, 186, OUT_NONE, 0, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x0011, 0x00FF, 194, OUT_2IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0006, 0x00FF, 110, OUT_2IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_2IP4, 6, LENACCU, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 190, OUT_2IP0, 3, INSTR, FLAG_2IPV6, 0),
++	PCE_MC_M3(0x0000, 0x00FE, 191, OUT_NONE, 0, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x1100, 0xFF00, 194, OUT_2IP3, 17, INSTR, FLAG_L2TPNEXP, 0),
++	PCE_MC_M3(0x0600, 0xFF00, 110, OUT_2IP3, 17, INSTR, FLAG_L2TPNEXP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_2IP3, 17, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 195, OUT_APP0, 3, INSTR, FLAG_2UDP, 0),
++	PCE_MC_M3(0x0000, 0xFFFF, 196, OUT_NONE, 0, INSTR, FLAG_ROUTEXP, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_APP3, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 198, OUT_APP0, 2, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 199, OUT_1PL, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_2PL, 1, INSTR, FLAG_NO, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++	PCE_MC_M3(0x0000, 0x0000, 200, OUT_NONE, 0, INSTR, FLAG_END, 0),
++};
++
++#endif /* _PCE_MICROCODE_TABLE_H_ */

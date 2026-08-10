@@ -1,0 +1,827 @@
+From 93fb5c35c46cb331ffb860df38ea2fde47443135 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:18:45 +0000
+Subject: net: ethernet: lantiq: add xRX500 GPHY firmware loader
+
+Add the loader that boots the four internal Gigabit PHYs (GPHY 2-5)
+of the xRX500 family. The GPHYs are microcontroller cores that
+execute firmware staged in DDR; the loader:
+
+ - requests the PHY11G firmware image (the LAN blob - the EVA
+   bootloader preloads the WAN blob, which does not serve the LAN
+   ports), copies it to a 16 KiB-aligned DMA-visible staging buffer,
+   and programs its physical address into the per-GPHY base-address
+   registers. The staging address must be a plain physical DDR
+   address (dma_alloc_coherent addresses on this platform are not
+   GPHY-reachable), and the buffer's device is marked non-coherent
+   so the image is actually flushed to DDR before the GPHYs boot.
+
+ - sequences the GPHY resets through the RCU reset controller:
+   clear the GPHY-group master reset, then release the per-GPHY
+   resets after the base addresses are programmed. When the EVA
+   bootloader has already preset base addresses, the loader detects
+   and re-stages them coherently instead of double-resetting.
+
+ - exposes xrx500_gphy_fw_is_loaded() so the MDIO bus driver can
+   defer PHY enumeration until the GPHYs are running.
+
+Ported from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
+drivers/net/ethernet/lantiq/xrx500_phy_fw.c - Copyright (C) 2012
+John Crispin <blogic@openwrt.org> (notice restored), updated to
+v6.18 reset-controller and firmware APIs.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/lantiq/Makefile          |  12 +
+ .../ethernet/lantiq/include/xrx500_phy_fw.h   |  50 ++
+ drivers/net/ethernet/lantiq/xrx500_phy_fw.c   | 704 ++++++++++++++++++
+ 3 files changed, 766 insertions(+)
+ create mode 100644 drivers/net/ethernet/lantiq/include/xrx500_phy_fw.h
+ create mode 100644 drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+
+diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
+index 9eef653be1df4..2b9d68ce079b1 100644
+--- a/drivers/net/ethernet/lantiq/Makefile
++++ b/drivers/net/ethernet/lantiq/Makefile
+@@ -17,3 +17,15 @@
+ obj-$(CONFIG_INTEL_XRX500_GSWIP_API) += intel-xrx500-gswip.o
+ 
+ intel-xrx500-gswip-y := switch-api/gsw_init.o switch-api/gsw_flow_core.o switch-api/gsw_flow_pce.o
++
++#
++# Sub-6 ST-001: GPHY firmware loader (CQ-004 B). Appended to the existing
++# intel-xrx500-gswip composite per the plan's "intra-module-only"
++# visibility rule for xrx500_gphy_fw_is_loaded() — intel_xrx500.c
++# (Sub-6 ST-003) calls it as an ordinary intra-module function with no
++# EXPORT_SYMBOL gymnastics (AC-001-9 / AC-001-10). The 5 phylink-related
++# selects needed by this TU (PHYLIB / OF_MDIO / PHYLINK / FW_LOADER /
++# RESET_CONTROLLER) are added to the INTEL_XRX500_GSWIP_API entry in
++# switch-api/Kconfig per AC-001-10.
++#
++intel-xrx500-gswip-y += xrx500_phy_fw.o
+diff --git a/drivers/net/ethernet/lantiq/include/xrx500_phy_fw.h b/drivers/net/ethernet/lantiq/include/xrx500_phy_fw.h
+new file mode 100644
+index 0000000000000..3e8411ec83f8a
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/include/xrx500_phy_fw.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/xrx500_phy_fw.c and xrx500_phy_fw.h:
++ * Copyright (C) 2012 John Crispin <blogic@openwrt.org>
++ * Copyright (C) 2016 Intel Corporation
++ */
++/*
++ * Intel xRX500 GPHY firmware loader - intra-module API.
++ *
++ * Phase 3 Sub-6 ST-001: port of AVM 4.9
++ *   drivers/net/ethernet/lantiq/xrx500_phy_fw.c
++ * from the FB7560-07.30 GPL drop to Linux 6.18 idioms.
++ *
++ * Cited per IG-008 / AS-014:
++ *   ff/sources/source-files-FRITZ.Box_7560-07.30/sources/kernel/linux/
++ *     drivers/net/ethernet/lantiq/xrx500_phy_fw.c
++ *
++ * Visibility note (CQ-004 B / AC-001-9): every symbol declared here is
++ * INTRA-MODULE-ONLY. The xrx500_phy_fw.o translation unit lives inside
++ * the intel-xrx500-gswip composite (drivers/net/ethernet/lantiq/Makefile)
++ * alongside switch-api/, datapath/, cqm/, dma/ and tmu/. Other TUs in
++ * the same composite call these as ordinary file-local linkage; no
++ * EXPORT_SYMBOL / EXPORT_SYMBOL_GPL is used and none is required.
++ */
++
++#ifndef _LANTIQ_XRX500_PHY_FW_H_
++#define _LANTIQ_XRX500_PHY_FW_H_
++
++#include <linux/types.h>
++
++/**
++ * xrx500_gphy_fw_is_loaded() - report GPHY firmware load status.
++ *
++ * Returns true once the xrx500_phy_fw platform_driver's probe path has
++ * successfully completed (firmware fetched via request_firmware, copied
++ * into a 16 KiB-aligned dma_alloc_coherent buffer, programmed into the
++ * GSW-L GPHY*_LBADR/MBADR register windows, and all five reset lines
++ * deasserted). Returns false before that point or after a probe failure.
++ *
++ * Intended caller: intel_xrx500.c (ST-003) gates its phylink bring-up
++ * on this flag so that mac_link_up/down do not race the GPHY firmware
++ * upload during a fast re-bind sequence.
++ *
++ * Renamed from the AVM 4.9 reference's is_xway_gphy_fw_loaded() per
++ * CQ-004 B - the "xway" prefix is misleading on xRX500-family silicon.
++ */
++bool xrx500_gphy_fw_is_loaded(void);
++
++#endif /* _LANTIQ_XRX500_PHY_FW_H_ */
+diff --git a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+new file mode 100644
+index 0000000000000..3720789983184
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+@@ -0,0 +1,704 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Ported from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/xrx500_phy_fw.c:
++ * Copyright (C) 2012 John Crispin <blogic@openwrt.org>
++ */
++/*
++ * Intel xRX500 GPHY firmware loader.
++ *
++ * Phase 3 Sub-6 ST-001: port of AVM 4.9
++ *   drivers/net/ethernet/lantiq/xrx500_phy_fw.c
++ * (FB7560-07.30 GPL drop) to Linux 6.18 idioms per CQ-004 B + CQ-002 A.
++ *
++ * IG-008 / AS-014 citation: the AVM 4.9 source TU lives at
++ *   ff/sources/source-files-FRITZ.Box_7560-07.30/sources/kernel/linux/
++ *     drivers/net/ethernet/lantiq/xrx500_phy_fw.c
++ * (xrx500_gphy_boot, xway_gphy_load, xway_phy_fw_probe). The whole TU
++ * is ported here; the differences are:
++ *
++ *   - DT-bound platform_driver (devm_ioremap_resource on the node's
++ *     reg property) instead of a hardcoded KSEG1 0xBC003C00 cast.
++ *   - of_machine_is_compatible("intel,xrx500") in place of the legacy
++ *     "lantiq,grx500" (the v6.18 board DTS declares "intel,xrx500").
++ *   - writel() / readl() in place of ltq_w32() / ltq_r32().
++ *   - per-PHY devm_reset_control_get() instead of a single file-scope
++ *     phy_rst pointer that the AVM loop overwrites on every iteration
++ *     (a latent AVM bug: assert/deassert always operated on the LAST
++ *     reset line, never on the one whose registers were programmed).
++ *   - silicon-id phy_id (u32 array per CQ-002 A) instead of u8 index
++ *     into a packed [0..4] table. The DT carries the silicon ids
++ *     {0x02, 0x03, 0x04, 0x05, 0x0F} directly; the driver maps each
++ *     id to its xrx500_gphy[] slot via a sparse-lookup helper.
++ *   - reset names rendered with snprintf("phy%X", id) so 0x0F -> "phyF"
++ *     (uppercase hex), matching the DT reset-names entries
++ *     "phy2","phy3","phy4","phy5","phyF" per AC-001-3.
++ *   - SHA-256 prefix info-log line on success (IG-018 trigger-signal
++ *     anchor for blob-substitution bisection per AC-001-8).
++ *   - is_xway_gphy_fw_loaded() renamed to xrx500_gphy_fw_is_loaded()
++ *     and intra-module-only - NO EXPORT_SYMBOL per CQ-004 B / AC-001-9.
++ *   - probe-error paths propagate the errno to the platform-driver core
++ *     (no silent -EPROBE_DEFER loops, no panic on reset-control errors)
++ *     per AC-001-11.
++ *
++ * Register layout note (review_focus #4): all GPHY*_LBADR/MBADR writes
++ * target the GSW-L instance only - never gswr@1a000000. This matches
++ * CQ-004 closure: the GPHY firmware base-address register window lives
++ * exclusively in the GSW-L silicon block.
++ */
++
++#include <crypto/sha2.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/err.h>
++#include <linux/firmware.h>
++#include <linux/gfp.h>
++#include <linux/io.h>
++#include <linux/mm.h>
++#include <linux/kernel.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/printk.h>
++#include <linux/reset.h>
++#include <linux/types.h>
++
++#include "include/xrx500_phy_fw.h"
++
++/*
++ * GPHY firmware code requires a 16 KiB-aligned contiguous backing
++ * buffer (AVM 4.9 xrx500_phy_fw.c:18). The dma_alloc_coherent caller
++ * over-allocates by XRX200_GPHY_FW_ALIGN and then PTR_ALIGN()s the
++ * returned virtual+physical addresses to the alignment boundary.
++ */
++#define XRX200_GPHY_FW_ALIGN (16 * 1024)
++
++/*
++ * Per-GPHY base-address register offsets (AVM 4.9 xrx500_phy_fw.c:23-32).
++ *
++ * These offsets are relative to the GSW-L "top" register window which
++ * starts at physical 0x1C003C00 (gswl_base + GSW30_TOP_OFFSET, where
++ * GSW30_TOP_OFFSET = 0xF00 DWORDs = 0x3C00 bytes per gsw30_reg_top.h).
++ *
++ * The plan-mandated DT reg property <0x1c003c00 0x80> is the sub-aperture
++ * containing the LBADR/MBADR register pairs for the 5 GPHYs (silicon
++ * ids 0x02, 0x03, 0x04, 0x05, 0x0F) per CQ-002 A. Note that the GSW-L
++ * gswip@1c000000 node retains its <0x1c000000 0x4000> reg claim at SoC
++ * scope (xrx500.dtsi); this sub-aperture lives inside that range. The
++ * overlap is by design - dtc tolerates sibling-node reg overlaps at
++ * root scope; the kernel's resource subsystem honours per-node ioremap
++ * regardless. Only the actual register WRITES target this sub-aperture.
++ *
++ * Per CQ-004 closure: GPHY register writes land on the L instance only,
++ * never on gswr@1a000000.
++ */
++#define GPHY2_LBADR_XRX500 0x0228
++#define GPHY2_MBADR_XRX500 0x022C
++#define GPHY3_LBADR_XRX500 0x0238
++#define GPHY3_MBADR_XRX500 0x023C
++#define GPHY4_LBADR_XRX500 0x0248
++#define GPHY4_MBADR_XRX500 0x024C
++#define GPHY5_LBADR_XRX500 0x0258
++#define GPHY5_MBADR_XRX500 0x025C
++#define GPHYF_LBADR_XRX500 0x0268
++#define GPHYF_MBADR_XRX500 0x026C
++
++/*
++ * Silicon ids carried in the DT phy_id property per CQ-002 A. These are
++ * the values the AVM grx_common.dtsi phy_id property contains; in the
++ * 4.9 source they were re-interpreted at the C side as packed [0..4]
++ * indices into the (then contiguous) xrx500_gphy[] table - here the DT
++ * stays as silicon ids and the C code does an explicit sparse mapping.
++ */
++#define XRX500_GPHY_SILICON_ID_2 0x02
++#define XRX500_GPHY_SILICON_ID_3 0x03
++#define XRX500_GPHY_SILICON_ID_4 0x04
++#define XRX500_GPHY_SILICON_ID_5 0x05
++#define XRX500_GPHY_SILICON_ID_F 0x0F
++
++/*
++ * Per-GPHY base-address-register pair. AVM 4.9 xrx500_phy_fw.c:35-44.
++ *
++ * The .rd field (RCU mask bit) is preserved verbatim from the AVM
++ * source for documentation/auditing purposes; it is not consumed by
++ * the v6.18 port because reset_control_assert/deassert now drive the
++ * reset-controller framework rather than a direct RCU register write.
++ */
++struct ltq_xrx500_gphy_reset {
++	u32 rd;		/* RCU mask bit (documentary, unused on v6.18) */
++	u32 addr;	/* LBADR byte offset within the GSW-L sub-aperture */
++};
++
++#define RCU_RD_GPHY2_XRX500 BIT(29)
++#define RCU_RD_GPHY3_XRX500 BIT(28)
++#define RCU_RD_GPHY4_XRX500 BIT(26)
++#define RCU_RD_GPHY5_XRX500 BIT(25)
++#define RCU_RD_GPHYF_XRX500 BIT(31)
++
++static const struct ltq_xrx500_gphy_reset xrx500_gphy[] = {
++	{ RCU_RD_GPHY2_XRX500, GPHY2_LBADR_XRX500 }, /* idx 0 - silicon id 0x02 */
++	{ RCU_RD_GPHY3_XRX500, GPHY3_LBADR_XRX500 }, /* idx 1 - silicon id 0x03 */
++	{ RCU_RD_GPHY4_XRX500, GPHY4_LBADR_XRX500 }, /* idx 2 - silicon id 0x04 */
++	{ RCU_RD_GPHY5_XRX500, GPHY5_LBADR_XRX500 }, /* idx 3 - silicon id 0x05 */
++	{ RCU_RD_GPHYF_XRX500, GPHYF_LBADR_XRX500 }, /* idx 4 - silicon id 0x0F */
++};
++
++/*
++ * File-scope load flag - mirrors AVM 4.9's g_xway_gphy_fw_loaded. Set
++ * to true after a successful probe completion; queried via the
++ * intra-module accessor xrx500_gphy_fw_is_loaded().
++ */
++static bool g_xrx500_gphy_fw_loaded;
++
++/*
++ * File-scope ioremap'd GSW-L sub-aperture base - populated by probe via
++ * devm_ioremap_resource() on the phy-xrx500 DT node's reg property
++ * <0x1c003c00 0x80> (AC-001-5). Per the platform_driver contract there
++ * is exactly one phy-xrx500 instance per board, so a file-scope pointer
++ * is sufficient; no per-device struct is required.
++ */
++static void __iomem *gsw_l_phy_base;
++
++/*
++ * IG-026: ioremap'd RCU_RST_REQ register. The GRX350 Reset Control Unit
++ * lives at physical 0x16000000; the reset-request register is at offset
++ * 0x10 (AVM 4.9 RCU_RST_REQ). We drive the per-GPHY reset bits here with
++ * direct read-modify-write because the mainline reset-controller path
++ * fails (-145) on this SoC. Mapped once at probe.
++ */
++#define XRX500_RCU_BASE_PHYS 0x16000000u
++#define XRX500_RCU_RST_REQ   0x10u
++static void __iomem *rcu_rst_base;
++
++/**
++ * xrx500_gphy_idx_for_silicon_id() - map a DT silicon id to xrx500_gphy[] idx.
++ * @id: silicon id read from the DT phy_id u32 array.
++ *
++ * Sparse lookup helper per AC-001-2. The 5 mapped silicon ids are
++ * 0x02, 0x03, 0x04, 0x05, 0x0F; any other value returns -EINVAL (NOT
++ * -ERANGE or another errno - the criterion fixes the errno value).
++ *
++ * Return: 0..4 on a valid silicon id, -EINVAL otherwise.
++ */
++static int xrx500_gphy_idx_for_silicon_id(u32 id)
++{
++	switch (id) {
++	case XRX500_GPHY_SILICON_ID_2:
++		return 0;
++	case XRX500_GPHY_SILICON_ID_3:
++		return 1;
++	case XRX500_GPHY_SILICON_ID_4:
++		return 2;
++	case XRX500_GPHY_SILICON_ID_5:
++		return 3;
++	case XRX500_GPHY_SILICON_ID_F:
++		return 4;
++	default:
++		return -EINVAL;
++	}
++}
++
++static void gsw_reg_w32(u32 val, u32 reg_off)
++{
++	/*
++	 * Cast from the byte offset within the ioremap'd sub-aperture; the
++	 * AVM-style offsets (GPHY*_LBADR/MBADR = 0x228..0x26C) are passed
++	 * straight through. This is the v6.18 writel() replacement for the
++	 * AVM ltq_w32() KSEG1 cast - see header comment.
++	 */
++	writel(val, (u8 __iomem *)gsw_l_phy_base + reg_off);
++}
++
++static u32 gsw_reg_r32(u32 reg_off)
++{
++	return readl((u8 __iomem *)gsw_l_phy_base + reg_off);
++}
++
++/**
++ * xrx500_gphy_boot() - program a GPHY's firmware base-address registers.
++ * @dev:      probing device (for dev_info / dev_err).
++ * @phy_rst:  per-PHY reset_control handle (already devm_-acquired).
++ * @silicon_id: silicon id (0x02, 0x03, 0x04, 0x05, or 0x0F).
++ * @dev_addr: 16 KiB-aligned bus address of the firmware buffer.
++ *
++ * AVM 4.9 xrx500_phy_fw.c:48-64 verbatim (semantically). Differences:
++ *   - dispatch on silicon id (via the sparse-lookup helper) rather than
++ *     a 0..4 index; rejects unknown ids with -EINVAL per AC-001-2.
++ *   - reset_control handle is passed in per-PHY (devm_-owned by probe);
++ *     no shared file-scope phy_rst.
++ *   - of_machine_is_compatible() gate updated to "intel,xrx500" per
++ *     AC-001-6.
++ *   - reset_control_assert/deassert errors are logged but NOT fatal per
++ *     AC-001-11 (the AVM source did not check return values at all).
++ *
++ * Return: 0 on success, -EINVAL for an unknown silicon id, or a
++ * negative errno relayed from the reset-control framework when an
++ * assert/deassert fails on a hardware level the loader cannot recover.
++ * (Logging-only failures of the assert/deassert calls do NOT propagate.)
++ */
++static int xrx500_gphy_boot(struct device *dev, struct reset_control *phy_rst,
++			    u32 silicon_id, dma_addr_t dev_addr)
++{
++	int idx;
++	int ret;
++
++	if (!of_machine_is_compatible("intel,xrx500"))
++		return 0;
++
++	idx = xrx500_gphy_idx_for_silicon_id(silicon_id);
++	if (idx < 0) {
++		dev_err(dev, "xrx500-phy-fw: invalid silicon id 0x%X\n",
++			silicon_id);
++		return -EINVAL;
++	}
++
++	(void)phy_rst; /* IG-026: reset now via direct RCU MMIO, not framework */
++
++	/*
++	 * Sub-6.4 ROOT-CAUSE FIX (EVA-preset awareness): BEFORE touching any
++	 * reset or LBADR/MBADR register, read the CURRENT firmware-base address
++	 * the GPHY is running from. On this board EVA pre-loads and *runs* the
++	 * GPHY firmware (phys 0x20040000 -> LBADR/MBADR = 0x0000/0x2004), so the
++	 * GE cores are already alive and answering MDIO with 0xd565a409 at
++	 * hand-off. The prior loader was DESTRUCTIVE: it asserted the RCU reset
++	 * and overwrote LBADR/MBADR with a dma_alloc_coherent address the GPHY
++	 * cannot reach, then deasserted — killing the working EVA GPHY. The
++	 * working v5.10 reference (lantiq_xrx500.c:5288-5296) reuses the
++	 * EVA-preloaded LBADR/MBADR rather than loading its own. Replicate that:
++	 * if EVA already preset the base, leave the GPHY entirely alone.
++	 */
++	/*
++	 * Sub-6.5 ROOT-CAUSE FIX (LAN vs WAN firmware): EVA pre-loads the
++	 * LAN GE GPHYs pointing at phys 0x20040000 — the WAN/anywan PHY11G
++	 * blob (payload 80400302), whose copper AFE config is WRONG for the
++	 * LAN ports. Both WAN and LAN blobs are PHY11G and BOTH answer MDIO
++	 * with PHY_ID 0xd565a409, so a correct PHY_ID does NOT prove correct
++	 * firmware (as observed on the stock image). With the WAN blob the LAN
++	 * copper never completes autoneg (ANLPAR stays 0, BMCR restart-aneg
++	 * sticks).
++	 * AVM 4.9 loads the LAN blob (ltq_fw_PHY11G_IP_xRx5xx_A21.bin, payload
++	 * 80780302 == our xrx500-phy-fw.bin) via xrx500_phy_fw.c. So we MUST
++	 * NOT reuse EVA's preset: always reset-cycle the GPHY and re-point
++	 * LBADR/MBADR at OUR LAN blob below. (The earlier "reuse EVA, no
++	 * reset" path mistook the WAN blob's valid PHY_ID for a working PHY.)
++	 */
++
++	/*
++	 * Fall-through: EVA did NOT preload this GPHY. Load our own blob via the
++	 * symmetric assert / write LBADR-MBADR / deassert RCU reset (AVM 4.9
++	 * gsw_gphy_fw.c:880-883 ordering; v5.10 lantiq_xrx500.c:5298-5314).
++	 */
++	if (rcu_rst_base) {
++		u32 rd = xrx500_gphy[idx].rd;
++
++		/* assert reset: RCU_RST_REQ |= rd */
++		writel(readl(rcu_rst_base) | rd, rcu_rst_base);
++		/* hold reset briefly so the GPHY core sees it (AVM uses udelay) */
++		udelay(50);
++	} else {
++		dev_warn(dev,
++			 "xrx500-phy-fw: rcu_rst_base NULL; cannot assert GPHY reset (phy%X)\n",
++			 silicon_id);
++	}
++
++	/*
++	 * 16 KiB-aligned firmware base address split across the LBADR
++	 * (bits 15..0) and MBADR (bits 31..16) sibling registers. The
++	 * AVM source writes LBADR at addr+0 and MBADR at addr+4 - the
++	 * sibling register pairs are spaced 4 bytes apart per
++	 * gsw30_reg_top.h GPHYx_LBADR/MBADR DWORD layout. Programmed while
++	 * the GPHY is held in reset so it boots from this base on deassert.
++	 */
++	gsw_reg_w32((u32)dev_addr & 0xFFFF, xrx500_gphy[idx].addr);
++	gsw_reg_w32(((u32)dev_addr >> 16) & 0xFFFF,
++		    xrx500_gphy[idx].addr + 4);
++
++	if (rcu_rst_base) {
++		u32 rd = xrx500_gphy[idx].rd;
++
++		/* deassert reset: RCU_RST_REQ &= ~rd -> GPHY boots from MBADR */
++		writel(readl(rcu_rst_base) & ~rd, rcu_rst_base);
++		udelay(100);
++	}
++	ret = 0;
++
++	return 0;
++}
++
++/**
++ * xway_gphy_load() - request the firmware blob and stage it into DMA memory.
++ * @pdev:    probing platform_device.
++ * @dev_out: out-parameter receiving the 16 KiB-aligned bus address.
++ * @fw_name_out: out-parameter receiving the firmware filename (for the
++ *               IG-018 SHA-256-prefix info-log emitted by the caller).
++ * @fw_size_out: out-parameter receiving the firmware blob size (bytes).
++ * @sha_out: out-parameter receiving the SHA-256 digest of the blob.
++ *
++ * AVM 4.9 xrx500_phy_fw.c:67-99 verbatim. Differences:
++ *   - returns an errno (not a bus address) so failure paths propagate
++ *     the actual cause (firmware filename missing / request_firmware
++ *     failure / dma_alloc_coherent ENOMEM) per AC-001-11.
++ *   - emits the IG-018 SHA-256-prefix info-log line via the caller
++ *     after the alignment fixup so dev_addr in the line is the aligned
++ *     value programmed to the registers (AC-001-7 / AC-001-8).
++ *
++ * Return: 0 on success, a negative errno on failure.
++ */
++static int xway_gphy_load(struct platform_device *pdev,
++			  dma_addr_t *dev_out, const char **fw_name_out,
++			  size_t *fw_size_out,
++			  u8 sha_out[SHA256_DIGEST_SIZE])
++{
++	const struct firmware *fw;
++	dma_addr_t dev_addr = 0;
++	const char *fw_name;
++	void *fw_addr;
++	size_t size;
++	int err;
++
++	err = of_property_read_string(pdev->dev.of_node, "firmware", &fw_name);
++	if (err) {
++		dev_err(&pdev->dev,
++			"xrx500-phy-fw: failed to read DT 'firmware' property: %d\n",
++			err);
++		return err;
++	}
++
++	dev_info(&pdev->dev, "xrx500-phy-fw: requesting %s\n", fw_name);
++	err = request_firmware(&fw, fw_name, &pdev->dev);
++	if (err) {
++		dev_err(&pdev->dev,
++			"xrx500-phy-fw: request_firmware(%s) failed: %d\n",
++			fw_name, err);
++		return err;
++	}
++
++	/*
++	 * Compute the SHA-256 digest of the raw firmware blob BEFORE the
++	 * copy so the digest reflects the on-disk bytes (IG-018 anchor).
++	 */
++	sha256(fw->data, fw->size, sha_out);
++
++	/*
++	 * GPHY cores need the firmware code in a persistent and contiguous
++	 * memory area with a 16 KiB-aligned start address (AVM 4.9
++	 * comment). Over-allocate by XRX200_GPHY_FW_ALIGN, then PTR_ALIGN()
++	 * the returned virtual+physical addresses to land on the boundary.
++	 */
++	size = fw->size + XRX200_GPHY_FW_ALIGN;
++	/*
++	 * Sub-6.6 FIX (GPHY-reachable firmware address): the GPHY core is a bus
++	 * master that fetches its firmware from DRAM using a RAW address that
++	 * matches EVA's scheme (EVA programs LBADR/MBADR = 0x20040000). The
++	 * prior dma_alloc_coherent path returned a *DMA* address (0x22440000)
++	 * for THIS platform_device that the GPHY's own address bus could NOT
++	 * fetch from: the readback latched (MBADR=0x2244) but the core never
++	 * booted and MDIO went dead (0x0). Use a linear-mapped (kernel-logical)
++	 * buffer so virt_to_phys() yields the TRUE physical address, then flush
++	 * the CPU cache for that range (dma_sync_single_for_device,
++	 * DMA_TO_DEVICE) so the GPHY DMA reads consistent bytes. Matches the
++	 * working v5.10 reference (lantiq_xrx500.c v108yv). __get_free_pages
++	 * gives a page-block aligned region (>= XRX200_GPHY_FW_ALIGN for this
++	 * size); it is intentionally never freed (persistent firmware area,
++	 * like AVM's never-released dma_alloc_coherent buffer).
++	 */
++	{
++		unsigned long pg;
++		phys_addr_t phys;
++
++		pg = __get_free_pages(GFP_KERNEL, get_order(size));
++		if (!pg) {
++			dev_err(&pdev->dev,
++				"xrx500-phy-fw: __get_free_pages(%zu) failed\n",
++				size);
++			release_firmware(fw);
++			return -ENOMEM;
++		}
++		fw_addr = PTR_ALIGN((void *)pg, XRX200_GPHY_FW_ALIGN);
++		memcpy(fw_addr, fw->data, fw->size);
++
++		phys = virt_to_phys(fw_addr);
++		dma_sync_single_for_device(&pdev->dev, (dma_addr_t)phys,
++					   fw->size, DMA_TO_DEVICE);
++		dev_addr = (dma_addr_t)phys;
++		dev_info(&pdev->dev,
++			 "xrx500-phy-fw: staged blob at virt=%p phys=0x%08x (was using dma_alloc dev_addr; now virt_to_phys)\n",
++			 fw_addr, (u32)dev_addr);
++	}
++
++	*dev_out = dev_addr;
++	*fw_name_out = fw_name;
++	*fw_size_out = fw->size;
++
++	release_firmware(fw);
++	return 0;
++}
++
++/**
++ * xway_phy_fw_probe() - platform_driver probe for "lantiq,phy-xrx500".
++ *
++ * AVM 4.9 xrx500_phy_fw.c:102-128 verbatim. Differences:
++ *   - reg-property-bound devm_ioremap_resource() establishes
++ *     gsw_l_phy_base; failure propagates the errno per AC-001-5.
++ *   - phy_id read as a u32 array (NOT a u8 byte stream) per AC-001-2:
++ *     of_property_count_u32_elems + of_property_read_u32_index.
++ *   - per-PHY devm_reset_control_get() with snprintf("phy%X", id) name
++ *     formatting per AC-001-3. Missing/unmapped names emit pr_err
++ *     identifying which name failed and return -ENODEV.
++ *   - silicon-id bounds check via xrx500_gphy_idx_for_silicon_id()
++ *     happens BEFORE devm_reset_control_get per AC-001-2.
++ *   - SHA-256-prefix info-log emitted exactly once on success per
++ *     AC-001-8.
++ *
++ * Return: 0 on success, a negative errno on any sub-step failure (no
++ * silent -EPROBE_DEFER loops per AC-001-11).
++ */
++static int xway_phy_fw_probe(struct platform_device *pdev)
++{
++	dma_addr_t fw_addr;
++	const char *fw_name = NULL;
++	size_t fw_size = 0;
++	u8 sha[SHA256_DIGEST_SIZE];
++	bool eva_preset;
++	int phy_count;
++	int i;
++	int ret;
++
++	/*
++	 * Force THIS device non-coherent. The platform enables IOCU hardware
++	 * DMA coherency globally (arch/mips/intel-mips/prom.c) so the datapath
++	 * descriptor rings get cached, snooped coherent memory. But the GPHY
++	 * firmware-fetch master is NOT in the IOCU coherence domain: it reads
++	 * the firmware blob from DRAM directly. With the device coherent, our
++	 * dma_sync_single_for_device(DMA_TO_DEVICE) in xway_gphy_load would be
++	 * a no-op and the GPHY would fetch stale (cached-but-not-written-back)
++	 * bytes -> firmware never boots, MDIO reads 0x0 (observed regression).
++	 * Marking this one device non-coherent makes that sync perform a real
++	 * cache writeback so the GPHY sees the firmware. Datapath devices are
++	 * unaffected (they stay coherent via dma_default_coherent).
++	 */
++	pdev->dev.dma_coherent = false;
++
++	/*
++	 * ioremap the GSW-L GPHY sub-aperture (reg = <0x1c003c00 0x280> in
++	 * seale_avm_fritz7560.dtsi). The 0x40000 GSW-L window at 0x1c000000
++	 * is exclusively reserved by the intel-xrx500-gswip platform_driver,
++	 * so devm_platform_ioremap_resource() returns -EBUSY here. Use
++	 * devm_ioremap() (no request_mem_region) since GSW-L doesn't touch
++	 * the GPHY*_LBADR/MBADR sub-aperture (0x228..0x26C) — this is the
++	 * standard kernel pattern for sharing a sub-region of another
++	 * driver's exclusive window. devm-owned so the mapping is released
++	 * on probe failure or unbind. AC-001-5: failure path returns the
++	 * error to the driver core (NOT swallowed).
++	 */
++	{
++		struct resource *res;
++
++		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++		if (!res) {
++			dev_err(&pdev->dev,
++				"xrx500-phy-fw: missing reg resource\n");
++			return -ENODEV;
++		}
++		gsw_l_phy_base = devm_ioremap(&pdev->dev, res->start,
++					      resource_size(res));
++		if (!gsw_l_phy_base) {
++			dev_err(&pdev->dev,
++				"xrx500-phy-fw: devm_ioremap failed at 0x%llx size 0x%llx\n",
++				(unsigned long long)res->start,
++				(unsigned long long)resource_size(res));
++			return -ENOMEM;
++		}
++	}
++
++	/*
++	 * Sub-6.4: detect whether EVA has already preloaded and is running the
++	 * GPHY firmware. If GPHY2's LBADR/MBADR (sub-aperture offset 0x228/0x22C)
++	 * are non-zero, EVA preset the base and the GE cores are alive — in that
++	 * case we must NOT touch the CGU block clock or the RCU group reset, as
++	 * either disturbs the running GPHY. Only when EVA did NOT preload do we
++	 * fall back to clock-gating + group-reset-clear + loading our own blob.
++	 */
++	{
++		u32 lb0 = gsw_reg_r32(GPHY2_LBADR_XRX500) & 0xFFFF;
++		u32 mb0 = gsw_reg_r32(GPHY2_MBADR_XRX500) & 0xFFFF;
++
++		eva_preset = (lb0 != 0 || mb0 != 0);
++	}
++
++	if (!eva_preset) {
++		/*
++		 * IG-026: enable the GSWIP/GPHY block clock (CGU GSR1 gate, bit 28
++		 * = GATE_GSWIP) BEFORE any reset/firmware work. Only needed when we
++		 * are loading our own blob — when EVA already runs the GPHY the gate
++		 * is already set and poking it could perturb the live core.
++		 */
++		void __iomem *cgu_gsr1_en = ioremap(0x16200124u, sizeof(u32));
++
++		if (cgu_gsr1_en) {
++			writel(BIT(28), cgu_gsr1_en);
++			(void)readl(cgu_gsr1_en); /* post-write settle */
++			iounmap(cgu_gsr1_en);
++			udelay(50);
++		} else {
++			dev_warn(&pdev->dev,
++				 "xrx500-phy-fw: failed to ioremap CGU GSR1 enable @0x16200124\n");
++		}
++	}
++
++	/*
++	 * IG-026: map RCU_RST_REQ for the direct-MMIO GPHY reset (one DWORD
++	 * at 0x16000010). Non-fatal if it fails — xrx500_gphy_boot guards on
++	 * rcu_rst_base and warns — but without it the GPHY won't reboot from
++	 * its firmware base and the link won't come up.
++	 */
++	rcu_rst_base = devm_ioremap(&pdev->dev,
++				    XRX500_RCU_BASE_PHYS + XRX500_RCU_RST_REQ,
++				    sizeof(u32));
++	if (!rcu_rst_base)
++		dev_warn(&pdev->dev,
++			 "xrx500-phy-fw: failed to ioremap RCU_RST_REQ @0x%x; GPHY reset will be skipped\n",
++			 XRX500_RCU_BASE_PHYS + XRX500_RCU_RST_REQ);
++
++	/*
++	 * IG-026 / Sub-6.4: deassert the GPHY-group master reset (RCU_RST_REQ
++	 * bit 31) ONLY when EVA did NOT preload the GPHY. When EVA is running
++	 * the GPHY, bit 31 is already clear and touching RCU_RST_REQ at all
++	 * risks disturbing the live cores — so gate this on !eva_preset.
++	 */
++	if (!eva_preset && rcu_rst_base) {
++		u32 v = readl(rcu_rst_base);
++
++		if (v & BIT(31)) {
++			writel(v & ~BIT(31), rcu_rst_base);
++			(void)readl(rcu_rst_base); /* post write, settle */
++			udelay(50);
++		}
++	}
++
++	ret = xway_gphy_load(pdev, &fw_addr, &fw_name, &fw_size, sha);
++	if (ret)
++		return ret;
++
++	/*
++	 * Read the silicon-id array. Each entry is a u32 per CQ-002 A;
++	 * the AVM-source u8 stream form is intentionally NOT supported on
++	 * v6.18 because the silicon id 0x0F would alias against the
++	 * indexed-0..4 form when stored as a byte.
++	 */
++	phy_count = of_property_count_u32_elems(pdev->dev.of_node, "phy_id");
++	if (phy_count <= 0) {
++		dev_err(&pdev->dev,
++			"xrx500-phy-fw: missing or empty DT 'phy_id' property\n");
++		return -ENOENT;
++	}
++
++	for (i = 0; i < phy_count; i++) {
++		struct reset_control *phy_rst;
++		char phy_str[8];
++		u32 silicon_id;
++		int idx;
++
++		ret = of_property_read_u32_index(pdev->dev.of_node, "phy_id",
++						 i, &silicon_id);
++		if (ret) {
++			dev_err(&pdev->dev,
++				"xrx500-phy-fw: phy_id[%d] read failed: %d\n",
++				i, ret);
++			return ret;
++		}
++
++		/*
++		 * Silicon-id validation BEFORE touching reset_control_get -
++		 * an unknown id (anything outside {0x02,0x03,0x04,0x05,0x0F})
++		 * returns -EINVAL per AC-001-2.
++		 */
++		idx = xrx500_gphy_idx_for_silicon_id(silicon_id);
++		if (idx < 0) {
++			dev_err(&pdev->dev,
++				"xrx500-phy-fw: phy_id[%d]=0x%X is not a recognised xRX500 silicon id\n",
++				i, silicon_id);
++			return -EINVAL;
++		}
++
++		/*
++		 * Reset name rendered with "phy%X" so 0x0F formats as "phyF"
++		 * (uppercase hex) per AC-001-3. The 5 reset-names entries
++		 * {"phy2","phy3","phy4","phy5","phyF"} live in the DT.
++		 */
++		snprintf(phy_str, sizeof(phy_str), "phy%X", silicon_id);
++
++		phy_rst = devm_reset_control_get(&pdev->dev, phy_str);
++		if (IS_ERR(phy_rst)) {
++			ret = PTR_ERR(phy_rst);
++			pr_err("xrx500-phy-fw: devm_reset_control_get(\"%s\") failed: %d\n",
++			       phy_str, ret);
++			/*
++			 * Surface -ENODEV explicitly when the underlying
++			 * reset-controller phandle resolved but the named line
++			 * was not registered; relay any other errno verbatim.
++			 */
++			return ret == -EINVAL ? -ENODEV : ret;
++		}
++
++		ret = xrx500_gphy_boot(&pdev->dev, phy_rst, silicon_id,
++				       fw_addr);
++		if (ret)
++			return ret;
++	}
++
++	mdelay(100);
++
++	/*
++	 * IG-018 trigger-signal anchor (AC-001-8): emit the loaded
++	 * firmware filename, size, and SHA-256 prefix exactly once after
++	 * the per-PHY register programming completes. This line is the
++	 * boot-log handle for blob-substitution bisection.
++	 */
++	pr_info("xrx500-phy-fw: loaded %s size=%zu sha256-prefix=%02x%02x%02x%02x%02x%02x%02x%02x\n",
++		fw_name, fw_size,
++		sha[0], sha[1], sha[2], sha[3],
++		sha[4], sha[5], sha[6], sha[7]);
++
++	g_xrx500_gphy_fw_loaded = true;
++	return 0;
++}
++
++bool xrx500_gphy_fw_is_loaded(void)
++{
++	return g_xrx500_gphy_fw_loaded;
++}
++
++static const struct of_device_id xway_phy_match[] = {
++	{ .compatible = "lantiq,phy-xrx500" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, xway_phy_match);
++
++static struct platform_driver xway_phy_driver = {
++	.probe = xway_phy_fw_probe,
++	.driver = {
++		.name = "phy-xrx500",
++		.of_match_table = xway_phy_match,
++	},
++};
++
++/*
++ * Composite-module init: device_initcall() instead of module_init() so
++ * that this TU can coexist with gsw_init.c's module_platform_driver()
++ * macro inside the same intel-xrx500-gswip composite (the
++ * module_platform_driver expansion contains a module_init/exit pair
++ * which would otherwise collide with a second module_init here).
++ *
++ * device_initcall fires at the same boot-order level as module_init in
++ * the built-in case (CONFIG_INTEL_XRX500_GSWIP_API=y in the FB7560
++ * OpenWrt build); it places this initcall into the level-6 .init.data
++ * section alongside the gsw_init.c driver's module-derived initcall.
++ */
++static int __init xrx500_phy_fw_init(void)
++{
++	return platform_driver_register(&xway_phy_driver);
++}
++device_initcall(xrx500_phy_fw_init);

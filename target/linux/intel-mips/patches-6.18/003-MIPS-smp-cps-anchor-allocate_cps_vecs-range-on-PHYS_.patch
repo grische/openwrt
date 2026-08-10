@@ -1,0 +1,100 @@
+From 97468576badeaa79e12913fa775adf2ed4a71574 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:00:41 +0000
+Subject: MIPS: smp-cps: anchor allocate_cps_vecs range on PHYS_OFFSET
+
+allocate_cps_vecs() restricts the BEV/CPS exception-vector allocation to
+the physical-address window addressable through KSEG1. The hard-coded
+[0x0, CSEGX_SIZE - 1] range assumes the standard MIPS layout where KSEG1
+maps the low 512 MiB.
+
+On platforms using EVA segmentation (e.g. the Intel/Lantiq xRX500 family
+with PHYS_OFFSET=0x20000000), DDR sits at 0x20000000-0x3FFFFFFF and the
+KSEG1 virtual range 0xA0000000-0xBFFFFFFF is mapped to that same window.
+The legacy [0, 0x1FFFFFFF] range matches no RAM at all, so the allocation
+fails, core_entry_reg stays zero, cps_prepare_cpus() bails out via
+err_out without populating mips_cps_cluster_bootcfg, and the secondary
+CPU bring-up later dereferences a NULL pointer in cps_boot_secondary().
+
+Anchor the range on PHYS_OFFSET. On standard MIPS PHYS_OFFSET is 0 so the
+range is unchanged; on EVA platforms it shifts to the actual RAM window
+addressable through KSEG1.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ arch/mips/kernel/smp-cps.c | 49 ++++++++++++++++++++++++++++----------
+ 1 file changed, 37 insertions(+), 12 deletions(-)
+
+diff --git a/arch/mips/kernel/smp-cps.c b/arch/mips/kernel/smp-cps.c
+index 22d4f9ff3ae26..1582cf99e2dab 100644
+--- a/arch/mips/kernel/smp-cps.c
++++ b/arch/mips/kernel/smp-cps.c
+@@ -154,9 +154,16 @@ static bool __init check_64bit_reset(void)
+ 
+ static int __init allocate_cps_vecs(void)
+ {
+-	/* Try to allocate in KSEG1 first */
++	/*
++	 * Try to allocate in the physical-address window addressable through
++	 * KSEG1. On standard MIPS this is the low 512 MiB, but on platforms
++	 * with EVA segmentation the same KSEG1 virtual range is mapped to a
++	 * PHYS_OFFSET-shifted RAM aperture, so anchor the range on
++	 * PHYS_OFFSET to allow allocation from real RAM on those systems.
++	 */
+ 	cps_vec_pa = memblock_phys_alloc_range(BEV_VEC_SIZE, BEV_VEC_ALIGN,
+-						0x0, CSEGX_SIZE - 1);
++						PHYS_OFFSET,
++						PHYS_OFFSET + CSEGX_SIZE - 1);
+ 
+ 	if (cps_vec_pa)
+ 		core_entry_reg = CKSEG1ADDR(cps_vec_pa) &
+@@ -259,20 +266,38 @@ static void __init cps_smp_setup(void)
+ 		__cpu_logical_map[v] = v;
+ 	}
+ 
+-	/* Set a coherent default CCA (CWB) */
+-	change_c0_config(CONF_CM_CMASK, 0x5);
++	/*
++	 * IG-166 (GRX500/intel-mips): skip the CPS fabric writes. No working
++	 * configuration of this SoC (EVA, TEP bootcore, AVM 4.9 CMP+VMB)
++	 * ever forces Config.K0=CCA5 or joins core 0 to the CM coherence
++	 * domain from live cached code (GCR_CL_COHERENCE=0xff) — domain
++	 * membership and CCA are established by the firmware boot chain
++	 * before kernel entry, and AVM's kernel only ever READS them. These
++	 * writes (plus the check_64bit_reset GCR_CO_RESET64 probe inside
++	 * allocate_cps_vecs) are the only fabric-visible register deltas our
++	 * kernel makes on every boot, and are prime suspects for the IG-163
++	 * peripheral-store truncation (frame DMA writes to DDR delivering a
++	 * single 64-bit beat). Vendor SMP is CMP+VMB (firmware-launched), so
++	 * the CPS vectors/BEV relocation are unused on this platform too.
++	 */
++	if (!IS_ENABLED(CONFIG_INTEL_MIPS)) {
++		/* Set a coherent default CCA (CWB) */
++		change_c0_config(CONF_CM_CMASK, 0x5);
+ 
+-	/* Initialise core 0 */
+-	mips_cps_core_init();
++		/* Initialise core 0 */
++		mips_cps_core_init();
+ 
+-	/* Make core 0 coherent with everything */
+-	write_gcr_cl_coherence(0xff);
++		/* Make core 0 coherent with everything */
++		write_gcr_cl_coherence(0xff);
+ 
+-	if (allocate_cps_vecs())
+-		pr_err("Failed to allocate CPS vectors\n");
++		if (allocate_cps_vecs())
++			pr_err("Failed to allocate CPS vectors\n");
+ 
+-	if (core_entry_reg && mips_cm_revision() >= CM_REV_CM3)
+-		write_gcr_bev_base(core_entry_reg);
++		if (core_entry_reg && mips_cm_revision() >= CM_REV_CM3)
++			write_gcr_bev_base(core_entry_reg);
++	} else {
++		pr_info("IG-166: CPS CCA-force/coherence-join/vec-alloc skipped (firmware CM state preserved)\n");
++	}
+ 
+ #ifdef CONFIG_MIPS_MT_FPAFF
+ 	/* If we have an FPU, enroll ourselves in the FPU-full mask */

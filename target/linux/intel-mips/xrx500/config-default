@@ -1,0 +1,17 @@
+# xrx500 (GRX350) subtarget kernel CONFIG fragment.
+#
+# Subtarget-specific options only. The intel-mips board-level config
+# (target/linux/intel-mips/config-6.18) holds platform defaults
+# (CONFIG_INTEL_MIPS, CONFIG_SERIAL_LANTIQ, CMDLINE infrastructure).
+#
+# The SoC selector is CONFIG_INTEL_MIPS, set at board level.
+#
+# DTB delivery: BUILTIN at __dtb_start, for the reasons spelled out in
+# ../config-6.18. CONFIG_BUILTIN_DTB is auto-selected when a
+# CONFIG_DTB_INTEL_MIPS_FRITZ7560 is enabled — leave it implicit.
+CONFIG_BUILTIN_DTB=y
+CONFIG_BUILTIN_DTB_NAME="intel-mips/seale_avm_fritz7560"
+CONFIG_CMDLINE="earlycon=lantiq,0x16600000 console=ttyLTQ0,115200n8r nosmp"
+CONFIG_DTB_INTEL_MIPS_FRITZ7560=y
+# CONFIG_DTB_INTEL_MIPS_GRX500 is not set
+CONFIG_NR_CPUS=4
