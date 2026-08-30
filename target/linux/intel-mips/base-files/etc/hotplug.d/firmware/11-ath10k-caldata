@@ -1,0 +1,254 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Per-unit ath10k calibration data for the AVM FRITZ!Box 7560, 7580 and 7590.
+#
+# No board here ships an on-card EEPROM. On the 7560 and the 7590 the
+# calibration blobs live zlib-compressed in the urlader (mtd "urlader", the
+# first NAND partition) and have to be handed to the driver through the
+# firmware loader. The 7580 is the exception and carries no blob at all; its
+# arms below are deliberately empty and say why.
+#
+# 7560: one QCA9882 (168c:003c, QCA988X hw2.0) behind the PCIe root
+# complex at 0x18900000, which seale_avm_fritz7560.dtsi pins to PCI
+# domain 0 via linux,pci-domain — hence the fixed 0000:01:00.0 in the
+# firmware name. It takes the "cal-" route.
+#
+# 7590: two QCA9984 (168c:0046), one per root complex, pinned to
+# domains 0 and 1 the same way — 5 GHz on 0000:01:00.0 and 2.4 GHz on
+# 0001:01:00.0. Both take the "pre-cal-" route; see the note at the
+# bottom of this file for why the boards differ there.
+#
+# 7580: two QCA9984 as well, on the same two root complexes and therefore
+# asking under the same two names. It is answered with nothing, on purpose.
+
+[ -e /lib/firmware/$FIRMWARE ] && exit 0
+
+. /lib/functions/caldata.sh
+
+case "$FIRMWARE" in
+"ath10k/pre-cal-pci-0000:01:00.0.bin")
+	board=$(board_name)
+
+	case "$board" in
+	avm,fritz7590)
+		#
+		# Entry ID 0x207 ("bb7") is the 5 GHz radio's blob and 0x208
+		# ("bb8") next door is the 2.4 GHz one, the same pairing the
+		# 7560 uses — but here both are QCA9984 records, so both go to
+		# ath10k rather than one going to ath9k.
+		#
+		# Two mirrors per record at a 0x40000 stride, and TWO known
+		# urlader layout generations: some units keep the chains at
+		# 0xb0000 (0x207) / 0xb1000 (0x208), others at 0xb8000 /
+		# 0xb8800. Same record format either way. Each record needs
+		# its own exact -s; walking from one to the other lands in
+		# the 0xff padding between them.
+		#
+		# -i 1 drops the leading 0xff tag byte, as on the 7560 (the
+		# skip applies to the DECOMPRESSED output — the tag sits inside
+		# the zlib stream). -l 12064 is ATH10K_QCA9984_CAL_DATA_LEN
+		# (core.c .cal_data_len) and, like the 2116 below, is exact
+		# rather than a lower bound. No -r: that is an AR9300 record
+		# quirk and belongs only to the ath9k script.
+		#
+		# On total failure the output file must not survive:
+		# fritz_cal_extract fopen(…, "w")s it before searching, and a
+		# leftover 0-byte file satisfies the next boot's firmware
+		# request, so extraction would never be retried (seen in the
+		# field: both radios dead on every boot after one bad first
+		# boot).
+		#
+		urlader=$(find_mtd_chardev "urlader")
+		/usr/bin/fritz_cal_extract -i 1 -s 0xb0000 -e 0x207 -l 12064 -o /lib/firmware/$FIRMWARE "$urlader" || \
+		/usr/bin/fritz_cal_extract -i 1 -s 0xf0000 -e 0x207 -l 12064 -o /lib/firmware/$FIRMWARE "$urlader" || \
+		/usr/bin/fritz_cal_extract -i 1 -s 0xb8000 -e 0x207 -l 12064 -o /lib/firmware/$FIRMWARE "$urlader" || \
+		/usr/bin/fritz_cal_extract -i 1 -s 0xf8000 -e 0x207 -l 12064 -o /lib/firmware/$FIRMWARE "$urlader" || \
+		{ rm -f /lib/firmware/$FIRMWARE; caldata_die "failed to extract ath10k pre-cal data from $urlader"; }
+
+		#
+		# No ath10k_patch_mac, for the same reason as the 7560 arm
+		# below: the blob carries this radio's own address at offset 6,
+		# the TFFS "macwlan" value, with "macwlan2" in the 2.4 GHz blob.
+		#
+		;;
+	avm,fritz7560)
+		#
+		# Deliberately empty. The 7560's QCA9882 sits at this same BDF
+		# and ath10k requests pre-cal for it unconditionally, but it is
+		# not a 10.4 part, so the pre-cal path is not the right one for
+		# it — see the note at the bottom of this file. Exiting 0 here
+		# lets procd complete the transaction and ath10k fall through to
+		# its "cal-" request, which the case below serves.
+		#
+		;;
+	avm,fritz7580)
+		#
+		# Also deliberately empty, but for a different reason from the
+		# 7560 above: this board has no calibration data in flash to
+		# extract, by either route. Its radios calibrate from on-chip
+		# OTP, so the right answer to every request in this file is to
+		# supply nothing and let ath10k fall through to
+		# ATH10K_CAL_MODE_OTP with board data from the generic
+		# board-2.bin, selected by the OTP board ids (3 for 5 GHz, 4
+		# for 2.4 GHz).
+		#
+		# That is a measurement, not an assumption. A full NAND backup
+		# of a 7580 was searched end to end: no zlib stream anywhere in
+		# the 1 MiB urlader (every 0x78 byte tried, nothing inflating to
+		# a plausible size), no valid record for any candidate entry id
+		# — 0x207/0x208 as here, 0x212 as on ipq40xx, and the TFFS name
+		# ids 0x18a/0x196/0x1ca — and no uncompressed blob either, with
+		# neither the unit's WiFi MAC bytes nor the QCA9984 board-data
+		# header signature present in any of the eight partitions. The
+		# two urlader mirrors are byte-identical to each other and the
+		# 7590's 0xb0000/0xb1000 are erased 0xff here. The same scanner
+		# run against a 7590 dump finds all four of its records, so the
+		# negative is the board's and not the tool's. The boot-loader
+		# environment carries no calibration variable either — only
+		# the MAC and identity keys.
+		#
+		# Consequence worth knowing before debugging the radios: unlike
+		# the other two boards, whose blobs carry the right address at
+		# offset 6 (which is why neither arm calls ath10k_patch_mac),
+		# nothing here hands ath10k a MAC. It gets whatever OTP holds.
+		# The unit's real WiFi addresses are in TFFS as "macwlan" and
+		# "macwlan2" if they turn out to be needed; there is no
+		# board.d route for them, so the fix would be a DT mac-address
+		# property rather than a line in this file.
+		#
+		;;
+	*)
+		caldata_die "board $board is not supported yet"
+		;;
+	esac
+	;;
+"ath10k/pre-cal-pci-0001:01:00.0.bin")
+	board=$(board_name)
+
+	case "$board" in
+	avm,fritz7590)
+		#
+		# The 2.4 GHz radio: entry ID 0x208 at 0xb1000, mirror 0xf1000
+		# — 0xb8800/0xf8800 on the second urlader layout generation.
+		# Everything else, the failure-cleanup rationale included, as
+		# in the 0x207 arm above.
+		#
+		urlader=$(find_mtd_chardev "urlader")
+		/usr/bin/fritz_cal_extract -i 1 -s 0xb1000 -e 0x208 -l 12064 -o /lib/firmware/$FIRMWARE "$urlader" || \
+		/usr/bin/fritz_cal_extract -i 1 -s 0xf1000 -e 0x208 -l 12064 -o /lib/firmware/$FIRMWARE "$urlader" || \
+		/usr/bin/fritz_cal_extract -i 1 -s 0xb8800 -e 0x208 -l 12064 -o /lib/firmware/$FIRMWARE "$urlader" || \
+		/usr/bin/fritz_cal_extract -i 1 -s 0xf8800 -e 0x208 -l 12064 -o /lib/firmware/$FIRMWARE "$urlader" || \
+		{ rm -f /lib/firmware/$FIRMWARE; caldata_die "failed to extract ath10k pre-cal data from $urlader"; }
+		;;
+	avm,fritz7580)
+		#
+		# Empty, as for this board's 5 GHz radio in the case above, and
+		# for the same reason: nothing in flash to extract, OTP does the
+		# calibration. The full evidence is on that arm.
+		#
+		;;
+	*)
+		#
+		# No avm,fritz7560) arm here, unlike the case above. The 7560
+		# does have a radio at 0001:01:00.0, but it is an AR93xx driven
+		# by ath9k, which asks for ath9k-eeprom-pci-0001:01:00.0.bin —
+		# a name that never reaches this script. An arm for it would be
+		# dead code implying an ath10k part that is not there.
+		#
+		caldata_die "board $board is not supported yet"
+		;;
+	esac
+	;;
+"ath10k/cal-pci-0000:01:00.0.bin")
+	board=$(board_name)
+
+	case "$board" in
+	avm,fritz7560)
+		#
+		# The urlader carries three byte-identical copies of the
+		# calibration table, 0x40000 apart. They are mirrors, not
+		# distinct records: a unit that lost one to a bad block still
+		# has the other two, so try each in turn.
+		#
+		# -e 0x207 is the table entry ID holding the 5 GHz blob;
+		# -e 0x208 next door holds the 2.4 GHz one (see the ath9k
+		# script). Each entry inflates to 4097 bytes, of which byte 0
+		# is a 0xff tag and the tail is 0xff padding.
+		#
+		# -i 1 drops that tag byte so the output starts at the blob's
+		# own header, and -l 2116 is the exact length ath10k wants:
+		# it matches ATH10K_QCA988X_CAL_DATA_LEN, and the blob's own
+		# little-endian u16 length field at offset 0 reads 2116 as
+		# well. ath10k rejects any other size outright, so this is not
+		# a "roughly big enough" figure — do not round it up. (The
+		# -l 12064 seen in target/linux/ipq40xx is the IPQ4019
+		# pre-cal blob, a different hardware family entirely.)
+		#
+		urlader=$(find_mtd_chardev "urlader")
+		/usr/bin/fritz_cal_extract -i 1 -s 0x7b800 -e 0x207 -l 2116 -o /lib/firmware/$FIRMWARE "$urlader" || \
+		/usr/bin/fritz_cal_extract -i 1 -s 0xbb800 -e 0x207 -l 2116 -o /lib/firmware/$FIRMWARE "$urlader" || \
+		/usr/bin/fritz_cal_extract -i 1 -s 0xfb800 -e 0x207 -l 2116 -o /lib/firmware/$FIRMWARE "$urlader" || \
+		{ rm -f /lib/firmware/$FIRMWARE; caldata_die "failed to extract ath10k calibration data from $urlader"; }
+
+		#
+		# No ath10k_patch_mac here, deliberately. The blob already
+		# carries this radio's own address at offset 6 — it is the
+		# TFFS "macwlan" value, distinct from the 2.4 GHz radio's
+		# "macwlan2" — so patching would only recompute the checksum
+		# over bytes that are already correct. If a later reader
+		# wonders why this looks unlike the ath79/ipq40xx scripts:
+		# those boards store a placeholder MAC and genuinely need the
+		# patch step. This one does not.
+		#
+		;;
+	avm,fritz7580)
+		#
+		# The 7580's 5 GHz radio reaches this case too: its pre-cal arm
+		# above answers with nothing, so ath10k falls back to asking for
+		# cal, and that has to be allowed to come up empty as well.
+		# Empty rather than absent, so it does not land on the
+		# caldata_die below and call a board we support unsupported on
+		# every boot.
+		#
+		# Its 2.4 GHz radio then asks for cal-pci-0001:01:00.0.bin,
+		# which the outer case does not name at all. That needs no arm:
+		# an unmatched $FIRMWARE runs off the end of this script and
+		# exits 0, which is exactly what is wanted here. A case for it
+		# would be an empty arm inside an otherwise empty case.
+		#
+		;;
+	*)
+		caldata_die "board $board is not supported yet"
+		;;
+	esac
+	;;
+esac
+
+#
+# Why the boards take different routes: ath10k asks for pre-cal first
+# and falls back to cal, and pre-cal is only meaningful for the 10.4
+# firmware variants, where it changes bmi_otp_exe_param. The 7590's
+# QCA9984 is such a part, so pre-cal is what it wants. The 7560's
+# QCA9882 is not, so supplying pre-cal for it would be wrong — its arm
+# in the first case above exits 0 and lets the fallback happen. The 7580
+# has the 7590's parts but nothing to feed them, so it leaves both
+# requests unanswered and ends up one step further along the same chain,
+# in ath10k's OTP mode.
+#
+# Leaving such a request unanswered costs nothing on this platform, which
+# is worth recording because it is not obvious: the generic kernel config
+# sets CONFIG_FW_LOADER_USER_HELPER_FALLBACK=y, and ath10k asks via
+# firmware_request_nowarn(), so the request *does* enter the sysfs
+# fallback rather than failing directly. It does not stall there because
+# procd's own load-firmware handler (package/system/procd, plug/hotplug.c)
+# completes every transaction unconditionally — a missing file is not an
+# error path for it, it writes loading=1, zero bytes of data, loading=0 —
+# and the kernel turns that empty buffer into an immediate -ENOMEM. So the
+# 60 s firmware timeout is never reached and no dummy file is needed.
+#
+# The 60 s losses this port hit earlier came from the GPHY loader, which
+# is built into the kernel and calls plain request_firmware() during init,
+# before any userspace exists to answer the uevent. Different regime; the
+# fix there is request_firmware_direct(), not a hotplug script.
+#
