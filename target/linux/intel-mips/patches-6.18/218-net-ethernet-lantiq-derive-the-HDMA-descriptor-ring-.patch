@@ -1,0 +1,375 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 09:17:04 +0000
+Subject: net: ethernet: lantiq: derive the HDMA descriptor ring vaddr from its
+ phys
+
+ltq_dma_chan_desc_alloc() kept one pointer for two jobs: the CPU view of
+the descriptor ring, and the cookie dma_free_coherent() has to be handed
+back. Those are not the same thing on this driver, and conflating them
+costs correctness twice.
+
+The CPU view is not always an allocator pointer. A CBM-managed channel
+points desc_base at the DQM MMIO window rather than at DRAM, and
+dma_p2p_cfg() copies the RX channel's ring onto the paired TX channel, so
+two channels share one allocation. Derive the view instead:
+CKSEG1ADDR(desc_phys), the same uncached alias this driver already builds
+by hand for data buffers in ltq_dma_chan_data_buf_alloc(), computed from
+the physical address the driver programs into CDBA. There is then exactly
+one place a ring vaddr is derived, and pch->desc_base is the single
+CPU-side view every consumer uses. pch->desc_phys was always correct and
+still feeds CDBA unchanged.
+
+The free cookie moves to a new pch->desc_alloc_va. That closes a latent
+defect: MIPS has no arch_dma_clear_uncached, so dma_direct_free() runs
+"if (is_vmalloc_addr(cpu_addr)) vunmap(cpu_addr)" on whatever it is
+handed. It is unreachable today only because hdma_port_disable() never
+runs for the single CBM-managed port in use, and that changes as soon as
+more ports come up. desc_alloc_va NULL with desc_base set now also means
+"this channel does not own the ring", so the free is skipped for the
+CBM-managed and p2p-paired channels rather than releasing MMIO or
+double-freeing.
+
+The KSEG1 aperture guard that belongs with a hand-built alias moves into
+desc_alloc with it.
+
+The memset is deleted rather than redirected: dma_direct_alloc() already
+zeroes the buffer through the cached alias and runs
+arch_dma_prep_coherent() (wback+inv) before arch_dma_set_uncached(), so
+the ring arrives zero and cache-clean.
+
+Also delete hdma_swtx_init() and hdma_swtx_xmit() with their
+declarations. They were scaffolding for a software-ring bypass of the CBM
+dequeue path, built on the premise that the DQM's own=0 / data_len=0
+egress descriptor state was a fault; it is the state the block is
+supposed to be in. Neither function ever gained a caller, and both
+dereferenced desc_base as a software ring.
+ltq_dma_chan_sw_poll_cfg() stays as a vendor-verbatim knob.
+
+No functional change to the ring the hardware sees: same physical
+address, same contents, same CDBA programming -- only the pointer the CPU
+walks it through, and the pointer the allocation is released with.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/dma/hdma.c b/drivers/net/ethernet/lantiq/dma/hdma.c
+index 7973ff7a2b92..96782db221ec 100644
+--- a/drivers/net/ethernet/lantiq/dma/hdma.c
++++ b/drivers/net/ethernet/lantiq/dma/hdma.c
+@@ -518,8 +518,6 @@ static int dma_port_cfg(struct dma_port *port)
+  * point at the channel before per-channel register writes take effect).
+  */
+ 
+-void __iomem *g_ig197_ring_va;
+-
+ static char *common_buffer_alloc(int len, int *byte_offset, void **opt)
+ {
+ 	char *buffer = kmalloc(len, GFP_ATOMIC);
+@@ -1606,6 +1604,21 @@ int ltq_dma_chan_class_cfg(u32 chan, u32 cls)
+ 	return dma_chan_set_class(pch, cls);
+ }
+ 
++/*
++ * arch_dma_set_uncached() on MIPS is __pa(addr) + UNCAC_BASE
++ * (arch/mips/mm/dma-noncoherent.c), and on this platform __pa() yields the
++ * FULL physical address because PHYS_OFFSET is 0x20000000
++ * (mach-intel-mips/spaces.h). So the "uncached" pointer the allocator returns
++ * is 0xa0000000 + 0x2xxxxxxx = 0xC2xxxxxx — past CKSEG1 and inside the
++ * TLB-mapped vmalloc/ioremap window (VMALLOC_START = CKSEG2 = 0xc0000000).
++ * Note the spaces.h route cannot work: arch_dma_set_uncached ADDS UNCAC_BASE,
++ * so a PHYS_OFFSET-correcting UNCAC_BASE would have to be 0x80000000 and
++ * would collide with CAC_BASE.
++ *
++ * The GRX500 aliases DDR at physical 0, so CKSEG1ADDR(phys) is an uncached
++ * window onto the very same DRAM page; the guard below accepts exactly the
++ * native DDR window.
++ */
+ int ltq_dma_chan_desc_alloc(u32 chan, u32 desc_num)
+ {
+ 	struct dma_ctrl *pctrl;
+@@ -1639,8 +1652,16 @@ int ltq_dma_chan_desc_alloc(u32 chan, u32 desc_num)
+ 	if (!vaddr)
+ 		return -ENOMEM;
+ 
+-	memset(vaddr, 0, bytes);
+-	pch->desc_base = (u32)(uintptr_t)vaddr;
++	if (phys < 0x20000000ULL || phys >= 0x28000000ULL) {
++		dev_err(pctrl->dev,
++			"desc_phys 0x%llx outside native DDR window, refusing the ring\n",
++			(unsigned long long)phys);
++		dma_free_coherent(pctrl->dev, bytes, vaddr, phys);
++		return -EINVAL;
++	}
++
++	pch->desc_alloc_va = vaddr;
++	pch->desc_base = (u32)CKSEG1ADDR((unsigned long)phys);
+ 	pch->desc_phys = phys;
+ 	pch->desc_len = desc_num;
+ 	pch->curr_desc = 0;
+@@ -1657,6 +1678,13 @@ int ltq_dma_chan_desc_alloc(u32 chan, u32 desc_num)
+  * returns 0 if desc_base is already NULL (e.g. double-free or
+  * free-before-alloc). Always clears the slot back to a zero state so a
+  * subsequent desc_alloc can re-bind.
++ *
++ * Handing dma_free_coherent the old 0xC2xxxxxx desc_base was a latent bad
++ * free: MIPS has no arch_dma_clear_uncached, so dma_direct_free falls into
++ * `if (is_vmalloc_addr(cpu_addr)) vunmap(cpu_addr)` and that address IS in
++ * the vmalloc range, so it would vunmap an area that was never mapped (WARN).
++ * Unreachable until now only because hdma_port_disable never ran for the one
++ * CBM-managed port; the deq-7..9 ports added alongside eth1-3 do tear down.
+  */
+ int ltq_dma_chan_desc_free(u32 chan)
+ {
+@@ -1671,9 +1699,26 @@ int ltq_dma_chan_desc_free(u32 chan)
+ 	if (!pch->desc_base)
+ 		return 0;
+ 
++	/*
++	 * desc_alloc_va NULL with desc_base set means this channel does not OWN
++	 * the ring: either the CBM-managed path pointed desc_base at the DQM
++	 * MMIO window, or dma_p2p_cfg copied the RX channel's ring onto this TX
++	 * channel (hdma.c dma_p2p_cfg). Releasing it here would free MMIO or
++	 * double-free the RX ring — drop the slot without freeing.
++	 */
++	if (!pch->desc_alloc_va) {
++		pch->desc_base = 0;
++		pch->desc_phys = 0;
++		pch->desc_len = 0;
++		pch->curr_desc = 0;
++		pch->prev_desc = 0;
++		pch->desc_configured = false;
++		return 0;
++	}
++
+ 	bytes = (size_t)pch->desc_len * pctrl->desc_size;
+-	dma_free_coherent(pctrl->dev, bytes, (void *)(uintptr_t)pch->desc_base,
+-			  pch->desc_phys);
++	dma_free_coherent(pctrl->dev, bytes, pch->desc_alloc_va, pch->desc_phys);
++	pch->desc_alloc_va = NULL;
+ 	pch->desc_base = 0;
+ 	pch->desc_phys = 0;
+ 	pch->desc_len = 0;
+@@ -1716,18 +1761,8 @@ int ltq_dma_chan_data_buf_alloc(u32 chan)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (pch->desc_phys < 0x20000000ULL ||
+-	    pch->desc_phys >= 0x28000000ULL) {
+-		dev_err(pctrl->dev,
+-			"desc_phys 0x%llx outside native DDR window, aborting seed\n",
+-			(unsigned long long)pch->desc_phys);
+-		return -EINVAL;
+-	}
+-	g_ig197_ring_va = (void __iomem *)
+-		CKSEG1ADDR((unsigned long)pch->desc_phys);
+-
+ 	for (i = 0; i < pch->desc_len; i++) {
+-		rx_desc_p = (struct dma_rx_desc *)g_ig197_ring_va + i;
++		rx_desc_p = (struct dma_rx_desc *)(uintptr_t)pch->desc_base + i;
+ 		buffer = pch->alloc(pch->pkt_size, &byte_offset, &pch->opt[i]);
+ 		if (!buffer) {
+ 			dev_err(pctrl->dev, "No enough memory for %s\n",
+@@ -1946,18 +1981,10 @@ static bool g_hdma_port10_armed;
+ extern int init_cbm_dqm_dma_port(int dqp);
+ 
+ /*
+- * The DMA channel itself WORKS (it reads + processes the descriptor,
+- * underruns on its emptiness) and the PMAC is never reached. PMAC0 routes
+- * egress by DMA-channel index (nTxDmaChanId=5 -> GPHY5, gsw_pmac_ig_cfg
+- * default header), independent of who built the descriptor.
+- *
+- * So bypass the CBM EQM/DQM entirely for CPU TX: drive DMA2TX ch5 from a
+- * software own-bit ring.
+- *
+- * Caller (ndo_start_xmit) serialises hdma_swtx_xmit under tx_lock.
++ * AVM ltq_dma_chan_sw_poll_cfg (hdma.c:1306-1364) — per-channel SW-poll mode
++ * (DMA_C_SWPOLL), which takes one channel off the controller-global CH_FL
++ * flow control engine.
+  */
+-
+-/* AVM ltq_dma_chan_sw_poll_cfg (hdma.c:1306-1364) — per-channel SW-poll. */
+ static void dma_chan_sw_poll_cfg(struct dmax_chan *pch, int enable)
+ {
+ 	unsigned long flags;
+@@ -2094,138 +2121,6 @@ int ltq_dma_p2p_cfg(u32 rx_chan, u32 tx_chan)
+ }
+ EXPORT_SYMBOL_GPL(ltq_dma_p2p_cfg);
+ 
+-static void *g_swtx_bufpool;            /* coherent data-buffer pool */
+-static dma_addr_t g_swtx_bufpool_phys;
+-static int g_swtx_n;                    /* ring / pool slots */
+-static int g_swtx_bufsz;                /* bytes per slot */
+-static struct dmax_chan *g_swtx_pch;
+-static bool g_swtx_inited;
+-
+-int hdma_swtx_init(u32 chan, int n, int buf_size)
+-{
+-	struct dmax_chan *pch;
+-	struct dma_ctrl *pctrl;
+-	int ret;
+-
+-	if (g_swtx_inited)
+-		return 0;               /* armed once for the device lifetime */
+-
+-	ret = ltq_request_dma(chan, "DMA2TX_SWTX_CH5");
+-	if (ret) {
+-		pr_err("hdma_swtx_init: ltq_request_dma failed: %d\n", ret);
+-		return ret;
+-	}
+-	pch = dma_chan_l2p(chan);
+-	if (!pch) {
+-		pr_err("hdma_swtx_init: dma_chan_l2p NULL\n");
+-		return -EINVAL;
+-	}
+-	pctrl = dma_chan_get_controller(pch);
+-	if (!pctrl)
+-		return -EINVAL;
+-
+-	/* SW own-bit descriptor ring (NOT the CBM DQM window 0x1e545000). */
+-	ret = ltq_dma_chan_desc_alloc(chan, n);
+-	if (ret) {
+-		pr_err("hdma_swtx_init: desc_alloc failed: %d\n", ret);
+-		return ret;
+-	}
+-	ret = ltq_dma_chan_desc_cfg(chan, pch->desc_phys, n);
+-	if (ret) {
+-		pr_err("hdma_swtx_init: desc_cfg failed: %d\n", ret);
+-		return ret;
+-	}
+-
+-	/* Private coherent data-buffer pool, one slot per descriptor. */
+-	g_swtx_bufpool = dma_alloc_coherent(pctrl->dev, (size_t)n * buf_size,
+-					    &g_swtx_bufpool_phys, GFP_KERNEL);
+-	if (!g_swtx_bufpool) {
+-		pr_err("hdma_swtx_init: bufpool alloc failed\n");
+-		return -ENOMEM;
+-	}
+-
+-	ltq_dma_chan_irq_disable(chan);
+-	ret = ltq_dma_chan_on(chan);
+-	if (ret) {
+-		pr_err("hdma_swtx_init: chan_on failed: %d\n", ret);
+-		ltq_free_dma(chan);     /* don't leave ch5 wedged for retries */
+-		return ret;
+-	}
+-
+-	g_swtx_pch = pch;
+-	g_swtx_n = n;
+-	g_swtx_bufsz = buf_size;
+-	g_swtx_inited = true;
+-	pr_info("hdma_swtx_init: DMA2TX ch%d SW ring n=%d buf=%d desc_phys=0x%llx DMA_CTRL=0x%08x (CH_FL=%d FOD=%d CPOLL=0x%08x; CBM bypassed)\n",
+-		pch->nr, n, buf_size, (unsigned long long)pch->desc_phys,
+-		ltq_dma_r32(pctrl, DMA_CTRL),
+-		!!(ltq_dma_r32(pctrl, DMA_CTRL) & DMA_CTRL_CH_FL),
+-		!!(ltq_dma_r32(pctrl, DMA_CTRL) & DMA_CTRL_DS_FOD),
+-		ltq_dma_r32(pctrl, DMA_CPOLL));
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(hdma_swtx_init);
+-
+-int hdma_swtx_xmit(u32 chan, const void *data, int len)
+-{
+-	struct dmax_chan *pch = g_swtx_pch;
+-	struct dma_ctrl *pctrl;
+-	struct dma_tx_desc *ring, *tx;
+-	dma_addr_t buf_phys;
+-	void *buf;
+-	unsigned long flags;
+-	u32 cctrl;
+-
+-	if (!g_swtx_inited || !pch)
+-		return -ENODEV;
+-	if (len <= 0 || len > g_swtx_bufsz)
+-		return -EINVAL;
+-	pctrl = dma_chan_get_controller(pch);
+-	ring = (struct dma_tx_desc *)(uintptr_t)pch->desc_base;
+-
+-	/* Reclaim descriptors the DMA finished (own back to CPU + complete). */
+-	while (ring[pch->prev_desc].status.field.own == CPU_OWN &&
+-	       ring[pch->prev_desc].status.field.c) {
+-		memset(&ring[pch->prev_desc], 0, sizeof(*tx));
+-		pch->prev_desc = (pch->prev_desc + 1) % pch->desc_len;
+-	}
+-
+-	tx = &ring[pch->curr_desc];
+-	if (tx->status.field.own == DMA_OWN)
+-		return -EBUSY;          /* ring full */
+-
+-	buf = (u8 *)g_swtx_bufpool + (size_t)pch->curr_desc * g_swtx_bufsz;
+-	buf_phys = g_swtx_bufpool_phys + (dma_addr_t)pch->curr_desc * g_swtx_bufsz;
+-	memcpy(buf, data, len);
+-
+-	tx->dw1.all = 0;
+-	tx->dw1.field.ep = 5;           /* GPHY5 */
+-	tx->dw1.field.color = 1;        /* green */
+-	tx->dw0.all = 0;
+-	tx->data_pointer = buf_phys;    /* slot 8-aligned -> byte_offset 0 */
+-	tx->status.all = 0;
+-	tx->status.field.byte_offset = 0;
+-	tx->status.field.data_len = len;
+-	tx->status.field.sop = 1;
+-	tx->status.field.eop = 1;
+-	wmb();                          /* publish fields before ownership */
+-	tx->status.field.own = DMA_OWN;
+-	wmb();                          /* publish ownership before kick */
+-
+-	pch->curr_desc = (pch->curr_desc + 1) % pch->desc_len;
+-
+-	/* Ensure ON so SW-poll re-scans and picks up the new descriptor. */
+-	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
+-	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
+-	cctrl = ltq_dma_r32(pctrl, DMA_CCTRL);
+-	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
+-	if (!(cctrl & DMA_CCTRL_ON))
+-		ltq_dma_chan_on(chan);
+-
+-	return len;
+-}
+-EXPORT_SYMBOL_GPL(hdma_swtx_xmit);
+-
+ /*
+  * hdma_ig192_toe_dma3_reset - reset-parity for the TOE DMA controller (AVM
+  * cid DMA3 @ ssx0+0x300000 = phys 0x1E300000).
+diff --git a/drivers/net/ethernet/lantiq/dma/hdma.h b/drivers/net/ethernet/lantiq/dma/hdma.h
+index 6fa64d382266..1f198dd85a00 100644
+--- a/drivers/net/ethernet/lantiq/dma/hdma.h
++++ b/drivers/net/ethernet/lantiq/dma/hdma.h
+@@ -150,7 +150,19 @@ struct dmax_chan {
+ 	int curr_desc;
+ 	int prev_desc;
+ 	dma_addr_t desc_phys; /* Descriptor base physical address */
++	/*
++	 * CPU-side view of the descriptor ring. On this platform it is the
++	 * CKSEG1 uncached alias of @desc_phys, NOT the pointer
++	 * dma_alloc_coherent returned — see ltq_dma_chan_desc_alloc().
++	 */
+ 	u32 desc_base;
++	/*
++	 * The raw dma_alloc_coherent() return value, kept ONLY as the cookie
++	 * dma_free_coherent() has to be handed back in ltq_dma_chan_desc_free().
++	 * Never dereferenced: on a PHYS_OFFSET platform it is arithmetically
++	 * wrong (see ltq_dma_chan_desc_alloc()).
++	 */
++	void *desc_alloc_va;
+ 	int desc_len;
+ 	enum dma_chan_txwgt txwgt;
+ 	int pkt_size;
+diff --git a/drivers/net/ethernet/lantiq/dma/lantiq_dmax.h b/drivers/net/ethernet/lantiq/dma/lantiq_dmax.h
+index a0bb5fa5f51c..a3cc1d9a5827 100644
+--- a/drivers/net/ethernet/lantiq/dma/lantiq_dmax.h
++++ b/drivers/net/ethernet/lantiq/dma/lantiq_dmax.h
+@@ -326,9 +326,11 @@ int hdma_port_enable(int port_id);
+ 
+ int hdma_ig192_toe_dma3_reset(void);
+ 
++/*
++ * AVM per-channel SW-poll knob (DMA_C_SWPOLL): takes one channel off the
++ * controller-global CH_FL flow-control engine.
++ */
+ int ltq_dma_chan_sw_poll_cfg(u32 chan, int enable);
+-int hdma_swtx_init(u32 chan, int n, int buf_size);
+-int hdma_swtx_xmit(u32 chan, const void *data, int len);
+ 
+ int ltq_dma_p2p_cfg(u32 rx_chan, u32 tx_chan);
+ 

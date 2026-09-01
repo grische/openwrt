@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 09:56:41 +0000
+Subject: net: ethernet: lantiq: correct stale per-port resource-map comments
+
+Six comments in the two files this series touches document maps the code
+next to them contradicts. They all predate the correction of the LAN port
+resource derivation, which was forced by two symptoms on hardware: eth0
+placed on dequeue port 7 egressed the dp2/LAN4 channel, and TMU egress
+port 15 drained to a dequeue port no DMA puller was attached to. The
+closed forms have been
+
+  cbm_deq_port == tmu_egress_port == dp_port_id + 5
+  tmu_queue    == dp_port_id + 15
+
+ever since; only the prose lagged.
+
+Corrected: the TMU resource table in cbm_dp.c (EPN 12..15 / QID 22..25
+-> EPN 7..10 / QID 17..20, with the SBIDs added since the probe path now
+derives them); cbm_dp_port_alloc()'s field contract, which still said
+"deq_port = port_id + 2"; a parenthetical claiming
+"tmu_egress_port = dp_port_id + 10"; and the mapping table in
+intel_xrx500.c (deq 7/6/5/4, EPN 15..12). The derivation note that
+followed that last table -- reasoning from the 5.10 device tree's
+interrupt-names "cbm-dqm4".."cbm-dqm7" to DQ ports 4..7 running inversely
+against dp_port_id -- was the origin of the error, so it goes rather than
+being patched.
+
+Two more that this series itself falsified: cbm_dp_enable()'s
+preconfig-skip note still said "dp5/eth0 is preconfigured at probe;
+dp2..4 build here as before", which stopped being true when the probe
+loop was extended to all four ports (the gated block is now dead for
+every LAN port, and the comment explains why keeping the gate is still
+right); and intel_xrx500's TX-init note said ltq_dma_chan_desc_alloc()
+"stashes vaddr in pch->desc_base", which has been the CKSEG1 alias of the
+ring's physical address since the descriptor-vaddr fix earlier in this
+series.
+
+Comments only, no code change.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
+index 2c41ac2ff6e1..9117d87c9194 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
+@@ -38,16 +38,18 @@
+  * @port_id: CBM port (caller-supplied; 0..15 fits the 0xF0 mask).
+  *
+  * dp_port_id 2..5 -> { tmu_egress_port (EPN), tmu_queue (QID) }. The EPN is
+- * dp_port_id + 10 (12..15, matching intel_xrx500.c:1941 port->tmu_egress_port
+- * and the AVM-orientation table). The QID is taken from the AVM
+- * xrx500_cbm_config[] DMA-port table (cbm_config.c): tmu_port 12..15 carry
+- * tmu_queue 22..25. SBID_START=16 (AVM cbm.h:207) -> base_sbid = tmu_queue -
+- * 16.
++ * dp_port_id + 5 and the QID is dp_port_id + 15, per AVM's epg_lookup_table
++ * and the xrx500_cbm_config[] DQ7..DQ10 rows; the EPN equals the CBM dequeue
++ * port, because AVM's conf_dqm_dma_port passes the same number to
++ * tmu_create_flat_egress_path and init_cbm_dqm_dma_port. SBID_START=16 (AVM
++ * cbm.h:207) -> base_sbid = tmu_queue - 16.
+  *
+- *   dp 2 -> EPN 12, QID 22   (eth3 / LAN4)
+- *   dp 3 -> EPN 13, QID 23   (eth2 / LAN3)
+- *   dp 4 -> EPN 14, QID 24   (eth1 / LAN2)
+- *   dp 5 -> EPN 15, QID 25   (eth0 / LAN1)
++ *   dp 2 -> EPN  7, QID 17, SBID 1   (eth3 / LAN4)
++ *   dp 3 -> EPN  8, QID 18, SBID 2   (eth2 / LAN3)
++ *   dp 4 -> EPN  9, QID 19, SBID 3   (eth1 / LAN2)
++ *   dp 5 -> EPN 10, QID 20, SBID 4   (eth0 / LAN1)
++ *
++ * The code below has been on the +5/+15 form since; only this comment lagged.
+  */
+ 
+ static u32 cbm_dp_tmu_egress_port(int port_id)

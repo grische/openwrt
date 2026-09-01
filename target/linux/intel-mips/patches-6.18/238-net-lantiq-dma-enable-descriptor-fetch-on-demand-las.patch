@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 27 Aug 2026 12:46:58 +0200
+Subject: net: lantiq: dma: enable descriptor fetch-on-demand last, not first
+
+dma_ctrl_cfg() turned descriptor fetch-on-demand on partway through the
+controller's global configuration, and dma_ctrl_init() calls dma_ctrl_cfg()
+as its second step -- right after dma_ctrl_reset(), and well before the
+per-port and per-channel loops that program dma_port_cfg() and
+dma_chan_cfg(). So between DMA_CTRL_DS_FOD going up and the last channel
+being configured, the controller is entitled to fetch descriptors from
+channels whose descriptor base, length and control words are still whatever
+the reset left behind.
+
+AVM's 08.25 GPL release closes that window by moving the block: it is
+deleted from dma_ctrl_cfg() and re-added verbatim as the final statement
+of dma_ctrl_init(), after the loops (hdma.c:3026-3030 in Linux 4.9.337,
+against :587-591 inside dma_ctrl_cfg in Linux 4.9.198). Do the same
+here. The block moves with its "int enable" declaration, which
+dma_ctrl_init() now needs and dma_ctrl_cfg() still has for its other
+five flag tests.
+
+"Final statement of dma_ctrl_init()" does not land in the same place for
+us as for AVM, because our dma_ctrl_init() hosts two calls AVM keeps in
+the probe -- dma_irq_chip_init() and tasklet_init(). AVM's probe runs
+dma_irq_chip_init (hdma.c:4392), then dma_ctrl_init (:4398) with the FOD
+block at its tail (:3030), then tasklet_init (:4400). So:
+
+  - Against dma_irq_chip_init we match AVM. FOD still comes after it, and
+    there is no reason to let it precede an IRQ chip that is about to start
+    delivering channel interrupts.
+
+  - Against tasklet_init we invert AVM, deliberately. AVM initialises
+    the tasklet only after dma_ctrl_init has already run
+    devm_request_irq for every channel, so a channel interrupt arriving
+    in that window would find an uninitialised tasklet to schedule. This
+    port moves tasklet_init ahead of the request_irq loop for exactly
+    that reason, which necessarily puts it ahead of the FOD block too.
+
+Moving FOD to the tail also puts it behind two probe-failure early
+returns it used to sit ahead of: hdma.c:1276 when dma_irq_chip_init()
+fails, and :1308 when devm_request_irq() fails. Both abort the probe, so
+the controller is torn down with FOD left at its post-reset default and
+no descriptor fetching is armed against half-configured channels -- the
+failure path ends up in a safer state than before, not a worse one.
+
+The flag is live on both boards, so this is a real window rather than a
+theoretical one. DMA_FTOD comes from the "lantiq,dma-desc-fod" DT property
+(hdma.c:1112-1117) and the controller nodes carry it in both releases.
+
+dma_ctrl_cfg() has a second caller: hdma_ig192_toe_dma3_reset(), the TOE
+reset-parity path, which drives a hand-built cid=DMA3 controller through
+the same primitives without going near dma_ctrl_init(). Losing the FOD call
+there changes nothing, and provably so rather than by argument:
+dma_ctrl_desc_fetch_on_demand_cfg() returns immediately for DMA0, DMA3 and
+DMA4 (hdma.c:401-403, an early return restored because the vendor skips the
+write for those cids). DMA3 was never getting a write from that call. Its
+comment is updated to say that the path no longer reaches the function at
+all, so the reasoning survives the next reader.
+
+That early return itself is untouched -- this commit only moves a call
+site.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/dma/hdma.c b/drivers/net/ethernet/lantiq/dma/hdma.c
+index b57d7372275d..a0c652352765 100644
+--- a/drivers/net/ethernet/lantiq/dma/hdma.c
++++ b/drivers/net/ethernet/lantiq/dma/hdma.c
+@@ -284,8 +284,15 @@ static void dma_ctrl_global_polling_enable(struct dma_ctrl *pctrl)
+ }
+ 
+ /*
+- * dma_ctrl_desc_fetch_on_demand_cfg — AVM hdma.c:494-509. DMA1TX / DMA1RX /
+- * DMA2TX fall through as before.
++ * dma_ctrl_desc_fetch_on_demand_cfg - AVM hdma.c:494-509.
++ *
++ * Since AVM 08.25 moved the call out of dma_ctrl_cfg and onto the tail of
++ * dma_ctrl_init, the TOE reset-parity path (hdma_ig192_toe_dma3_reset,
++ * cid=DMA3) no longer reaches this function at all — it calls dma_ctrl_cfg
++ * directly, not dma_ctrl_init. That path's hardware effect is unchanged
++ * either way, precisely because this early return meant DMA3 never got a
++ * write. Kept because AVM has it. DMA1TX / DMA1RX / DMA2TX fall through as
++ * before.
+  */
+ static void dma_ctrl_desc_fetch_on_demand_cfg(struct dma_ctrl *pctrl,
+ 					      int enable)
+@@ -375,7 +382,10 @@ static void dma_ctrl_orrc_cfg(struct dma_ctrl *pctrl)
+ 	}
+ }
+ 
+-/* AVM hdma.c:577-617 verbatim. */
++/*
++ * AVM hdma.c:577-617, minus the descriptor-fetch-on-demand block, which
++ * AVM 08.25 moved to the tail of dma_ctrl_init (see there).
++ */
+ static int dma_ctrl_cfg(struct dma_ctrl *pctrl)
+ {
+ 	int enable;
+@@ -386,12 +396,6 @@ static int dma_ctrl_cfg(struct dma_ctrl *pctrl)
+ 		enable = 0;
+ 	dma_ctrl_chan_flow_ctl_cfg(pctrl, enable);
+ 
+-	if ((pctrl->flags & DMA_FTOD))
+-		enable = 1;
+-	else
+-		enable = 0;
+-	dma_ctrl_desc_fetch_on_demand_cfg(pctrl, enable);
+-
+ 	if ((pctrl->flags & DMA_DESC_IN_SRAM))
+ 		enable = 1;
+ 	else
+@@ -996,7 +1000,7 @@ static int dma_cfg_init(struct dma_ctrl *pctrl)
+ static int dma_ctrl_init(struct dma_ctrl *pctrl)
+ {
+ 	u32 i, j;
+-	int ret;
++	int enable, ret;
+ 	struct dma_port *pport = NULL;
+ 	struct dmax_chan *pch = NULL;
+ 
+@@ -1053,6 +1057,20 @@ static int dma_ctrl_init(struct dma_ctrl *pctrl)
+ 			}
+ 		}
+ 	}
++
++	/*
++	 * Descriptor fetch-on-demand goes on LAST, after every port and
++	 * channel is configured — AVM 08.25 hdma.c:3026-3030. It used to sit
++	 * in dma_ctrl_cfg, i.e. before the loops, which leaves the controller
++	 * free to fetch descriptors out of channels that have not been
++	 * programmed yet.
++	 */
++	if ((pctrl->flags & DMA_FTOD))
++		enable = 1;
++	else
++		enable = 0;
++	dma_ctrl_desc_fetch_on_demand_cfg(pctrl, enable);
++
+ 	return 0;
+ }
+ 

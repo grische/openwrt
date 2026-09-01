@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 01:31:34 +0200
+Subject: MIPS: dts: intel-mips: base the FRITZ!Box 7590 on the shared AVM dtsi
+
+The FRITZ!Box 7590 was added with no ethernet at all, on the grounds
+that its datapath is not a copy of the FRITZ!Box 7560's. Half of that is
+true: the WAN port sits on the second GSWIP instance behind its own MDIO
+bus at a datapath port number the driver does not yet accept. The LAN
+half is not -- this board wires its four LAN jacks exactly as the
+FRITZ!Box 7560 does, to the same four GPHYs at the same MDIO addresses
+in the same reversed order.
+
+Include seale_avm.dtsi, which supplies that half, and drop what the
+board file was duplicating: the CBM pool reservations, which were
+already byte-identical to the FRITZ!Box 7560's, and the NAND controller
+scaffolding, leaving only the partition map that actually differs.
+Declare the four LAN GPHYs.
+
+This enables the datapath on this board for the first time: CBM comes up
+with its pools, both switch instances are bound, the GSWIP-L MDIO bus
+registers four PHYs, and the firmware loader boots them. It is also the
+first hardware exercise of the hdma descriptor-ring aperture bound,
+which has been in the tree untested since the FRITZ!Box 7590 carried no
+ethernet node.
+
+The fifth GPHY is deliberately absent. The vendor device tree gives its
+reset as bit 31, but bit 31 behaves on the GRX350 as the GPHY-group
+master reset: toggling it topples the clock group the four GE cores have
+just booted from. One of the two readings has to be wrong for the GRX550
+and settling that is cheap against the vendor's own GRX550 device tree,
+so the fifth GPHY lands with the WAN port it serves.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index 87533197d802..6c247e7aecaf 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -7,7 +7,7 @@
+  */
+ /dts-v1/;
+ 
+-#include "xrx500.dtsi"
++#include "seale_avm.dtsi"
+ 
+ / {
+ 	model = "AVM FRITZ!Box 7590";
+@@ -43,7 +43,9 @@ avm-hw-revision {
+ 	 * Widening past this needs the bootcore question settled first (a
+ 	 * bootcore built for 512 MiB, or a single-kernel image that starts no
+ 	 * bootcore at all) and the KSEG1 aperture bound respected -- see the
+-	 * warning on the reservations below.
++	 * warning on the reservations below. It also cannot move the CBM pools
++	 * that seale_avm.dtsi reserves at 0x23800000..0x25200000, only extend
++	 * past them.
+ 	 */
+ 	memory@20000000 {
+ 		device_type = "memory";
+@@ -65,18 +67,8 @@ chosen {
+ 	};
+ 
+ 	/*
+-	 * WARNING: every region here is below PHYS_OFFSET + 0x12310000
+-	 * (0x32310000), and that is a requirement, not a coincidence. KSEG1 is one
+-	 * 512 MiB window shared between the uncached DRAM alias and the SoC
+-	 * register aperture, whose lowest block sits 0x12310000 past the RAM
+-	 * base. A page above that bound has an uncached alias that *is* a
+-	 * register address, so anything reached through ioremap(),
+-	 * memremap(..., MEMREMAP_WC) or CKSEG1ADDR() has to live below it.
+-	 *
+-	 * The vendor's third reservation, an shm RNG seed at 0x3dfb0000, is
+-	 * above the bound. It is out of range of the memory node today; if the
+-	 * node is ever widened far enough to include it, a plain cached
+-	 * mapping is fine and an uncached one is not.
++	 * Every region below must stay under PHYS_OFFSET + SZ_256M; the
++	 * uncached alias above that address reaches registers, not DRAM.
+ 	 */
+ 	reserved-memory {
+ 		#address-cells = <1>;
+@@ -98,31 +90,6 @@ ramoops@20100000 {
+ 			mem-type = <1>;
+ 		};
+ 
+-		/*
+-		 * CBM standard and jumbo buffer pools, at the FRITZ!Box 7560's
+-		 * addresses and sizes.
+-		 *
+-		 * What is board scope is only that they have to be carved out
+-		 * of *this* board's memory node, which is why the nodes live
+-		 * here: a reservation cannot be declared without knowing the
+-		 * memory it comes out of. They abut exactly (0x23800000 +
+-		 * 0x1200000 = 0x24a00000) and top out at 0x25200000.
+-		 *
+-		 * Declared now, ahead of the datapath that consumes them, so
+-		 * that bringing ethernet up does not move this board's memory
+-		 * map afterwards. cbm@1e700000 stays disabled until then;
+-		 * enabling it is a memory-region binding plus a status flip.
+-		 */
+-		cbm_std_pool: cbm-std-pool@23800000 {
+-			reg = <0x23800000 0x1200000>;
+-			no-map;
+-		};
+-
+-		cbm_jbo_pool: cbm-jbo-pool@24a00000 {
+-			reg = <0x24a00000 0x800000>;
+-			no-map;
+-		};
+-
+ 		/*
+ 		 * Owned by the second CPU's boot loader (the vendor ships its
+ 		 * own device tree for that core); no-map so this kernel never
+@@ -141,85 +108,77 @@ bootcore@2e000000 {
+ };
+ 
+ /*
+- * NAND. The controller and its wiring are identical to the FRITZ!Box 7560's -- EBU
+- * chip-select 1, on-die ECC -- and the chip self-identifies, so no geometry
+- * appears here. What differs is the chip: 512 MiB with a 4 KiB page and a
+- * 256 KiB erase block, against the FRITZ!Box 7560's 128 MiB / 2 KiB / 128 KiB. That
+- * matters to whoever builds the UBI image, not to this file.
++ * Toshiba BENAND, 512 MiB with a 4 KiB page; the geometry is self-identified.
++ * The partition map is the one the vendor boot loader installs, so a vendor
++ * recovery can hand the kernel back to the original firmware without
++ * remapping flash.
+  */
+-&ebu_nand {
+-	status = "okay";
+-
+-	lantiq,cs = <1>;
+-
+-	nand@0 {
+-		reg = <0>;
+-		label = "nand0";
++&nand0 {
++	partitions {
++		compatible = "fixed-partitions";
++		#address-cells = <1>;
++		#size-cells = <1>;
+ 
+ 		/*
+-		 * Toshiba BENAND, ECC on the chip. Selected through the legacy
+-		 * "nand-ecc-mode" property on purpose: the modern
+-		 * "nand-ecc-engine" spelling is a phandle, and a string there
+-		 * fails phandle resolution silently.
++		 * First-stage boot loader, and the only copy of the Wi-Fi
++		 * calibration data. Read-only: overwriting it bricks the
++		 * device past the point of recovery without an external
++		 * programmer.
+ 		 */
+-		nand-ecc-mode = "on-die";
++		partition@0 {
++			label = "urlader";
++			reg = <0x0 0x100000>;
++			read-only;
++		};
+ 
+ 		/*
+-		 * The two kernel slots are *mirrored* relative to the FRITZ!Box 7560,
+-		 * because this unit has linux_fs_start = 1: the active slot
+-		 * is the one at 0xd00000.
+-		 *
+-		 * So this map pins slot 1, and installing on a unit whose
+-		 * urlader says slot 0 writes the slot EVA will not boot.
++		 * AVM TFFS environment: the only copy of this unit's
++		 * identity (MAC addresses, serial number). Never
++		 * written from Linux, and erasing it cannot be undone.
+ 		 */
+-		partitions {
+-			compatible = "fixed-partitions";
+-			#address-cells = <1>;
+-			#size-cells = <1>;
+-
+-			/*
+-			 * First-stage boot loader, and the only copy of the
+-			 * Wi-Fi calibration data. Read-only: overwriting it
+-			 * bricks the device past the point of recovery
+-			 * without an external programmer.
+-			 */
+-			partition@0 {
+-				label = "urlader";
+-				reg = <0x0 0x100000>;
+-				read-only;
+-			};
+-
+-			/*
+-			 * AVM TFFS environment: the only copy of this unit's
+-			 * identity (MAC addresses, serial number). Never
+-			 * written from Linux, and erasing it cannot be undone.
+-			 */
+-			partition@100000 {
+-				label = "nand-tffs";
+-				reg = <0x100000 0x400000>;
+-				read-only;
+-			};
+-
+-			/* Inactive kernel slot 0. Written by sysupgrade. */
+-			partition@500000 {
+-				label = "reserved-kernel";
+-				reg = <0x500000 0x800000>;
+-			};
+-
+-			/*
+-			 * Active kernel slot 1 -- the one EVA boots on this
+-			 * unit.
+-			 */
+-			partition@d00000 {
+-				label = "kernel";
+-				reg = <0xd00000 0x800000>;
+-			};
+-
+-			/* UBI: rootfs and rootfs_data. Ends at the 512 MiB mark. */
+-			partition@1500000 {
+-				label = "ubi";
+-				reg = <0x1500000 0x1eb00000>;
+-			};
++		partition@100000 {
++			label = "nand-tffs";
++			reg = <0x100000 0x400000>;
++			read-only;
++		};
++
++		/* Inactive kernel slot 0. Written by sysupgrade. */
++		partition@500000 {
++			label = "reserved-kernel";
++			reg = <0x500000 0x800000>;
++		};
++
++		/* Active kernel slot 1 -- the one EVA boots on this unit. */
++		partition@d00000 {
++			label = "kernel";
++			reg = <0xd00000 0x800000>;
++		};
++
++		/* UBI: rootfs and rootfs_data. Ends at the 512 MiB mark. */
++		partition@1500000 {
++			label = "ubi";
++			reg = <0x1500000 0x1eb00000>;
+ 		};
+ 	};
+ };
++
++/*
++ * The four LAN GPHYs, which are the same four the FRITZ!Box 7560 has: silicon ids
++ * 0x02..0x05 on RCU reset bits 29 / 28 / 26 / 25, in that order.
++ *
++ * AVM's own DTS gives the fifth reset as bit 31, but bit 31 was found on the
++ * GRX350 to be the GPHY-GROUP MASTER reset rather than a per-PHY GE reset --
++ * toggling it toppled the clock group the four GE cores had just booted from,
++ * and they reverted to ROM.
++ *
++ * Adding the fifth PHY is one appended entry in each of these three
++ * properties. It lands with the WAN port it serves.
++ */
++&gphy_fw {
++	phy_id = <0x02 0x03 0x04 0x05>;
++	resets = <&rcu_reset0 29 29>,
++		 <&rcu_reset0 28 28>,
++		 <&rcu_reset0 26 26>,
++		 <&rcu_reset0 25 25>;
++	reset-names = "phy2", "phy3", "phy4", "phy5";
++};

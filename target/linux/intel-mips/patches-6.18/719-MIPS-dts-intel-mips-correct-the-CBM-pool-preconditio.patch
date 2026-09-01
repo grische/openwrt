@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 01:47:38 +0200
+Subject: MIPS: dts: intel-mips: correct the CBM pool precondition
+
+The precondition on the CBM buffer pools says the FRITZ!Box 7590 has 224
+MiB. It has 512, and had 256 before that -- the number went stale twice
+while the constraint it was illustrating never moved.
+
+State it against the address instead. The pools end at 0x25200000, the
+smallest memory node on the platform is the FRITZ!Box 7560's 128 MiB
+ending at 0x28000000, and every board clears the pools by at least 46
+MiB. That sentence stays true however much DRAM a future board carries,
+which the old one could not.
+
+Comment only; no DTB changes.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
+index bdef191a7cdf..cea39f817ddf 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
+@@ -147,10 +147,11 @@ port@3 {
+ 	 * comes out of, and easy350_anywan has no use for them.
+ 	 *
+ 	 * PRECONDITION for every board including this file: its memory node
+-	 * must cover 0x23800000..0x25200000. True of the FRITZ!Box 7560 (128 MiB) and
+-	 * the FRITZ!Box 7590 (224 MiB). A board with less RAM than that would have to
+-	 * override these, and widening a board's memory node cannot move them
+-	 * -- only extend past them.
++	 * must reach 0x25200000, where the jumbo pool ends. The smallest node
++	 * on this platform is the FRITZ!Box 7560's 128 MiB, ending at 0x28000000, so
++	 * every board clears the pools by at least 46 MiB. A board with less
++	 * RAM than that would have to override them, and widening a board's
++	 * memory node cannot move them -- only extend past them.
+ 	 *
+ 	 * `no-map` keeps the regions out of the buddy allocator entirely so
+ 	 * that cbm_buf.c's carve allocator owns the only access path. The

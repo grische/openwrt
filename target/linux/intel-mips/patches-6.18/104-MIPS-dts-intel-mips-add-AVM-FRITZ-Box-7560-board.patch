@@ -1,0 +1,332 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:09:19 +0000
+Subject: MIPS: dts: intel-mips: add AVM FRITZ!Box 7560 board
+
+Add the board DTS/dtsi for the AVM FRITZ!Box 7560 (AVM codename
+"seale", HW221), a GRX350-based DSL gateway, and the matching
+built-in-DTB Kconfig option (the AVM EVA bootloader does not pass a
+DTB, so the kernel carries one).
+
+Board description highlights:
+
+ - 128 MiB DDR at physical 0x20000000 (EVA layout).
+
+ - Macronix MX30LF1GE8AB NAND on EBU chip-select 1 (data window at
+   0x17c00000), using the chip's on-die BCH ECC via the legacy
+   "nand-ecc-mode" string property (the modern "nand-ecc-engine"
+   binding takes a phandle, which cannot name the on-die engine),
+   with the AVM partition layout.
+
+ - Reserved-memory carve-outs for the CBM packet-buffer pools
+   (18 MiB standard + 8 MiB jumbo, no-map) and the cbm node enabled
+   with those pools attached.
+
+ - GPHY firmware loader node (lantiq,phy-xrx500) loading the LAN
+   PHY11G firmware into GPHYs 2-5 through the RCU reset provider,
+   and the GSWIP MDIO bus with PHY addresses aligned to the
+   datapath port numbering. Front-panel LAN port N connects to
+   GPHY (6-N) on this board.
+
+ - avm-hw-revision node matching the vendor firmware's expectations.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/Makefile b/arch/mips/boot/dts/intel-mips/Makefile
+index 6ef945b2b722..c7483ffc6c19 100644
+--- a/arch/mips/boot/dts/intel-mips/Makefile
++++ b/arch/mips/boot/dts/intel-mips/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ dtb-$(CONFIG_DTB_INTEL_MIPS_GRX500)	+= easy350_anywan.dtb
++dtb-$(CONFIG_DTB_INTEL_MIPS_FRITZ7560)	+= seale_avm_fritz7560.dtb
+ 
+ obj-$(CONFIG_BUILTIN_DTB)		+= $(addsuffix .o, $(dtb-y))
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+new file mode 100644
+index 000000000000..81ad8f38e553
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Copyright (C) 2026 Grische <github@grische.xyz>
++/dts-v1/;
++
++#include <dt-bindings/interrupt-controller/mips-gic.h>
++#include <dt-bindings/clock/intel,grx500-clk.h>
++
++#include "xrx500.dtsi"
++#include "seale_avm_fritz7560.dtsi"
++
++/ {
++	model = "AVM FRITZ!Box 7560";
++	compatible = "avm,fritz7560", "intel,xrx500";
++
++	/*
++	 * The boot loader carries a table of device-tree blobs keyed by
++	 * hardware sub-revision. Declaring the tag is cosmetic here — the
++	 * loader passes this kernel no device tree and the appended blob is
++	 * parsed unconditionally — but it stops the loader reporting an
++	 * unmatched sub-revision.
++	 */
++	avm-hw-revision {
++		compatible = "avm,avm_hw_revision";
++		revision = "221";
++		subrevision = "1";
++	};
++
++	/*
++	 * xrx500.dtsi already declares cpu0/cpu1 (interAptiv). The FRITZ!Box 7560 has
++	 * a 4-core interAptiv cluster ("VPE topology {2,2} total 4" per line
++	 * 197), so augment the inherited cpus block with cpu2/cpu3. The cpus
++	 * node is merged by dtc with the same path declared in xrx500.dtsi;
++	 * #address-cells / #size-cells are inherited.
++	 */
++	cpus {
++		cpu2: cpu@2 {
++			device_type = "cpu";
++			compatible = "mti,interaptiv";
++			reg = <2>;
++		};
++
++		cpu3: cpu@3 {
++			device_type = "cpu";
++			compatible = "mti,interaptiv";
++			reg = <3>;
++		};
++	};
++
++	/*
++	 * 128 MiB DDR at PHYS_OFFSET 0x20000000. Match the 5.10 reference
++	 * DTS for this board. The chip has 256 MiB physical but AVM's 4Kec
++	 * bootcore (kernel2 at load 0x8DFFFFFC) lives in the upper region;
++	 * conservative Phase 1 exposes only the bottom 128 MiB to the
++	 * InterAptiv kernel.
++	 * Reserved-memory regions (gphy_fw, cbm_std_pool, cbm_jbo_pool from
++	 * the 5.10 DTS) are deferred to Phase 2/3 where they're load-bearing.
++	 */
++	memory@20000000 {
++		device_type = "memory";
++		reg = <0x20000000 0x08000000>;
++	};
++
++	aliases {
++		serial0 = &asc0;
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++		bootargs = "";
++	};
++};
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+new file mode 100644
+index 000000000000..a4da268ac781
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+@@ -0,0 +1,189 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * AVM FRITZ!Box 7560 (HW221, GRX350) board-specific shared definitions.
++ *
++ * Phase 2 layers a persistent NAND-backed rootfs onto the Phase-1 RAM-boot
++ * baseline. Partition labels, offsets, and sizes are reproduced byte-for-byte
++ * from AVM's stock layout so that a vendor recovery (TFTP via the urlader)
++ * can hand the kernel back to AVM-firmware without remapping flash.
++ */
++
++&ebu_nand {
++	status = "okay";
++
++	/* FRITZ!Box 7560's Macronix NAND is wired to EBU chip-select 1. */
++	lantiq,cs = <1>;
++
++	nand@0 {
++		reg = <0>;
++		label = "nand0";
++
++		/*
++		 * Macronix MX30LF1GE8AB on-die 4-bit BCH ECC. Selected via
++		 * the legacy "nand-ecc-mode" binding; the modern
++		 * "nand-ecc-engine" property is a phandle, not a string,
++		 * and is not applicable when the chip itself is the ECC
++		 * engine.
++		 */
++		nand-ecc-mode = "on-die";
++
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			/*
++			 * AVM urlader (first-stage bootloader). Read-only:
++			 * overwriting it bricks the device past the point of
++			 * recovery without JTAG/SPI-flashing the chip.
++			 */
++			partition@0 {
++				label = "urlader";
++				reg = <0x0 0x100000>;
++				read-only;
++			};
++
++			/*
++			 * AVM TFFS environment (serial, MAC, calibration). Kept
++			 * writable so the fritz-tffs userspace package can fix
++			 * up serial/MAC entries in some recovery flows.
++			 */
++			partition@100000 {
++				label = "nand-tffs";
++				reg = <0x100000 0x400000>;
++			};
++
++			/* Primary kernel slot. Written by sysupgrade. */
++			partition@500000 {
++				label = "kernel";
++				reg = <0x500000 0x800000>;
++			};
++
++			/* AVM secondary/recovery kernel slot. Written by sysupgrade. */
++			partition@d00000 {
++				label = "reserved-kernel";
++				reg = <0xd00000 0x800000>;
++			};
++
++			/* UBI volume hosting rootfs / rootfs_data. */
++			partition@1500000 {
++				label = "ubi";
++				reg = <0x1500000 0x6b00000>;
++			};
++		};
++	};
++};
++
++&gswl {
++	status = "okay";
++};
++
++&gswr {
++	status = "okay";
++};
++
++/ {
++	phy-xrx500@1c003c00 {
++		compatible = "lantiq,phy-xrx500";
++		reg = <0x1c003c00 0x280>;
++		firmware-name = "lantiq/xrx500-phy-fw.bin";
++		phy_id = <0x02 0x03 0x04 0x05>;
++		resets = <&rcu_reset0 29 29>,
++			 <&rcu_reset0 28 28>,
++			 <&rcu_reset0 26 26>,
++			 <&rcu_reset0 25 25>;
++		reset-names = "phy2", "phy3", "phy4", "phy5";
++		status = "okay";
++	};
++
++	gswip_mdio: gswip-mdio@1c003c10 {
++		compatible = "lantiq,gswip-mdio";
++		reg = <0x1c003c10 0x20>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "okay";
++
++		/*
++		 * Each label is consumed by the port whose intel,dp-port-id
++		 * equals the GSWIP port number, and GSWIP port N == GPHY-N ==
++		 * MDIO addr N. So the PHY address MUST match the consuming
++		 * port's dp-port-id, NOT ascending order:
++		 *   gphy_lan1 -> port@0 (dp-port-id 5) -> MDIO addr 5
++		 *   gphy_lan2 -> port@1 (dp-port-id 4) -> MDIO addr 4
++		 *   gphy_lan3 -> port@2 (dp-port-id 3) -> MDIO addr 3
++		 *   gphy_lan4 -> port@3 (dp-port-id 2) -> MDIO addr 2
++		 * The earlier ascending wiring (lan1->addr2 .. lan4->addr5)
++		 * made each netdev's phylink monitor the WRONG GPHY: eth0
++		 * (datapath GSWIP port 5) watched the PHY on port 2, so a
++		 * cable on the port-5 jack never raised carrier on eth0.
++		 */
++		gphy_lan1: ethernet-phy@5 {
++			reg = <0x05>;
++		};
++
++		gphy_lan2: ethernet-phy@4 {
++			reg = <0x04>;
++		};
++
++		gphy_lan3: ethernet-phy@3 {
++			reg = <0x03>;
++		};
++
++		gphy_lan4: ethernet-phy@2 {
++			reg = <0x02>;
++		};
++	};
++
++	intel_xrx500_net: ethernet {
++		compatible = "intel,xrx500-net";
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "okay";
++
++		port@0 {
++			reg = <0>;
++			intel,dp-port-id = <5>;
++			phy-handle = <&gphy_lan1>;
++		};
++
++		port@1 {
++			reg = <1>;
++			intel,dp-port-id = <4>;
++			phy-handle = <&gphy_lan2>;
++		};
++
++		port@2 {
++			reg = <2>;
++			intel,dp-port-id = <3>;
++			phy-handle = <&gphy_lan3>;
++		};
++
++		port@3 {
++			reg = <3>;
++			intel,dp-port-id = <2>;
++			phy-handle = <&gphy_lan4>;
++		};
++	};
++
++	reserved-memory {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++
++		cbm_std_pool: cbm-std-pool@23800000 {
++			reg = <0x23800000 0x1200000>;
++			no-map;
++		};
++
++		cbm_jbo_pool: cbm-jbo-pool@24a00000 {
++			reg = <0x24a00000 0x800000>;
++			no-map;
++		};
++	};
++};
++
++&cbm {
++	memory-region = <&cbm_std_pool>, <&cbm_jbo_pool>;
++	memory-region-names = "cbm-std-pool", "cbm-jbo-pool";
++	status = "okay";
++};
+diff --git a/arch/mips/intel-mips/Kconfig b/arch/mips/intel-mips/Kconfig
+index f51570c43663..70ddb9473870 100644
+--- a/arch/mips/intel-mips/Kconfig
++++ b/arch/mips/intel-mips/Kconfig
+@@ -15,6 +15,10 @@ config DTB_INTEL_MIPS_GRX500
+ 	bool "Intel MIPS GRX500 Board"
+ 	select BUILTIN_DTB
+ 
++config DTB_INTEL_MIPS_FRITZ7560
++	bool "AVM FRITZ!Box 7560"
++	select BUILTIN_DTB
++
+ endchoice
+ 
+ endif

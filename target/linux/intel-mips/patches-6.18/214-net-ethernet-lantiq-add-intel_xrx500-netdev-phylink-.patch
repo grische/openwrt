@@ -1,0 +1,1706 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:27:45 +0000
+Subject: net: ethernet: lantiq: add intel_xrx500 netdev/phylink driver with
+ CBM TX
+
+Add the network driver: one netdev per LAN port (from the DT port
+list), phylink-managed against the internal GPHYs via the GSWIP
+MDIO bus.
+
+ndo_open runs the bring-up in the hardware-required order:
+
+ 1. TMU egress-port enable for the port's egress port - FIRST; the
+    vendor enables the TMU egress port before opening the dequeue
+    channel, and reversing this wedges the dequeue handshake.
+ 2. hdma_port_enable(deq port) - open the port's DMA2TX dequeue
+    channel against the CBM DQM staging window - plus the one-shot
+    turn_on_DMA_p2p() arming the seeded host-RX bridge.
+ 3. dp_alloc_port_ext + dp_register_subif (datapath registration,
+    which programs the QIDT route via cbm_dp_enable).
+ 4. TX admit gate open.
+ 5. phylink_start, then cbm_rx_set_netdev(dev) - the RX engine
+    delivers to this netdev from here on. ndo_stop unwinds in
+    reverse and unbinds the RX netdev.
+
+The TX path (ndo_start_xmit) enqueues through the CBM rather than
+driving a DMA ring directly: linearize/pad the skb, build the
+8-byte CPU-to-wire PMAC header, pop a segment from the FSQM
+hardware pool (mandatory - the store-forward machinery only binds
+payload lengths for pool segments), place header+frame at the fixed
+RX offset inside the segment, write the CPU dcache back to DDR
+(non-coherent DMA), build the four descriptor words and commit them
+with cbm_cpu_enqueue_hw(). On enqueue failure the segment is
+returned to the pool. The switch egress port is resolved from the
+per-port datapath id; the GSW-L port-5 MAC is activated at link-up
+(both the TX and RX gates require the trunk MAC active).
+
+MAC config/link_down are no-ops toward the switch registers: link
+state is owned by the hardware MDIO poller, and reprogramming
+MAC_CTRL from software fights it.
+
+Also consolidate the composite-module object list into its final
+grouping now that all objects exist.
+
+One deliberate deviation from phylink: a device tree that names a PHY
+which has not been registered yet gets -ENODEV out of
+phylink_of_phy_connect(), and nothing retries -ENODEV. The GPHY firmware
+loader and the MDIO bus that create those PHYs can be built as a module,
+so on a cold boot they arrive after this probe. That case is turned into
+-EPROBE_DEFER, which a PHY registering re-triggers.
+
+New driver written for this port; the functional reference is the
+vendor ltq_eth_drv_xrx500.c from the AVM FRITZ!Box 7560 GPL release
+(Linux 4.9.198), which was not ported (its PMAC/DMA model predates
+phylink).
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
+index 34bcf6d113b3..1f11f3a423ec 100644
+--- a/drivers/net/ethernet/lantiq/Makefile
++++ b/drivers/net/ethernet/lantiq/Makefile
+@@ -10,6 +10,13 @@
+ obj-$(CONFIG_INTEL_XRX500_GSWIP_API) += intel-xrx500-gswip.o
+ 
+ intel-xrx500-gswip-y := switch-api/gsw_init.o switch-api/gsw_flow_core.o switch-api/gsw_flow_pce.o
++intel-xrx500-gswip-y += datapath/datapath_misc.o datapath/datapath_api.o datapath/datapath_instance.o
++intel-xrx500-gswip-y += cqm/grx500/cbm.o cqm/grx500/cbm_basic.o cqm/grx500/cbm_buf.o
++intel-xrx500-gswip-y += cqm/grx500/cbm_intr.o cqm/grx500/fsqm.o cqm/grx500/cbm_dma.o
++intel-xrx500-gswip-y += cqm/grx500/cbm_dp.o
++intel-xrx500-gswip-y += cqm/grx500/cbm_ports.o
++intel-xrx500-gswip-y += dma/hdma.o
++intel-xrx500-gswip-y += tmu/tmu_init.o tmu/drv_tmu_ll.o
+ 
+ #
+ # The GPHY firmware is proprietary and lives in the rootfs, so the loader
+@@ -25,11 +32,11 @@ intel-xrx500-mdio-y := xrx500_phy_fw.o
+ # Without the bus, phylink_of_phy_connect() has no PHY to find.
+ #
+ intel-xrx500-mdio-y += switch-api/mdio_xrx500.o
+-intel-xrx500-gswip-y += dma/hdma.o
+-intel-xrx500-gswip-y += cqm/grx500/cbm_basic.o cqm/grx500/cbm_buf.o cqm/grx500/fsqm.o
+-intel-xrx500-gswip-y += cqm/grx500/cbm_dma.o
+-intel-xrx500-gswip-y += tmu/tmu_init.o tmu/drv_tmu_ll.o
+-intel-xrx500-gswip-y += datapath/datapath_misc.o datapath/datapath_api.o datapath/datapath_instance.o
+-intel-xrx500-gswip-y += cqm/grx500/cbm_dp.o
+-intel-xrx500-gswip-y += cqm/grx500/cbm_ports.o
+-intel-xrx500-gswip-y += cqm/grx500/cbm.o
++
++#
++# The netdev/phylink driver consumes gsw_w32() and gsw_get_swcore_ops()
++# from switch-api/, so it ships in the same module as gsw_init.o and
++# gsw_flow_core.o. It binds "intel,xrx500-net" and instantiates one
++# netdev per LAN port.
++#
++intel-xrx500-gswip-y += intel_xrx500.o
+diff --git a/drivers/net/ethernet/lantiq/include/intel_xrx500.h b/drivers/net/ethernet/lantiq/include/intel_xrx500.h
+new file mode 100644
+index 000000000000..d78e7882d6b2
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/include/intel_xrx500.h
+@@ -0,0 +1,166 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) 2026 Grische <github@grische.xyz>
++ *
++ * Per-port and per-device state for the xRX500 network driver.
++ */
++
++#ifndef _LANTIQ_INTEL_XRX500_H_
++#define _LANTIQ_INTEL_XRX500_H_
++
++#include <linux/atomic.h>
++#include <linux/dma-mapping.h>
++#include <linux/netdevice.h>
++#include <linux/phylink.h>
++#include <linux/spinlock.h>
++#include <linux/types.h>
++#include <linux/u64_stats_sync.h>
++
++/*
++ * Forward declarations.
++ *
++ * The .c TU that actually dereferences port->tx_ring (intel_xrx500.c)
++ * includes dma/hdma.h directly.
++ */
++struct dma_tx_desc;
++
++/*
++ *   eth0 = physical LAN1 (silkscreen) = dp_port_id 5
++ *   eth1 = physical LAN2              = dp_port_id 4
++ *   eth2 = physical LAN3              = dp_port_id 3
++ *   eth3 = physical LAN4              = dp_port_id 2
++ *
++ * Note: the orientation is INVERSE the "natural" silicon counting order (eth0
++ * -> dp_port_id 2 .. eth3 -> dp_port_id 5 would be natural).
++ */
++#define INTEL_XRX500_NUM_PORTS  4
++
++/**
++ * struct intel_xrx500_port_stats - per-port traffic counters.
++ *
++ * @rx_packets: frames received and delivered to the stack.
++ *
++ * @rx_bytes:   bytes received (post-CRC strip).
++ *
++ * @tx_packets: frames successfully posted to the egress DMA.
++ *
++ * @tx_bytes:   bytes posted to egress.
++ *
++ * @rx_dropped: receive-path drops (allocation failure, queue full, ...).
++ *
++ * @tx_dropped: transmit-path drops.
++ *
++ * @syncp:      seqcount-based torn-read protection for the u64_stats_t
++ *              fields above.
++ *
++ * The two drop counters use atomic_long_t because they (a) are incremented
++ * from drop fastpaths that have no obligation to advance under the same
++ * seqcount sequence as the packet/byte pair, and (b) atomic_long_t avoids
++ * forcing the caller to acquire u64_stats_update_begin in the drop-only path.
++ * On 64-bit architectures (BITS_PER_LONG == 64) the u64_stats_sync discipline
++ * collapses to a no-op; on 32-bit architectures u64_stats_init must be called
++ * before any update.
++ */
++struct intel_xrx500_port_stats {
++	u64_stats_t		rx_packets;
++	u64_stats_t		rx_bytes;
++	u64_stats_t		tx_packets;
++	u64_stats_t		tx_bytes;
++	atomic_long_t		rx_dropped;
++	atomic_long_t		tx_dropped;
++	struct u64_stats_sync	syncp;
++};
++
++/**
++ * struct intel_xrx500_port - per-LAN-port state object.
++ *
++ * @netdev:           the per-port net_device allocated via
++ *                    alloc_etherdev_mq at probe time.
++ *
++ * @phylink:          phylink instance returned by phylink_create.
++ *                    NULL between alloc_etherdev_mq and phylink_create.
++ *
++ * @port_idx:         per-port index 0..3 - matches the DT child node
++ *                    reg = <N> property. Used as the array index back
++ *                    into priv->ports[] from phylink callbacks.
++ *
++ * Identical to the GSWIP silicon port-number for these four LAN ports -
++ * directly indexes into MAC_CTRL_0[port] et seq.
++ *
++ * Used when wiring the TMU port-enable sequence.
++ *
++ * @phy_node:         the DT node carrying the phy-handle (= one of
++ *                    &gphy_lan1..&gphy_lan4); used by
++ *                    phylink_of_phy_connect at probe time. Held by an
++ *                    of_node_get reference released in
++ *                    intel_xrx500_remove.
++ *
++ * @port_node:        the per-port DT node (port@N) whose fwnode is
++ *                    handed to phylink_create. Held by an of_node_get
++ *                    reference released in intel_xrx500_remove.
++ *
++ * @parent:           back-pointer to the owning
++ *                    struct intel_xrx500_priv (for dev_err routing).
++ *
++ * Initialized to DP_F_FAST_ETH_LAN at probe time (the four FRITZ!Box 7560 LAN ports
++ * are all fast-Ethernet LAN class). The same value (OR'd with
++ * DP_F_DEREGISTER) is passed on the ndo_stop teardown path so the
++ * alloc/dealloc pair use bit-for-bit identical base flags.
++ *
++ * @dp_subif_id: the @subif handle returned by dp_register_subif on success
++ * (the VAP/CTP identifier inside the dp_port). Undefined when
++ * @state_subif_registered is false.
++ *
++ * The struct sits at netdev_priv(netdev) for that port's netdev, so any ndo_*
++ * callback can recover it via netdev_priv(dev).
++ */
++struct intel_xrx500_port {
++	struct net_device		*netdev;
++	struct phylink			*phylink;
++	struct phylink_config		phylink_config;
++	u32				port_idx;
++	u32				dp_port_id;
++	u32				cbm_deq_port;
++	u32				tmu_egress_port;
++	struct device_node		*phy_node;
++	struct device_node		*port_node;
++	struct intel_xrx500_priv	*parent;
++	struct intel_xrx500_port_stats	stats;
++	u32				dp_alloc_flags;
++	s32				dp_subif_id;
++	bool				state_open;
++	bool				state_subif_registered;
++	spinlock_t			tx_lock;
++	u32				tx_chan;
++	struct dma_tx_desc		*tx_ring;
++	dma_addr_t			tx_ring_phys;
++	u32				tx_head;
++	bool				state_tx_initialized;
++};
++
++/**
++ * struct intel_xrx500_priv - per-platform_device top-level state.
++ *
++ * @pdev:    the bound platform_device.
++ *
++ * @dev:     convenience back-pointer for dev_err / dev_info.
++ *
++ * @ports: per-port state pointers; NULL slots are unallocated.
++ *
++ * @gswl_dev: cached ethsw_api_dev_t pointer for GSW-L (devid=0), recovered
++ * via gsw_get_swcore_ops(0) + container_of at probe time. Carries gswl_base /
++ * gsw_base for direct gsw_w32 register writes from mac_link_up /
++ * mac_link_down. NULL until probe completes - probe returns -EPROBE_DEFER if
++ * gsw_get_swcore_ops(0) returns NULL at probe time.
++ *
++ * Allocated once via devm_kzalloc at probe time, freed automatically
++ * on probe failure or driver unbind.
++ */
++struct intel_xrx500_priv {
++	struct platform_device		*pdev;
++	struct device			*dev;
++	struct intel_xrx500_port	*ports[INTEL_XRX500_NUM_PORTS];
++	void				*gswl_dev;
++};
++
++#endif /* _LANTIQ_INTEL_XRX500_H_ */
+diff --git a/drivers/net/ethernet/lantiq/intel_xrx500.c b/drivers/net/ethernet/lantiq/intel_xrx500.c
+new file mode 100644
+index 000000000000..5215b7836ced
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/intel_xrx500.c
+@@ -0,0 +1,1431 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 Grische <github@grische.xyz>
++ *
++ * Per-port network devices for the xRX500 Ethernet switch: phylink-driven MAC
++ * configuration, the polled-DMA transmit path and the receive callbacks the
++ * CBM load spreader calls.
++ */
++
++#include <linux/atomic.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/err.h>
++#include <linux/etherdevice.h>
++#include <linux/ethtool.h>
++#include <linux/if_ether.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/netdevice.h>
++#include <linux/of.h>
++#include <linux/of_net.h>
++#include <linux/phy.h>
++#include <linux/phylink.h>
++#include <linux/platform_device.h>
++#include <linux/printk.h>
++#include <linux/ratelimit.h>
++#include <linux/rtnetlink.h>
++#include <linux/skbuff.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/u64_stats_sync.h>
++#include <generated/utsrelease.h>
++
++#include "include/intel_xrx500.h"
++#include "switch-api/gsw_reg.h"
++#include "switch-api/gsw_init.h"
++#include "switch-api/gsw_flow_core.h"
++
++#include "dma/hdma.h"
++
++#include "datapath/datapath_api.h"
++#include "dma/lantiq_dmax.h"
++#include "tmu/drv_tmu_ll.h"
++
++/*
++ * Local fallback definitions of the DP_F_* flag bits the AVM public-API enum
++ * carries in include/net/datapath_api.h. Byte values are AVM-canonical and
++ * must NOT drift from the datapath_api.c local fallbacks (the .o ABI must
++ * match across both TUs).
++ */
++#ifndef DP_F_DEREGISTER
++#define DP_F_DEREGISTER			0x00000001
++#endif
++#ifndef DP_F_FAST_ETH_LAN
++#define DP_F_FAST_ETH_LAN		0x00000002
++#endif
++
++/*
++ * Field order/sizes MUST match datapath_api.c's local copy bit-for-bit or
++ * dp_register_subif's reads/writes through the pointer will land in the wrong
++ * slot.
++ */
++struct dp_subif {
++	s32 port_id;
++	int inst;
++	int subif_num;
++	s32 subif;
++};
++
++#define INTEL_XRX500_DRV_NAME "intel-xrx500"
++
++/*
++ * Sentinel `struct module` used as the `owner` argument when calling
++ * AVM-ported dp_alloc_port_ext / dp_register_subif / dp_dealloc_port_ext.
++ *
++ * AVM's datapath_api.c rejects `owner == NULL` (`"Allocate port failed for
++ * owner NULL"`, datapath_api.c:411) and dereferences `owner->name` in its
++ * dev_err / hashing paths. For loadable-module builds the kernel's
++ * THIS_MODULE expands to `&__this_module`, which is stable + has a name.
++ *
++ * A static `struct module` with .name set does the job: address-stable for
++ * the life of the .ko/.o, dereference- safe, and the name shows up in dp_dev
++ * / dev_err diagnostics.
++ *
++ * The sentinel is NEVER passed to module_get/put — datapath_api.c uses
++ * `owner` only as an identity pointer + for .name. The unused struct
++ * fields stay zero-init which is benign for that read-only usage.
++ */
++static struct module intel_xrx500_module_sentinel = {
++	.name = INTEL_XRX500_DRV_NAME,
++};
++#define INTEL_XRX500_DP_OWNER (&intel_xrx500_module_sentinel)
++
++/*
++ * Per-port MAC register stride (GSWIP-3.0).
++ *
++ * MAC_PSTAT_LSTAT lives at word-offset MAC_PSTAT_LSTAT_OFFSET = 0x900
++ * for port 0. AVM 4.9 gsw_flow_core.c:12764 accesses per-port copies
++ * via the expression `MAC_PSTAT_LSTAT_OFFSET + (0xC * pidx)`. So each
++ * port consumes 12 word-offsets (= 48 bytes) and the per-port stride
++ * is 0xC words.
++ *
++ * Sub-register offsets within the per-port window (from gsw_reg.h
++ * lines 3152-3520):
++ *   MAC_PSTAT      0x900  port status
++ *   MAC_PISR       0x901  port interrupt status
++ *   MAC_PIER       0x902  port interrupt enable
++ *   MAC_CTRL_0     0x903  GMII (speed) / FDUP / FCON / FCS / PADEN / BM
++ *   MAC_CTRL_1     0x904  IPG / SHORTPRE / DEFERMODE
++ *   MAC_CTRL_2     0x905  LCHKS / LCHKL / MLEN
++ *   MAC_CTRL_3     0x906  RCNT (retry count)
++ *   MAC_CTRL_4     0x907  WAIT / LPIEN / GWAIT (EEE LPI timing)
++ *   MAC_CTRL_5     0x908  PJPS_BP / PJPS_NOBP
++ *   MAC_LPITMER0   0x909  LPI timer LSB
++ *   MAC_LPITMER1   0x90A  LPI timer MSB
++ *   MAC_TESTEN     0x90B  test enables
++ *
++ * The plan refers to these registers by their AVM functional name
++ * MAC_PCFG (port configuration) - that maps to MAC_CTRL_0 in the
++ * gsw_reg.h naming, since MAC_CTRL_0 carries the speed (GMII),
++ * full-duplex (FDUP), and flow-control (FCON) fields that mac_link_up
++ * must program.
++ */
++#define INTEL_XRX500_MAC_PORT_STRIDE  0xC
++
++/*
++ * Speed encoding for MAC_CTRL_0[GMII] field (bits 0..1, size 2).
++ *
++ * GSWIP-3.0 datasheet encodings (datasheet table referenced from
++ * the gsw_reg.h bit description "GMII/MII interface mode selection"):
++ *   00 = MII mode (10 Mbps half-duplex baseline)
++ *   01 = MII 100 Mbps
++ *   10 = GMII 1000 Mbps
++ *   11 = reserved
++ *
++ * (There is no dedicated single-bit "MAC enable" in MAC_CTRL_0; FCS=1 is the
++ * operationally-equivalent gate that mac_link_down clears alongside the
++ * speed/duplex/flow fields.)
++ */
++#define INTEL_XRX500_GMII_10M   0x0u
++#define INTEL_XRX500_GMII_100M  0x1u
++#define INTEL_XRX500_GMII_1000M 0x2u
++
++/*
++ * FDUP encoding for MAC_CTRL_0[FDUP] field (bits 2..3, size 2).
++ *
++ *   00 = half-duplex
++ *   01 = full-duplex
++ *   10 = reserved
++ *   11 = reserved
++ */
++#define INTEL_XRX500_FDUP_HALF  0x0u
++#define INTEL_XRX500_FDUP_FULL  0x1u
++
++/*
++ * FCON encoding for MAC_CTRL_0[FCON] field (bits 4..6, size 3).
++ *
++ *   000 = no flow control
++ *   001 = symmetric pause (RX + TX)
++ *   010 = TX pause only
++ *   011 = RX pause only
++ *   1xx = auto-negotiated (handled by phylink)
++ *
++ * Real hardware encoding (AVM lantiq_gsw.h:1959-1967, written verbatim to
++ * FCON at gsw_flow_core.c:4271; mainline lantiq_gswip.h
++ * GSWIP_MAC_CTRL_0_FCON_* agrees): 0=AUTO, 1=RX-only, 2=TX-only, 3=RXTX
++ * (symmetric), 4=NONE. Constants fixed to match.
++ */
++#define INTEL_XRX500_FCON_NONE  0x4u
++#define INTEL_XRX500_FCON_SYM   0x3u
++#define INTEL_XRX500_FCON_TX    0x2u
++#define INTEL_XRX500_FCON_RX    0x1u
++
++#define DMA_TX_RING_DEPTH                  32U
++#define INTEL_XRX500_TX_POLL_TIMEOUT_US    5000U
++#define INTEL_XRX500_TX_POLL_INCREMENT_US  100U
++
++
++/*
++ * Cross-TU CBM buffer-pool prototypes.
++ *
++ * cbm_buf_alloc / cbm_buf_free are defined in cqm/grx500/cbm_buf.c.
++ *
++ * The plan text reads "cbm_buf_alloc(skb->len, NULL, 0)" +
++ * "virt_to_phys(buf)" — that combination would oops on `no-map` memory.
++ */
++void *cbm_buf_alloc(u32 size, u32 *pool_phys, u32 flags);
++int cbm_buf_free(void *buf, u32 size);
++
++#define CBM_PORT_F_STANDARD_BUF  0x1U
++void *cbm_fsqm_buf_alloc(int pid, u32 flags, u32 *buf_phys);
++int cbm_fsqm_buf_free(int pid, u32 buf_phys);
++
++/*
++ * cbm_cpu_enqueue_hw — fire-and-forget CPU TX enqueue to the CBM EQM
++ * CPU ingress port (cqm/grx500/cbm_dma.c; faithful port of AVM
++ * cpu_enqueue_hw). Declared here for the same intra-composite linkage
++ * reason as cbm_buf_alloc above (authoritative decl in
++ * include/net/cqm_cbm_api.h).
++ */
++int cbm_cpu_enqueue_hw(int pid, u32 dw0, u32 dw1, u32 data_phys, u32 dw3);
++
++int turn_on_DMA_p2p(void);
++
++void cbm_rx_set_netdev(struct net_device *dev);
++
++#define XRX500_CBM_TX_DATA_OFFSET (128u + NET_IP_ALIGN + NET_SKB_PAD)
++
++/* Forward declarations. */
++static const struct net_device_ops intel_xrx500_netdev_ops;
++static const struct ethtool_ops intel_xrx500_ethtool_ops;
++static const struct phylink_mac_ops intel_xrx500_phylink_ops;
++
++/* Helpers */
++
++/**
++ * intel_xrx500_get_gswl_dev() - recover the GSW-L ethsw_api_dev_t.
++ *
++ * Returns NULL while GSW-L probe has not yet completed (the caller
++ * must treat this as -EPROBE_DEFER).
++ */
++static void *intel_xrx500_get_gswl_dev(void)
++{
++	struct core_ops *ops = gsw_get_swcore_ops(0);
++
++	if (!ops)
++		return NULL;
++
++	return GSW_PDATA_GET(ops);
++}
++
++/**
++ * intel_xrx500_port_from_config() - recover per-port struct from
++ * phylink_config.
++ *
++ * @config: phylink_config pointer handed in by a phylink_mac_ops callback.
++ */
++static inline struct intel_xrx500_port *
++intel_xrx500_port_from_config(struct phylink_config *config)
++{
++	return container_of(config, struct intel_xrx500_port, phylink_config);
++}
++
++/*
++ * phylink_mac_ops
++ *
++ * mac_get_caps returns the static cap bitmap (10/100/1000FD + pause
++ * caps for phylink validation). Phylink uses this to negotiate the
++ * resolved link speed before calling mac_link_up.
++ *
++ * Phylink tolerates a NULL PCS pointer in PHY-attached mode.
++ */
++
++/**
++ * intel_xrx500_mac_get_caps() - return MAC capabilities for an interface
++ * mode.
++ *
++ * @config:    phylink_config (carries the static mac_capabilities bitmap).
++ *
++ * @interface: PHY interface mode under negotiation.
++ */
++static unsigned long intel_xrx500_mac_get_caps(struct phylink_config *config,
++					       phy_interface_t interface)
++{
++	return config->mac_capabilities;
++}
++
++/**
++ * intel_xrx500_mac_select_pcs() - select a PCS for the interface mode.
++ *
++ * @config:    phylink_config.
++ *
++ * @interface: PHY interface mode under negotiation.
++ */
++static struct phylink_pcs *
++intel_xrx500_mac_select_pcs(struct phylink_config *config,
++			    phy_interface_t interface)
++{
++	return NULL;
++}
++
++/**
++ * intel_xrx500_mac_config() - reconfigure MAC for a new mode/state.
++ *
++ * @config: phylink_config.
++ *
++ * @mode:   one of MLO_AN_FIXED, MLO_AN_PHY, MLO_AN_INBAND.
++ *
++ * @state:  resolved link-state pointer.
++ */
++static void intel_xrx500_mac_config(struct phylink_config *config,
++				    unsigned int mode,
++				    const struct phylink_link_state *state)
++{
++	/* Intentionally empty - see kdoc above. */
++}
++
++/**
++ * intel_xrx500_mac_link_down() - notification that the link has gone down.
++ *
++ * @config:    phylink_config (recover per-port struct via container_of).
++ *
++ * @mode:      autonegotiation mode.
++ *
++ * @interface: PHY interface mode.
++ */
++static void intel_xrx500_mac_link_down(struct phylink_config *config,
++				       unsigned int mode,
++				       phy_interface_t interface)
++{
++}
++
++/*
++ * MAC_CTRL_0 stays at its reset default: the vendor's differing value is
++ * written only from code inside #ifdef CONFIG_USE_EMULATOR
++ * (ltq_eth_drv_xrx500.c:966-979).
++ */
++
++/**
++ * intel_xrx500_mac_link_up() - notification that the link has come up.
++ *
++ * @config:    phylink_config (recover per-port struct via container_of).
++ *
++ * @phy:      attached struct phy_device (unused - LPI deferred).
++ *
++ * @mode:      autonegotiation mode.
++ *
++ * @interface: PHY interface mode.
++ *
++ * @speed:     resolved link speed (SPEED_10 / 100 / 1000).
++ *
++ * @duplex:    resolved duplex (DUPLEX_FULL / DUPLEX_HALF).
++ *
++ * @tx_pause:  TX pause-frame admission status.
++ *
++ * @rx_pause:  RX pause-frame admission status.
++ */
++static void intel_xrx500_mac_link_up(struct phylink_config *config,
++				     struct phy_device *phy,
++				     unsigned int mode,
++				     phy_interface_t interface, int speed,
++				     int duplex, bool tx_pause, bool rx_pause)
++{
++	struct intel_xrx500_port *port = intel_xrx500_port_from_config(config);
++	unsigned int pidx = port->dp_port_id;
++
++	/*
++	 * No register writes here: the hardware MDIO poller is the
++	 * link-to-MAC coupling on this switch, matching the vendor driver,
++	 * whose adjust_link is an empty stub and which enables the poller at
++	 * switch-core init.
++	 */
++
++	netdev_info(port->netdev,
++		    "intel-xrx500: %s link up (speed=%dMbps duplex=%s flow=%s%s dp_port_id=%u)\n",
++		    netdev_name(port->netdev), speed,
++		    (duplex == DUPLEX_FULL) ? "full" : "half",
++		    tx_pause ? "tx" : "",
++		    rx_pause ? "rx" : (tx_pause ? "" : "none"),
++		    pidx);
++}
++
++static const struct phylink_mac_ops intel_xrx500_phylink_ops = {
++	.mac_get_caps   = intel_xrx500_mac_get_caps,
++	.mac_select_pcs = intel_xrx500_mac_select_pcs,
++	.mac_config     = intel_xrx500_mac_config,
++	.mac_link_down  = intel_xrx500_mac_link_down,
++	.mac_link_up    = intel_xrx500_mac_link_up,
++};
++
++/* net_device_ops */
++
++/*
++ * (1) phylink_stop(port->phylink) (2) dp_register_subif(... (3)
++ * tmu_egress_port_enable(port->tmu_egress_port, false) (codebase convention:
++ * single enable function with bool — see the file-header include block; the
++ * plan text's "tmu_egress_port_disable" reads as the (epn, false) form.) (4)
++ * hdma_port_disable(port->cbm_deq_port)
++ */
++
++/**
++ * intel_xrx500_open_step1_hdma() - ndo_open step 1: hdma_port_enable.
++ *
++ * @port: the per-port state.
++ */
++static int intel_xrx500_open_step1_hdma(struct intel_xrx500_port *port)
++{
++	int ret = hdma_port_enable((int)port->cbm_deq_port);
++
++	if (ret) {
++		pr_err("intel-xrx500: %s ndo_open step 1 (hdma_port_enable) FAILED: %d; rolling back\n",
++		       netdev_name(port->netdev), ret);
++		return ret;
++	}
++
++	{
++		int p2p = turn_on_DMA_p2p();
++
++		if (!p2p)
++			pr_info("intel-xrx500: %s p2p channels turned ON\n",
++				netdev_name(port->netdev));
++	}
++	return 0;
++}
++
++/**
++ * intel_xrx500_open_step1_hdma_undo() - reverse of step 1 (rollback path).
++ *
++ * @port: the per-port state.
++ */
++static void intel_xrx500_open_step1_hdma_undo(struct intel_xrx500_port *port)
++{
++	int ret = hdma_port_disable((int)port->cbm_deq_port);
++
++	if (ret)
++		pr_warn("intel-xrx500: %s rollback step 1 (hdma_port_disable) failed: %d\n",
++			netdev_name(port->netdev), ret);
++}
++
++/**
++ * intel_xrx500_open_step2_tmu() - ndo_open step 2: tmu_egress_port_enable.
++ *
++ * @port: the per-port state.
++ *
++ * The function cannot fail; this step always succeeds.
++ */
++static int intel_xrx500_open_step2_tmu(struct intel_xrx500_port *port)
++{
++	tmu_egress_port_enable(port->tmu_egress_port, true);
++	return 0;
++}
++
++/**
++ * intel_xrx500_open_step2_tmu_undo() - reverse of step 2 (rollback path).
++ *
++ * @port: the per-port state.
++ */
++static void intel_xrx500_open_step2_tmu_undo(struct intel_xrx500_port *port)
++{
++	tmu_egress_port_enable(port->tmu_egress_port, false);
++}
++
++/**
++ * intel_xrx500_open_step3_dp() - ndo_open step 3: dp_alloc_port_ext +
++ * dp_register_subif.
++ *
++ * @port: the per-port state.
++ *
++ * The 5-step ordering maps to 4 explicit calls under the
++ * dp_register_subif-owns- cbm_dp_enable resolution. Re-introducing an
++ * explicit cbm_dp_enable call here would double-program the QIDT — DO NOT.
++ *
++ * On dp_register_subif failure the partial dp_alloc_port_ext is undone inline
++ * before returning (so step 2's undo can safely run without leaking the
++ * dp_port_info slot).
++ */
++static int intel_xrx500_open_step3_dp(struct intel_xrx500_port *port)
++{
++	struct dp_subif subif = {
++		.port_id    = (s32)port->dp_port_id,
++		.inst       = 0,
++		.subif_num  = 0,
++		.subif      = -1,
++	};
++	int ret;
++
++	ret = dp_alloc_port_ext(0, INTEL_XRX500_DP_OWNER, port->netdev, 0,
++				(int)port->dp_port_id, NULL, NULL,
++				port->dp_alloc_flags);
++	if (ret < 0) {
++		pr_err("intel-xrx500: %s ndo_open step 3 (dp_alloc_port_ext) FAILED: %d; rolling back\n",
++		       netdev_name(port->netdev), ret);
++		return ret;
++	}
++
++	ret = dp_register_subif(INTEL_XRX500_DP_OWNER, port->netdev,
++				port->netdev->name, &subif,
++				port->dp_alloc_flags);
++	if (ret) {
++		pr_err("intel-xrx500: %s ndo_open step 3 (dp_register_subif) FAILED: %d; rolling back\n",
++		       netdev_name(port->netdev), ret);
++		/*
++		 * Undo the partial step-3 dp_alloc_port_ext before the outer
++		 * rollback chain reaches step 2 / step 1.
++		 */
++		if (dp_dealloc_port_ext(0, INTEL_XRX500_DP_OWNER, port->netdev, 0,
++					(int)port->dp_port_id, NULL, NULL,
++					port->dp_alloc_flags))
++			pr_warn("intel-xrx500: %s rollback step 3 (dp_dealloc_port_ext after failed subif register) failed\n",
++				netdev_name(port->netdev));
++		return ret;
++	}
++
++	port->dp_subif_id = subif.subif;
++	port->state_subif_registered = true;
++	return 0;
++}
++
++/**
++ * intel_xrx500_open_step3_dp_undo() - reverse of step 3 (rollback / ndo_stop
++ * path).
++ *
++ * @port: the per-port state.
++ */
++static int intel_xrx500_open_step3_dp_undo(struct intel_xrx500_port *port)
++{
++	struct dp_subif subif = {
++		.port_id   = (s32)port->dp_port_id,
++		.inst      = 0,
++		.subif_num = 1,
++		.subif     = port->dp_subif_id,
++	};
++	int first_err = 0;
++	int ret;
++
++	if (!port->state_subif_registered)
++		return 0;
++
++	ret = dp_register_subif(INTEL_XRX500_DP_OWNER, port->netdev,
++				port->netdev->name, &subif,
++				port->dp_alloc_flags | DP_F_DEREGISTER);
++	if (ret) {
++		pr_err("intel-xrx500: %s ndo_stop step 2 (dp_deregister_subif) FAILED: %d; continuing teardown\n",
++		       netdev_name(port->netdev), ret);
++		first_err = ret;
++	}
++
++	ret = dp_dealloc_port_ext(0, INTEL_XRX500_DP_OWNER, port->netdev, 0,
++				  (int)port->dp_port_id, NULL, NULL,
++				  port->dp_alloc_flags);
++	if (ret) {
++		pr_err("intel-xrx500: %s ndo_stop step 2 (dp_dealloc_port_ext) FAILED: %d; continuing teardown\n",
++		       netdev_name(port->netdev), ret);
++		if (!first_err)
++			first_err = ret;
++	}
++
++
++	port->state_subif_registered = false;
++	port->dp_subif_id = -1;
++	return first_err;
++}
++
++/*
++ * The ndo_stop teardown gains a symmetric inverse between phylink_stop
++ * (step 1) and dp_deregister_subif (step 3):
++ *
++ *   (1) phylink_stop                 [unchanged]
++ *   (2) tx-teardown: ltq_dma_chan_off + ltq_free_dma + dma_free_coherent
++ *   (3) dp_deregister_subif + dp_dealloc_port_ext  [was step 2]
++ *   (4) tmu_egress_port_enable(false)              [was step 3]
++ *   (5) hdma_port_disable                          [was step 4]
++ *
++ * The ring's lifetime spans ndo_open .. ndo_stop; a remove/re-probe cycle
++ * re-allocates from clean state.
++ *
++ * This is a functionally-equivalent substitution recorded in manifest
++ * scope_deviations.
++ */
++
++/**
++ * intel_xrx500_open_step4_tx() - ndo_open step 4: TX descriptor-ring init.
++ *
++ * @port: the per-port state.
++ *
++ * On any failure, every successful sub-step is unwound INLINE before
++ * the errno is returned (so the outer rollback chain reaches step 3's
++ * undo without leaking the partially-acquired channel / ring / etc.).
++ * After a successful return, port->state_tx_initialized == true and
++ * port->tx_ring / port->tx_ring_phys / port->tx_chan are valid.
++ */
++static int intel_xrx500_open_step4_tx(struct intel_xrx500_port *port)
++{
++	if (!port->parent || !port->parent->dev) {
++		pr_err("intel-xrx500: %s ndo_open step 4 (tx-init): parent->dev NULL\n",
++		       netdev_name(port->netdev));
++		return -EINVAL;
++	}
++
++	if (port->port_idx >= INTEL_XRX500_NUM_PORTS) {
++		pr_err("intel-xrx500: %s ndo_open step 4 (tx-init): port_idx %u out of table range\n",
++		       netdev_name(port->netdev), port->port_idx);
++		return -EINVAL;
++	}
++
++	/*
++	 * Keep the legacy fields well-defined for any teardown/zero-init
++	 * path.
++	 */
++	port->tx_chan = 0;
++	port->tx_ring = NULL;
++	port->tx_ring_phys = 0;
++	port->tx_head = 0;
++
++	port->state_tx_initialized = true;
++
++	pr_info("intel-xrx500: %s TX path CPU-ENQUEUE (DMA2TX ch5)\n",
++		netdev_name(port->netdev));
++
++	return 0;
++}
++
++/**
++ * intel_xrx500_open_step4_tx_undo() - reverse of step 4 (rollback / ndo_stop
++ * path).
++ *
++ * @port: the per-port state.
++ */
++static int intel_xrx500_open_step4_tx_undo(struct intel_xrx500_port *port)
++{
++	if (!port->state_tx_initialized)
++		return 0;
++
++	port->tx_ring = NULL;
++	port->tx_ring_phys = 0;
++	port->tx_chan = 0;
++	port->tx_head = 0;
++	port->state_tx_initialized = false;
++
++	return 0;
++}
++
++/**
++ * intel_xrx500_ndo_open() - bring the per-port netdev up.
++ *
++ * @dev: the netdev being brought up.
++ *
++ * step 5 (phylink_start) returns void — it cannot fail at the API boundary.
++ */
++static int intel_xrx500_ndo_open(struct net_device *dev)
++{
++	struct intel_xrx500_port *port = netdev_priv(dev);
++	int ret;
++
++	if (port->state_open)
++		return -EALREADY;
++
++	ret = intel_xrx500_open_step2_tmu(port);
++	if (ret)
++		return ret;
++
++	ret = intel_xrx500_open_step1_hdma(port);
++	if (ret)
++		goto err_undo_step2;
++
++	ret = intel_xrx500_open_step3_dp(port);
++	if (ret)
++		goto err_undo_step1;
++
++	ret = intel_xrx500_open_step4_tx(port);
++	if (ret)
++		goto err_undo_step3;
++
++	phylink_start(port->phylink);
++
++	cbm_rx_set_netdev(dev);
++
++	port->state_open = true;
++	return 0;
++
++err_undo_step3:
++	intel_xrx500_open_step3_dp_undo(port);
++err_undo_step1:
++	intel_xrx500_open_step1_hdma_undo(port);
++err_undo_step2:
++	intel_xrx500_open_step2_tmu_undo(port);
++	return ret;
++}
++
++/**
++ * intel_xrx500_ndo_stop() - bring the per-port netdev down.
++ *
++ * @dev: the netdev being brought down.
++ *
++ * On partial failure logs each failing step but continues the teardown (never
++ * bails partway through), returning the FIRST errno seen at the end.
++ */
++static int intel_xrx500_ndo_stop(struct net_device *dev)
++{
++	struct intel_xrx500_port *port = netdev_priv(dev);
++	int first_err = 0;
++	int ret;
++
++	if (!port->state_open)
++		return 0;
++
++	/* (1) phylink_stop — returns void; cannot fail. */
++	phylink_stop(port->phylink);
++
++	/*
++	 * Reverse-order inverse of intel_xrx500_open_step4_tx. Idempotent
++	 * against the state_tx_initialized flag so a partial-open whose step
++	 * 4 failed is a no-op here.
++	 */
++	if (port->state_tx_initialized) {
++		ret = intel_xrx500_open_step4_tx_undo(port);
++		if (ret && !first_err)
++			first_err = ret;
++	}
++
++	if (port->state_subif_registered) {
++		ret = intel_xrx500_open_step3_dp_undo(port);
++		if (ret && !first_err)
++			first_err = ret;
++	}
++
++	/* (4) tmu_egress_port_enable(epn, false) — codebase-convention
++	 * spelling of the plan's tmu_egress_port_disable. Returns void.
++	 */
++	tmu_egress_port_enable(port->tmu_egress_port, false);
++
++	/* (5) hdma_port_disable. */
++	ret = hdma_port_disable((int)port->cbm_deq_port);
++	if (ret) {
++		pr_err("intel-xrx500: %s ndo_stop step 5 (hdma_port_disable) FAILED: %d; continuing teardown\n",
++		       netdev_name(dev), ret);
++		if (!first_err)
++			first_err = ret;
++	}
++
++	cbm_rx_set_netdev(NULL);
++
++	port->state_open = false;
++	return first_err;
++}
++
++/**
++ * intel_xrx500_tx_drop_skb_locked() - common tx-drop fastpath.
++ *
++ * @port:    the per-port state.
++ *
++ * @skb:     the frame to drop (consumed via dev_kfree_skb_any).
++ *
++ * @flags:   the irqsave flags captured at spin_lock_irqsave entry.
++ *
++ * @reason:  free-text string included in the pr_err_ratelimited line
++ *           so post-mortems can disambiguate the failure mode.
++ */
++static netdev_tx_t
++intel_xrx500_tx_drop_skb_locked(struct intel_xrx500_port *port,
++				struct sk_buff *skb,
++				unsigned long flags,
++				const char *reason)
++{
++	atomic_long_inc(&port->stats.tx_dropped);
++
++	spin_unlock_irqrestore(&port->tx_lock, flags);
++
++	pr_err_ratelimited("intel-xrx500: %s tx drop: %s\n",
++			   netdev_name(port->netdev), reason);
++
++	dev_kfree_skb_any(skb);
++	return NETDEV_TX_OK;
++}
++
++/**
++ * intel_xrx500_ndo_start_xmit() - polled-DMA TX path.
++ *
++ * @skb: outgoing frame (consumed in all return paths).
++ *
++ * @dev: source netdev.
++ *
++ * Reading the API surface end-to-end, the only writable per-channel
++ * state-change primitives are ltq_dma_chan_on/off/reset which carry
++ * orthogonal semantics (channel-state, not descriptor commit). DMA_C_SWPOLL
++ * (0x150) exists in hdma_regs.h but is never written from hdma.c and has no
++ * public accessor. The controller is set into AUTO-POLL MODE at init time via
++ * the DMA_CPOLL_EN bit (hdma.c:374), which causes silicon to continuously
++ * sweep the descriptor ring at the configured polling-cnt cadence. In this
++ * mode, the descriptor itself IS the commit point: once
++ * status.own=DESC_OWN_DMA is visible to the engine, the next polling sweep
++ * picks up the entry. The wmb() makes the descriptor body globally visible
++ * before the next polling sweep — that is the commit-equivalent on CPOLL_EN
++ * silicon.
++ *
++ * Every failure path returns NETDEV_TX_OK after dev_kfree_skb_any +
++ * tx_dropped++; success returns NETDEV_TX_OK after dev_consume_skb_any +
++ * tx_packets++ / tx_bytes+=skb->len.
++ */
++static netdev_tx_t intel_xrx500_ndo_start_xmit(struct sk_buff *skb,
++					       struct net_device *dev)
++{
++	struct intel_xrx500_port *port = netdev_priv(dev);
++	struct pmac_tx_hdr *pmac;
++	struct dma_tx_desc_0 desc0;
++	struct dma_tx_desc_1 desc1;
++	struct dma_tx_desc_3 desc3;
++	unsigned long flags;
++	u32 pool_phys = 0;
++	u32 data_phys;
++	u32 frame_len;
++	u32 total_len;
++	u32 hdr_len;
++	int cpu_pid;
++	void *buf;
++	int ret;
++
++	spin_lock_irqsave(&port->tx_lock, flags);
++
++	/*
++	 * The CBM CPU-enqueue TX path does not use the per-port descriptor
++	 * ring at all; it fires the frame straight at the CBM EQM CPU port.
++	 */
++	if (!port->state_tx_initialized)
++		return intel_xrx500_tx_drop_skb_locked(port, skb, flags,
++						      "tx-init not complete");
++
++	if (skb_linearize(skb))
++		return intel_xrx500_tx_drop_skb_locked(port, skb, flags,
++						      "skb_linearize failed");
++
++	/*
++	 * GSWIP drops sub-minimum Ethernet frames; pad to ETH_ZLEN like AVM
++	 * cbm_cpu_pkt_tx_grx500 does before computing total length.
++	 */
++	if (skb->len < ETH_ZLEN) {
++		if (skb_padto(skb, ETH_ZLEN))
++			return intel_xrx500_tx_drop_skb_locked(port, skb, flags,
++							      "skb_padto failed");
++		if (skb->len < ETH_ZLEN)
++			skb_put(skb, ETH_ZLEN - skb->len);
++	}
++
++	hdr_len = (u32)sizeof(struct pmac_tx_hdr);
++
++	frame_len = (u32)skb->len;
++	total_len = frame_len + hdr_len;
++
++	/*
++	 * MTU 1500 keeps total_len well under that, but guard so a
++	 * misconfigured MTU can't overflow the segment into adjacent FSQM
++	 * memory.
++	 */
++	if (XRX500_CBM_TX_DATA_OFFSET + total_len > 2048)
++		return intel_xrx500_tx_drop_skb_locked(port, skb, flags,
++						      "frame exceeds std FSQM segment");
++
++	/*
++	 * CPU enqueue port id: AVM cbm_cpu_enqueue uses smp_processor_id()
++	 * for BOTH the BUFREQ buffer checkout and the enqueue.
++	 */
++	cpu_pid = raw_smp_processor_id();
++
++	buf = cbm_fsqm_buf_alloc(cpu_pid, CBM_PORT_F_STANDARD_BUF, &pool_phys);
++	if (!buf)
++		return intel_xrx500_tx_drop_skb_locked(port, skb, flags,
++						      "cbm_fsqm_buf_alloc returned NULL");
++
++	if (hdr_len) {
++		/*
++		 * LAN-port PMAC tx header (AVM DP_F_FAST_ETH_LAN template):
++		 * port_map_en=1, sppid=PMAC_CPU_ID(0), class_en=1,
++		 * port_map2 = 1 << dp_port_id. Only used on a header-channel.
++		 */
++		pmac = (struct pmac_tx_hdr *)((u8 *)buf + XRX500_CBM_TX_DATA_OFFSET);
++		memset(pmac, 0, sizeof(*pmac));
++		pmac->port_map_en = 1;
++		pmac->sppid = 0;          /* PMAC_CPU_ID */
++		pmac->class_en = 1;
++		if (port->dp_port_id <= 7)
++			pmac->port_map2 = (u8)(1u << port->dp_port_id);
++		else
++			pmac->port_map = (u8)(1u << (port->dp_port_id - 8));
++	}
++
++	memcpy((u8 *)buf + XRX500_CBM_TX_DATA_OFFSET + hdr_len, skb->data,
++	       frame_len);
++
++	dma_cache_wback((unsigned long)((u8 *)buf + XRX500_CBM_TX_DATA_OFFSET),
++			total_len);
++
++	desc0.all = 0;
++	desc0.field.dest_sub_if_id = 0;
++
++	desc1.all = 0;
++	desc1.field.ep = port->dp_port_id;
++	desc1.field.color = 1; /* green */
++
++	desc3.all = 0;
++	desc3.field.data_len = total_len & 0xFFFFu;
++	desc3.field.sop = 1;
++	desc3.field.eop = 1;
++	desc3.field.own = 0;
++
++	/*
++	 * The frame data sits at pool_phys + XRX500_CBM_TX_DATA_OFFSET. Mirror
++	 * AVM setup_desc (cbm.c:1787-1789): the DWORD2 data_ptr must be 8-byte
++	 * aligned, and the low 3 bits of the data address go into
++	 * DWORD3.byte_offset (here = 194 & 0x7 = 2).
++	 */
++	data_phys = pool_phys + XRX500_CBM_TX_DATA_OFFSET;
++	desc3.field.byte_offset = data_phys & 0x7u;
++
++	ret = cbm_cpu_enqueue_hw(cpu_pid, desc0.all, desc1.all,
++				 data_phys & ~0x7u, desc3.all);
++	if (ret) {
++		/*
++		 * Enqueue refused (bad pid / window unmapped). Silicon never
++		 * took the segment, so return it to the FSQM free pool via
++		 * ptr_rtn (otherwise the popped segment leaks).
++		 */
++		if (cbm_fsqm_buf_free(cpu_pid, pool_phys))
++			pr_err_ratelimited("intel-xrx500: %s cbm_fsqm_buf_free(post-enqueue-fail) failed\n",
++					   netdev_name(port->netdev));
++		return intel_xrx500_tx_drop_skb_locked(port, skb, flags,
++						      "cbm_cpu_enqueue_hw failed");
++	}
++
++	/*
++	 * Fire-and-forget: the FSQM segment now belongs to silicon, which
++	 * recycles it back to the free pool automatically once the DMA2TX has
++	 * egressed the frame. We do NOT free buf here and we do NOT poll an
++	 * own bit. (A free-segment count OFSC that drains across sustained TX
++	 * would mean the recycle is not happening and the segment has to be
++	 * returned explicitly with cbm_fsqm_buf_free() after egress.)
++	 *
++	 * Stats under tx_lock — required on 32-bit MIPS where the u64-stats
++	 * fallback uses write_seqcount_begin and WARNs on concurrent writers.
++	 */
++	u64_stats_update_begin(&port->stats.syncp);
++	u64_stats_inc(&port->stats.tx_packets);
++	u64_stats_add(&port->stats.tx_bytes, frame_len);
++	u64_stats_update_end(&port->stats.syncp);
++
++	spin_unlock_irqrestore(&port->tx_lock, flags);
++
++	/* Frame copied + enqueued; release the skb. */
++	dev_consume_skb_any(skb);
++	return NETDEV_TX_OK;
++}
++
++/**
++ * intel_xrx500_ndo_change_mtu() - MTU change handler.
++ *
++ * @dev:     the source netdev.
++ *
++ * @new_mtu: the requested new MTU value.
++ */
++static int intel_xrx500_ndo_change_mtu(struct net_device *dev, int new_mtu)
++{
++	/*
++	 * Range check is redundant (netdev core already enforced via
++	 * dev->min_mtu / dev->max_mtu) but kept as a defensive belt-and-
++	 * braces guard so an out-of-band caller cannot bypass it.
++	 */
++	if (new_mtu < ETH_MIN_MTU || new_mtu > 9216)
++		return -EINVAL;
++	return 0;
++}
++
++/**
++ * intel_xrx500_ndo_get_stats64() - ndo_get_stats64 implementation.
++ *
++ * @dev:     the source netdev.
++ *
++ * @storage: caller-allocated stats sink.
++ */
++static void intel_xrx500_ndo_get_stats64(struct net_device *dev,
++					 struct rtnl_link_stats64 *storage)
++{
++	struct intel_xrx500_port *port = netdev_priv(dev);
++	unsigned int start;
++
++	do {
++		start = u64_stats_fetch_begin(&port->stats.syncp);
++		storage->rx_packets = u64_stats_read(&port->stats.rx_packets);
++		storage->rx_bytes   = u64_stats_read(&port->stats.rx_bytes);
++		storage->tx_packets = u64_stats_read(&port->stats.tx_packets);
++		storage->tx_bytes   = u64_stats_read(&port->stats.tx_bytes);
++	} while (u64_stats_fetch_retry(&port->stats.syncp, start));
++
++	storage->rx_dropped = (u64)atomic_long_read(&port->stats.rx_dropped);
++	storage->tx_dropped = (u64)atomic_long_read(&port->stats.tx_dropped);
++}
++
++static const struct net_device_ops intel_xrx500_netdev_ops = {
++	.ndo_open        = intel_xrx500_ndo_open,
++	.ndo_stop        = intel_xrx500_ndo_stop,
++	.ndo_start_xmit  = intel_xrx500_ndo_start_xmit,
++	.ndo_get_stats64 = intel_xrx500_ndo_get_stats64,
++	.ndo_change_mtu  = intel_xrx500_ndo_change_mtu,
++	.ndo_validate_addr = eth_validate_addr,
++	.ndo_set_mac_address = eth_mac_addr,
++};
++
++/* ethtool_ops */
++
++/**
++ * @dev:  source netdev.
++ *
++ * @info: caller-allocated drvinfo sink.
++ */
++static void intel_xrx500_ethtool_get_drvinfo(struct net_device *dev,
++					     struct ethtool_drvinfo *info)
++{
++	struct intel_xrx500_port *port = netdev_priv(dev);
++
++	strscpy(info->driver, INTEL_XRX500_DRV_NAME, sizeof(info->driver));
++	strscpy(info->version, UTS_RELEASE, sizeof(info->version));
++	if (port->parent && port->parent->pdev)
++		strscpy(info->bus_info, dev_name(&port->parent->pdev->dev),
++			sizeof(info->bus_info));
++}
++
++/**
++ * intel_xrx500_ethtool_get_link_ksettings() - phylink-routed link settings
++ * get.
++ *
++ * @dev:      source netdev.
++ *
++ * @ksettings: caller-allocated settings sink.
++ */
++static int
++intel_xrx500_ethtool_get_link_ksettings(struct net_device *dev,
++					struct ethtool_link_ksettings *ksettings)
++{
++	struct intel_xrx500_port *port = netdev_priv(dev);
++
++	if (!port->phylink)
++		return -ENODEV;
++
++	return phylink_ethtool_ksettings_get(port->phylink, ksettings);
++}
++
++/**
++ * intel_xrx500_ethtool_set_link_ksettings() - phylink-routed link settings
++ * set.
++ *
++ * @dev:      source netdev.
++ *
++ * @ksettings: caller-supplied settings.
++ */
++static int intel_xrx500_ethtool_set_link_ksettings(struct net_device *dev,
++		const struct ethtool_link_ksettings *ksettings)
++{
++	struct intel_xrx500_port *port = netdev_priv(dev);
++
++	if (!port->phylink)
++		return -ENODEV;
++
++	return phylink_ethtool_ksettings_set(port->phylink, ksettings);
++}
++
++static const struct ethtool_ops intel_xrx500_ethtool_ops = {
++	.get_drvinfo        = intel_xrx500_ethtool_get_drvinfo,
++	.get_link           = ethtool_op_get_link,
++	.get_link_ksettings = intel_xrx500_ethtool_get_link_ksettings,
++	.set_link_ksettings = intel_xrx500_ethtool_set_link_ksettings,
++};
++
++/* Probe / Remove */
++
++/**
++ * intel_xrx500_port_destroy() - tear down a single per-port struct.
++ *
++ * @priv: owning struct intel_xrx500_priv.
++ *
++ * @i:    port slot index (0..3).
++ *
++ * Calls unregister_netdev only if the netdev has been registered
++ * (port->netdev->reg_state == NETREG_REGISTERED); phylink_disconnect_phy /
++ * phylink_destroy only if phylink is non-NULL.
++ */
++static void intel_xrx500_port_destroy(struct intel_xrx500_priv *priv, int i)
++{
++	struct intel_xrx500_port *port = priv->ports[i];
++
++	if (!port)
++		return;
++
++	if (port->netdev && port->netdev->reg_state == NETREG_REGISTERED)
++		unregister_netdev(port->netdev);
++
++	if (port->phylink) {
++		/* Callers run without the RTNL that phylink needs here. */
++		rtnl_lock();
++		phylink_disconnect_phy(port->phylink);
++		rtnl_unlock();
++		phylink_destroy(port->phylink);
++		port->phylink = NULL;
++	}
++
++	of_node_put(port->phy_node);
++	of_node_put(port->port_node);
++
++	if (port->netdev) {
++		free_netdev(port->netdev);
++		port->netdev = NULL;
++	}
++
++	priv->ports[i] = NULL;
++}
++
++/**
++ * intel_xrx500_port_setup() - allocate and configure a single per-port
++ * netdev.
++ *
++ * @priv:      owning private state.
++ *
++ * @port_node: DT child node carrying the port configuration.
++ *
++ * @port_idx:  port slot index (= reg = <N> from DT).
++ *
++ * Returns 0 on success or a negative errno (including -EPROBE_DEFER)
++ * on failure. On failure no per-slot artifacts are left dangling -
++ * the caller-side rollback walks slot indices 0..(i-1) only.
++ */
++static int intel_xrx500_port_setup(struct intel_xrx500_priv *priv,
++				   struct device_node *port_node,
++				   u32 port_idx)
++{
++	struct intel_xrx500_port *port;
++	struct net_device *netdev;
++	struct phylink *phylink;
++	u32 dp_port_id;
++	int ret;
++
++	ret = of_property_read_u32(port_node, "intel,dp-port-id", &dp_port_id);
++	if (ret) {
++		dev_err(priv->dev,
++			"intel-xrx500: port@%u missing intel,dp-port-id\n",
++			port_idx);
++		return ret;
++	}
++
++	/* Bounds-check dp_port_id. */
++	if (dp_port_id < 2 || dp_port_id > 5) {
++		dev_err(priv->dev,
++			"intel-xrx500: port@%u intel,dp-port-id=%u out of range [2..5]\n",
++			port_idx, dp_port_id);
++		return -EINVAL;
++	}
++
++	netdev = alloc_etherdev_mq(sizeof(*port), 1);
++	if (!netdev)
++		return -ENOMEM;
++
++	SET_NETDEV_DEV(netdev, priv->dev);
++
++	port = netdev_priv(netdev);
++	port->netdev          = netdev;
++	port->port_idx        = port_idx;
++	port->dp_port_id      = dp_port_id;
++	/*
++	 *   dp_port_id  cbm_deq_port == tmu_egress_port   tmu_queue
++	 *      5            10                              20     (eth0 = LAN1)
++	 *      4             9                              19     (eth1 = LAN2)
++	 *      3             8                              18     (eth2 = LAN3)
++	 *      2             7                              17     (eth3 = LAN4)
++	 *
++	 * Closed-form: cbm_deq_port = tmu_egress_port = dp_port_id + 5.
++	 */
++	port->cbm_deq_port    = dp_port_id + 5u;
++	port->tmu_egress_port = dp_port_id + 5u;
++	port->parent          = priv;
++	port->dp_alloc_flags  = DP_F_FAST_ETH_LAN;
++	port->dp_subif_id     = -1;
++	port->state_open      = false;
++	port->state_subif_registered = false;
++	spin_lock_init(&port->tx_lock);
++	port->tx_chan = 0;
++	port->tx_ring = NULL;
++	port->tx_ring_phys = 0;
++	port->tx_head = 0;
++	port->state_tx_initialized = false;
++
++	port->port_node = of_node_get(port_node);
++	port->phy_node  = of_parse_phandle(port_node, "phy-handle", 0);
++
++	u64_stats_init(&port->stats.syncp);
++
++	/*
++	 * The supported_interfaces bitmap MUST be populated BEFORE
++	 * phylink_create - otherwise phylink_create returns an error pointer.
++	 */
++	port->phylink_config.dev  = &netdev->dev;
++	port->phylink_config.type = PHYLINK_NETDEV;
++	/*
++	 * The xRX500 GPHY advertises Pause + Asym_Pause (ethtool linkmode
++	 * bits 7 + 9 == 0x280), but with no MAC_*_PAUSE caps
++	 * phylink_caps_to_linkmodes() never sets those bits in the MAC
++	 * support mask, so the support(0x6280) vs advert(0x280) intersection
++	 * failed and phylink_validate returned -EINVAL ("validation of
++	 * internal ... failed"), which in turn made phylink_of_phy_connect()
++	 * return -22. Advertising both pause directions makes
++	 * phylink_caps_to_linkmodes() set the Pause / Asym_Pause linkmode
++	 * bits so the intersection is non-empty and validation passes —
++	 * letting eth0 come up even before MDIO works.
++	 */
++	port->phylink_config.mac_capabilities =
++		MAC_SYM_PAUSE | MAC_ASYM_PAUSE |
++		MAC_1000FD | MAC_100FD | MAC_10FD;
++	__set_bit(PHY_INTERFACE_MODE_INTERNAL,
++		  port->phylink_config.supported_interfaces);
++
++	netdev->netdev_ops  = &intel_xrx500_netdev_ops;
++	netdev->ethtool_ops = &intel_xrx500_ethtool_ops;
++
++	netdev->min_mtu = ETH_MIN_MTU;
++	netdev->max_mtu = 9216;
++
++	phylink = phylink_create(&port->phylink_config,
++				 of_fwnode_handle(port_node),
++				 PHY_INTERFACE_MODE_INTERNAL,
++				 &intel_xrx500_phylink_ops);
++	if (IS_ERR(phylink)) {
++		ret = PTR_ERR(phylink);
++		dev_err(priv->dev,
++			"intel-xrx500: phylink_create(port@%u) failed: %d\n",
++			port_idx, ret);
++		of_node_put(port->phy_node);
++		of_node_put(port->port_node);
++		free_netdev(netdev);
++		return ret;
++	}
++	port->phylink = phylink;
++
++	ret = phylink_of_phy_connect(phylink, port_node, 0);
++	/*
++	 * phylink reports "the device tree names a PHY but no such device
++	 * exists" as -ENODEV, which no caller retries. The GPHY firmware
++	 * loader and the MDIO bus that create these PHYs can be a module, so
++	 * on a cold boot they legitimately arrive after this probe. Ask to be
++	 * retried instead; a PHY registering is what re-triggers it.
++	 */
++	if (ret == -ENODEV && port->phy_node)
++		ret = -EPROBE_DEFER;
++	if (ret) {
++		if (ret != -EPROBE_DEFER)
++			dev_err(priv->dev,
++				"intel-xrx500: phylink_of_phy_connect(port@%u) failed: %d\n",
++				port_idx, ret);
++		phylink_destroy(phylink);
++		port->phylink = NULL;
++		of_node_put(port->phy_node);
++		of_node_put(port->port_node);
++		free_netdev(netdev);
++		return ret;
++	}
++
++	/*
++	 * (1) Strip Pause/Asym_Pause from the GPHY advertisement. With the HW
++	 * poller now conveying resolved pause into the MAC, advertising pause
++	 * would diverge from the only proven configuration.
++	 *
++	 * (2) Disable EEE advertisement. AVM zeroes the EEE advert on exactly
++	 * this port (grx350_common.dtsi:19-21 &lan1 avm,eee-adv=<0x0>,
++	 * applied via phy_ethtool_set_eee at ltq_eth_drv_xrx500.c:1810-1816).
++	 */
++	if (netdev->phydev) {
++		phy_remove_link_mode(netdev->phydev,
++				     ETHTOOL_LINK_MODE_Pause_BIT);
++		phy_remove_link_mode(netdev->phydev,
++				     ETHTOOL_LINK_MODE_Asym_Pause_BIT);
++		phy_disable_eee(netdev->phydev);
++	}
++
++	/*
++	 * Set a sane MAC address before register_netdev so userspace sees a
++	 * non-zero hwaddr from the moment the netdev appears.
++	 */
++	eth_hw_addr_random(netdev);
++
++	ret = register_netdev(netdev);
++	if (ret) {
++		dev_err(priv->dev,
++			"intel-xrx500: register_netdev(port@%u) failed: %d\n",
++			port_idx, ret);
++		rtnl_lock();
++		phylink_disconnect_phy(phylink);
++		rtnl_unlock();
++		phylink_destroy(phylink);
++		port->phylink = NULL;
++		of_node_put(port->phy_node);
++		of_node_put(port->port_node);
++		free_netdev(netdev);
++		return ret;
++	}
++
++	/*
++	 * Diagnostic line on per-port success. The chassis-side LAN
++	 * label (LAN1..LAN4) reads naturally against dp_port_id 5..2.
++	 */
++	dev_info(priv->dev,
++		 "intel-xrx500: %s registered (port@%u dp_port_id=%u deq=%u tmu=%u)\n",
++		 netdev_name(netdev), port_idx, port->dp_port_id,
++		 port->cbm_deq_port, port->tmu_egress_port);
++
++	priv->ports[port_idx] = port;
++	return 0;
++}
++
++static int intel_xrx500_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct intel_xrx500_priv *priv;
++	struct device_node *port_node;
++	int ret = 0;
++	int i;
++	int registered = 0;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->pdev = pdev;
++	priv->dev  = dev;
++
++	/*
++	 * Recover the GSW-L per-instance ethsw_api_dev_t pointer via the
++	 * switch-api/ slot-table dispatcher.
++	 */
++	priv->gswl_dev = intel_xrx500_get_gswl_dev();
++	if (!priv->gswl_dev) {
++		dev_dbg(dev, "intel-xrx500: GSW-L not yet registered; deferring probe\n");
++		return -EPROBE_DEFER;
++	}
++
++	platform_set_drvdata(pdev, priv);
++
++	/* Iterate child port@N nodes and instantiate per-port netdevs. */
++	for_each_available_child_of_node(dev->of_node, port_node) {
++		u32 port_idx;
++
++		ret = of_property_read_u32(port_node, "reg", &port_idx);
++		if (ret) {
++			dev_err(dev, "intel-xrx500: child node %pOFn missing reg\n",
++				port_node);
++			of_node_put(port_node);
++			goto err_rollback;
++		}
++
++		if (port_idx >= INTEL_XRX500_NUM_PORTS) {
++			dev_err(dev, "intel-xrx500: port@%u out of range [0..%u]\n",
++				port_idx, INTEL_XRX500_NUM_PORTS - 1);
++			of_node_put(port_node);
++			ret = -EINVAL;
++			goto err_rollback;
++		}
++
++		if (priv->ports[port_idx]) {
++			dev_err(dev, "intel-xrx500: duplicate port@%u\n", port_idx);
++			of_node_put(port_node);
++			ret = -EINVAL;
++			goto err_rollback;
++		}
++
++		ret = intel_xrx500_port_setup(priv, port_node, port_idx);
++		if (ret) {
++			of_node_put(port_node);
++			goto err_rollback;
++		}
++		registered++;
++	}
++
++	if (registered != INTEL_XRX500_NUM_PORTS) {
++		dev_err(dev,
++			"intel-xrx500: expected %d port child nodes, found %d\n",
++			INTEL_XRX500_NUM_PORTS, registered);
++		ret = -EINVAL;
++		goto err_rollback;
++	}
++
++	pr_info("intel-xrx500: %d LAN netdevs registered (eth0..eth%d); PMAC<->CPU link up (internal, no netdev)\n",
++		INTEL_XRX500_NUM_PORTS, INTEL_XRX500_NUM_PORTS - 1);
++
++	return 0;
++
++err_rollback:
++	/*
++	 * Walk in reverse order to mirror the symmetric remove path.
++	 * Each slot may be either NULL (never set up) or fully wired -
++	 * intel_xrx500_port_destroy handles both cases.
++	 */
++	for (i = INTEL_XRX500_NUM_PORTS - 1; i >= 0; i--)
++		intel_xrx500_port_destroy(priv, i);
++
++	return ret;
++}
++
++static void intel_xrx500_remove(struct platform_device *pdev)
++{
++	struct intel_xrx500_priv *priv = platform_get_drvdata(pdev);
++	int i;
++
++	if (!priv)
++		return;
++
++	for (i = INTEL_XRX500_NUM_PORTS - 1; i >= 0; i--)
++		intel_xrx500_port_destroy(priv, i);
++}
++
++static const struct of_device_id intel_xrx500_of_match[] = {
++	{ .compatible = "intel,xrx500-net" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, intel_xrx500_of_match);
++
++static struct platform_driver intel_xrx500_driver = {
++	.probe  = intel_xrx500_probe,
++	.remove = intel_xrx500_remove,
++	.driver = {
++		.name = INTEL_XRX500_DRV_NAME,
++		.of_match_table = intel_xrx500_of_match,
++	},
++};
++
++/*
++ * Composite-module init: device_initcall() instead of module_init() so
++ * that this TU can coexist with gsw_init.c's module_platform_driver()
++ * macro inside the same intel-xrx500-gswip composite (see the matching
++ * commentary in switch-api/mdio_xrx500.c).
++ *
++ * Ordering: device_initcall fires after subsys_initcall and
++ * arch_initcall, so the lantiq pinmux / GSWIP HAL / MDIO bus driver
++ * have all completed their probe calls before this one binds.
++ * EPROBE_DEFER on gsw_get_swcore_ops(0) or on phylink_of_phy_connect
++ * is the safety net for any residual ordering surprises.
++ */
++static int __init intel_xrx500_init(void)
++{
++	pr_info("intel-xrx500: TX path: polled\n");
++	return platform_driver_register(&intel_xrx500_driver);
++}
++device_initcall(intel_xrx500_init);
++
++MODULE_ALIAS("platform:intel-xrx500-net");

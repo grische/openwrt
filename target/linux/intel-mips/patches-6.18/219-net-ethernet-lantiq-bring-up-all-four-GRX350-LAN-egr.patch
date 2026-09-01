@@ -1,0 +1,371 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 09:21:50 +0000
+Subject: net: ethernet: lantiq: bring up all four GRX350 LAN egress ports
+
+eth0..eth3 all register at probe, but only eth0 could ever be brought
+up: "ip link set eth1 up" fails -EINVAL in ndo_open step 1. Everything
+below the netdev was single-port, and three separate places had to learn
+about the other three.
+
+hdma_port_enable() knew CBM dequeue ports 7 and 10 only, so eth1 (deq 9)
+and eth2 (deq 8) fell straight into its -EINVAL arm. Add
+port8_channels/port9_channels for DMA2TX channels 3 and 4, and factor
+the enable/disable dispatch into one hdma_port_chan_tbl() lookup so the
+two can never disagree about which channels belong to a port again: they
+did once, disable knowing only port 7, which leaked eth0's channel 5
+across an ndo_stop/ndo_open cycle.
+
+eth3 (deq 7) matched, but onto the wrong table. The port-7 entry carried
+.cbm_deq = 0, left from when port 7 was a bring-up test channel rather
+than eth3's egress, and .cbm_deq is a mode selector, not decoration:
+zero routes the channel into the legacy software-ring path, which
+allocates a DRAM descriptor ring the CBM never writes to and which the
+DMA therefore reads while the CBM dequeue engine writes elsewhere. All
+four of these ports are CBM-managed -- their descriptors live in the CBM
+DQM window at 0x1e540000 + (deq - 5) * 0x1000 -- so all four entries
+must set .cbm_deq non-zero. Set the port-7 entry to 7, and say so in the
+table's comment.
+
+The DQM descriptor-window formula is established for deq 7 and deq 10,
+so 8 and 9 interpolate between two known points rather than
+extrapolating past them.
+
+The scalar g_hdma_port10_armed latch becomes a bitmap over deq 7..10.
+Its semantics are unchanged -- arm once, keep armed for the device
+lifetime, because closing and reopening a CBM-managed channel leaves the
+DQM-to-DMA2TX handshake stale -- and now apply per port.
+hdma_port_disable() still refuses to tear down an armed channel, but an
+in-range port that is not armed now falls through to the teardown: that
+is the ndo_open rollback path for an enable that failed partway, where
+releasing what was acquired is correct.
+
+cbm_dp_port_alloc()'s dma_chan switch resolved only dp 5 and dp 4 and
+sent dp 2 and dp 3 to a DMA_CHANNEL_0 placeholder. Replace the whole
+switch with the closed form: dp N -> DMA2TX channel N, because dequeue
+port N+5 is served by DMA2TX channel (deq - 5) == N. The placeholder's
+comment was doubly stale -- it cited a superseded "+2" map and claimed
+hdma_port_enable() rejects any port_id != 7, which had not been true
+since port 10 was armed.
+
+Third, the probe-time egress preconfiguration ran for dp5 only. dp 2/3/4
+had no probe-time DQM/TMU egress path, so they fell through to the
+cbm_dp_enable() path at ndo_open, i.e. after cbm_enable_controllers() --
+the configure-after-enable inversion that was already fixed for dp5,
+where a DQM enabled before its EPMAP binding rebuilds the egress
+descriptor from a stale PPT body length and reports data_len = 0. Loop
+the preconfiguration over dp 2..5, deriving deq = dp + 5, qid = dp + 15
+and sbid = qid - SBID_START, and loop the probe-tail hdma_port_enable()
+over deq 7..10 as well. This is what the vendor driver does: its
+configure_ports() walks all 17 compiled-in rows at probe, so every DMA
+egress port is bound before the controllers come up. The loop stays
+where the single-port version was, before cbm_enable_controllers(); that
+ordering is load-bearing and the code now says so.
+
+Finally, make the GSW-L whole-core re-init a one-shot at its own entry
+point. gsw_hw_reinit_gswl() pulses ETHSW_SWRES, which takes every port
+of the instance down, reloads the PCE microcode and wipes the switch TOP
+block including the MDIO master. That is acceptable exactly once, while
+at most one port is passing traffic; it is not acceptable once per
+netdev, where a later port's ndo_open would drop the links of ports
+already forwarding. Its single caller is structurally one-shot already
+-- one delayed work scheduled from the MDIO driver's probe -- but that
+is a property of the caller, not of the function. The latch makes it a
+property of the function, so a future caller cannot turn a deliberate
+one-shot into a per-port switch reset.
+
+No new CBM, DQM, EQM or TMU resource is allocated by any of this. All 17
+DQM DMA egress ports, their DMA TX channels and their TMU triplets are
+statically pre-provisioned and disjoint per port; the four LAN ports
+differ only in which of them each call names. Nothing else needed
+touching: the GSWIP-L per-port FDMA/SDMA/BM enables, the MDIO auto-poll
+mask (0x003C = ports 2..5), MAC_FLEN, the PMAC ingress/egress tables
+(indexed by TX DMA channel, so channels 2..5 map to ports 2..5 for
+free), the GPHY firmware loader and phylink are all four-port already.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+index 10d5b389399a..921902455b53 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+@@ -634,21 +634,37 @@ static int cbm_xrx500_probe(struct platform_device *pdev)
+ 
+ 	cbm_rx_engine_init();
+ 
+-	init_cbm_dqm_dma_port(10);
+-	tmu_create_flat_egress_path(1, 10, 4, 20, 1);
+-	g_cbm_egress_preconfig[5] = true;
+-	pr_info("cbm: dp5 egress preconfigured at probe (deq10/q20/sbid4) before controller enable\n");
++	{
++		int dp;
++
++		for (dp = 2; dp <= 5; dp++) {
++			u16 deq = (u16)(dp + 5);
++			u16 qid = (u16)(dp + 15);
++			u16 sbid = (u16)(qid - SBID_START);
++
++			init_cbm_dqm_dma_port((int)deq);
++			tmu_create_flat_egress_path(1, deq, sbid, qid, 1);
++			g_cbm_egress_preconfig[dp] = true;
++			pr_info("cbm: dp%d egress preconfigured at probe (deq%u/q%u/sbid%u) before controller enable\n",
++				dp, deq, qid, sbid);
++		}
++	}
+ 
+ 	cbm_enable_controllers();
+ 
+ 	{
+-		int hret = hdma_port_enable(10);
++		int deq;
+ 
+-		if (hret)
+-			dev_warn(dev, "cbm: probe-time hdma_port_enable(10) = %d (ndo_open will retry)\n",
+-				 hret);
+-		else
+-			pr_info("cbm: DMA2TX ch5 opened at probe-end (AVM order)\n");
++		for (deq = 7; deq <= 10; deq++) {
++			int hret = hdma_port_enable(deq);
++
++			if (hret)
++				dev_warn(dev, "cbm: probe-time hdma_port_enable(%d) = %d (ndo_open will retry)\n",
++					 deq, hret);
++			else
++				pr_info("cbm: DMA2TX ch%d opened at probe-end for deq %d (AVM order)\n",
++					deq - 5, deq);
++		}
+ 	}
+ 
+ 	cbm_eqm_rx_chan_open(DMA2RX_CBMP5_CLASS14, 5, CBM_PORT_F_STANDARD_BUF);
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
+index 6084e8da3d2a..2c41ac2ff6e1 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
+@@ -232,18 +232,21 @@ int cbm_dp_port_alloc(struct module *owner, struct net_device *dev,
+ 		return -EINVAL;
+ 	}
+ 
+-	switch (port_id) {
+-	case 5:
+-		dma_chan = DMA2TX_CBM_P10_CLASS5;
+-		break;
+-	case 4:
+-		/* eth1 / LAN2, deq 9 (channel = deq - 5). */
+-		dma_chan = DMA2TX_CBM_P9_CLASS4;
+-		break;
+-	default:
+-		dma_chan = _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_0);
+-		break;
+-	}
++	/*
++	 * DMA2TX channel N, because CBM dequeue port N+5 is served by DMA2TX
++	 * channel (deq - 5) == N and DMA_CHANNEL_N == N. So
++	 *
++	 *   dp 5 (eth0/LAN1) -> deq 10 -> DMA2TX_CBM_P10_CLASS5 -> PMAC p5 -> GPHY5
++	 *   dp 4 (eth1/LAN2) -> deq  9 -> DMA2TX_CBM_P9_CLASS4  -> PMAC p4 -> GPHY4
++	 *   dp 3 (eth2/LAN3) -> deq  8 -> DMA2TX_CBM_P8_CLASS3  -> PMAC p3 -> GPHY3
++	 *   dp 2 (eth3/LAN4) -> deq  7 -> DMA2TX_CBM_P7_CLASS2  -> PMAC p2 -> GPHY2
++	 *
++	 * matching AVM epg_lookup_table (dp5 -> CBM_P10,
++	 * cqm/grx500/cbm.c:568) and DT DQ7..DQ10. This replaces a switch that
++	 * resolved only dp 5 and dp 4 and sent dp 2 / dp 3 to a DMA_CHANNEL_0
++	 * placeholder.
++	 */
++	dma_chan = _DMA_C(DMA2TX, DMA2TX_PORT, (u32)port_id);
+ 
+ 	data->dp_port = (u32)port_id;
+ 	data->deq_port = (u32)port_id + 5;
+diff --git a/drivers/net/ethernet/lantiq/dma/hdma.c b/drivers/net/ethernet/lantiq/dma/hdma.c
+index 96782db221ec..dc9d104e8ef4 100644
+--- a/drivers/net/ethernet/lantiq/dma/hdma.c
++++ b/drivers/net/ethernet/lantiq/dma/hdma.c
+@@ -1945,7 +1945,17 @@ struct port7_chan_desc {
+ 
+ static const struct port7_chan_desc port7_channels[] = {
+ 	{ .cid = DMA2TX, .pid = DMA2TX_PORT, .nid = DMA_CHANNEL_2,
+-	  .label = "DMA2TX_CBM_P7_CLASS2", .cbm_deq = 0 },
++	  .label = "DMA2TX_CBM_P7_CLASS2", .cbm_deq = 7 },
++};
++
++static const struct port7_chan_desc port8_channels[] = {
++	{ .cid = DMA2TX, .pid = DMA2TX_PORT, .nid = DMA_CHANNEL_3,
++	  .label = "DMA2TX_CBM_P8_CLASS3", .cbm_deq = 8 },
++};
++
++static const struct port7_chan_desc port9_channels[] = {
++	{ .cid = DMA2TX, .pid = DMA2TX_PORT, .nid = DMA_CHANNEL_4,
++	  .label = "DMA2TX_CBM_P9_CLASS4", .cbm_deq = 9 },
+ };
+ 
+ static const struct port7_chan_desc port10_channels[] = {
+@@ -1953,6 +1963,34 @@ static const struct port7_chan_desc port10_channels[] = {
+ 	  .label = "DMA2TX_CBM_P10_CLASS5", .cbm_deq = 10 },
+ };
+ 
++/*
++ * hdma_port_chan_tbl — the per-CBM-dequeue-port channel table, or NULL for a
++ * dequeue port this driver does not serve. Shared by hdma_port_enable and
++ * hdma_port_disable so the two can never disagree about which channels belong
++ * to a port (they did once: disable knew only port 7, so eth0's channel 5
++ * leaked across a netifd ndo_stop -> ndo_open cycle and the re-open failed
++ * -EBUSY).
++ */
++static const struct port7_chan_desc *hdma_port_chan_tbl(int port_id, size_t *n)
++{
++	switch (port_id) {
++	case 7:
++		*n = ARRAY_SIZE(port7_channels);
++		return port7_channels;
++	case 8:
++		*n = ARRAY_SIZE(port8_channels);
++		return port8_channels;
++	case 9:
++		*n = ARRAY_SIZE(port9_channels);
++		return port9_channels;
++	case 10:
++		*n = ARRAY_SIZE(port10_channels);
++		return port10_channels;
++	default:
++		return NULL;
++	}
++}
++
+ /*
+  * The CBM DQM descriptor window is laid out per dequeue port and is
+  * controller-independent (the vendor computes it in setup_DMA_channel, two
+@@ -1967,16 +2005,34 @@ static const struct port7_chan_desc port10_channels[] = {
+ 		      ((u32)((deq) - 5) * 0x1000U)))
+ 
+ /*
+- * Opens the DMA channel(s) listed in port7_channels[] above.
+- *
+- * The desc_alloc + desc_cfg pair installs a HDMA_PORT_DESC_NUM placeholder
+- * ring so ltq_dma_chan_open's pch->desc_configured WARN_ON guard is
+- * satisfied. Narrow scope per task title 'CBM EQM port 7 admit'; no
+- * hdma_port_disable wrapper is added.
++ * Opens the DMA channel(s) the CBM dequeue port @port_id owns, per
++ * hdma_port_chan_tbl().
+  */
+ #define HDMA_PORT_DESC_NUM 32
+ 
+-static bool g_hdma_port10_armed;
++/*
++ * Once a CBM-managed DMA2TX egress channel is armed, keep it armed: the CBM
++ * dequeue port owns the descriptor window, and tearing the channel down
++ * leaves the port pointing at descriptors nothing will refill.
++ */
++#define HDMA_CBM_DEQ_FIRST 7
++#define HDMA_CBM_DEQ_LAST  10
++
++static u32 g_hdma_deq_armed;
++
++static bool hdma_deq_armed(int port_id)
++{
++	if (port_id < HDMA_CBM_DEQ_FIRST || port_id > HDMA_CBM_DEQ_LAST)
++		return false;
++	return !!(g_hdma_deq_armed & BIT(port_id - HDMA_CBM_DEQ_FIRST));
++}
++
++static void hdma_deq_set_armed(int port_id)
++{
++	if (port_id < HDMA_CBM_DEQ_FIRST || port_id > HDMA_CBM_DEQ_LAST)
++		return;
++	g_hdma_deq_armed |= BIT(port_id - HDMA_CBM_DEQ_FIRST);
++}
+ 
+ extern int init_cbm_dqm_dma_port(int dqp);
+ 
+@@ -2247,18 +2303,12 @@ int hdma_port_enable(int port_id)
+ 	u32 chan;
+ 	struct dmax_chan *pch;
+ 
+-	if (port_id == 10 && g_hdma_port10_armed)
++	if (hdma_deq_armed(port_id))
+ 		return 0;
+ 
+-	if (port_id == 7) {
+-		tbl = port7_channels;
+-		n = ARRAY_SIZE(port7_channels);
+-	} else if (port_id == 10) {
+-		tbl = port10_channels;
+-		n = ARRAY_SIZE(port10_channels);
+-	} else {
++	tbl = hdma_port_chan_tbl(port_id, &n);
++	if (!tbl)
+ 		return -EINVAL;
+-	}
+ 
+ 	for (i = 0; i < n; i++) {
+ 		const struct port7_chan_desc *e = &tbl[i];
+@@ -2326,8 +2376,7 @@ int hdma_port_enable(int port_id)
+ 			port_id, e->label, e->cid, e->pid, e->nid);
+ 	}
+ 
+-	if (port_id == 10)
+-		g_hdma_port10_armed = true;
++	hdma_deq_set_armed(port_id);
+ 	return 0;
+ }
+ 
+@@ -2344,8 +2393,8 @@ int hdma_port_enable(int port_id)
+  *        ltq_dma_chan_desc_free's body)
+  *   (3) ltq_free_dma         reverses ltq_request_dma
+  *
+- * Per-port channel source-of-truth: port7_channels[] (the same static const
+- * lookup table hdma_port_enable iterates).
++ * Per-port channel source-of-truth: hdma_port_chan_tbl() (the same lookup
++ * hdma_port_enable uses).
+  *
+  * Failure handling: a single failing step records the error code into
+  * `partial` and the loop continues.
+@@ -2361,18 +2410,17 @@ int hdma_port_disable(int port_id)
+ 	int first_err = 0;
+ 	u32 chan;
+ 
+-	if (port_id == 10)
++	/*
++	 * Never tear down a CBM-managed DMA2TX egress channel from the netdev
++	 * path: the descriptors belong to the CBM dequeue port, not to this
++	 * driver.
++	 */
++	if (hdma_deq_armed(port_id))
+ 		return 0;
+ 
+-	if (port_id == 7) {
+-		tbl = port7_channels;
+-		n = ARRAY_SIZE(port7_channels);
+-	} else if (port_id == 10) {
+-		tbl = port10_channels;
+-		n = ARRAY_SIZE(port10_channels);
+-	} else {
++	tbl = hdma_port_chan_tbl(port_id, &n);
++	if (!tbl)
+ 		return -EINVAL;
+-	}
+ 
+ 	for (i = 0; i < n; i++) {
+ 		const struct port7_chan_desc *e = &tbl[i];
+diff --git a/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c
+index fef6b8e0564e..c94f6ec96d84 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c
++++ b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c
+@@ -983,11 +983,18 @@ int gsw_hw_reinit(void *cdev)
+ 
+ int gsw_hw_reinit_gswl(void)
+ {
++	static bool done;
+ 	struct core_ops *ops = gsw_get_swcore_ops(0);
+ 
+ 	if (!ops)
+ 		return -ENODEV;
+ 
++	if (done) {
++		pr_info("gsw: GSW-L full re-init already done; skipping (whole-core SWRES must not re-run under live links)\n");
++		return -EALREADY;
++	}
++	done = true;
++
+ 	return gsw_hw_reinit(GSW_PDATA_GET(ops));
+ }
+ EXPORT_SYMBOL_GPL(gsw_hw_reinit_gswl);

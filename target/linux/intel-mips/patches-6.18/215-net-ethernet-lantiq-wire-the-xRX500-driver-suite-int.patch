@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:27:55 +0000
+Subject: net: ethernet: lantiq: wire the xRX500 driver suite into the build
+
+Hook drivers/net/ethernet/lantiq/ into the ethernet Makefile. The
+Kconfig entries have been in place since the suite skeleton landed;
+this final one-line hook is deliberately last so that every patch
+of the series builds: the suite is one composite module with
+mutual dependencies between its subsystems (switch-api and the
+datapath call each other, as do the CBM and the DMA driver), so
+the object list is only link-complete now.
+
+From this point CONFIG_INTEL_XRX500_NET=y +
+CONFIG_INTEL_XRX500_GSWIP_API builds intel-xrx500-gswip with the
+full TX and RX datapaths verified on FRITZ!Box 7560 hardware
+(sustained ping and broadcast-flood zero-loss).
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/Makefile b/drivers/net/ethernet/Makefile
+index 998dd628b202..7432200bd12e 100644
+--- a/drivers/net/ethernet/Makefile
++++ b/drivers/net/ethernet/Makefile
+@@ -56,6 +56,7 @@ obj-$(CONFIG_JME) += jme.o
+ obj-$(CONFIG_KORINA) += korina.o
+ obj-$(CONFIG_LANTIQ_ETOP) += lantiq_etop.o
+ obj-$(CONFIG_LANTIQ_XRX200) += lantiq_xrx200.o
++obj-$(CONFIG_INTEL_XRX500_NET) += lantiq/
+ obj-$(CONFIG_NET_VENDOR_LITEX) += litex/
+ obj-$(CONFIG_NET_VENDOR_MARVELL) += marvell/
+ obj-$(CONFIG_NET_VENDOR_MEDIATEK) += mediatek/

@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 27 Aug 2026 12:37:13 +0200
+Subject: net: lantiq: datapath: clear the subif's netif on deregister
+
+dp_deregister_subif_private() resets the subif slot it is releasing --
+it zeroes the mib and the flags -- but leaves subif_info[i].netif
+pointing at the net_device that has just been deregistered. AVM's 08.25
+GPL release adds "sif->netif = NULL;" beside the flags reset
+(datapath_api.c:905 in Linux 4.9.337); 07.30, which we were transcribed
+from, does not. Take it.
+
+This is hygiene, not a use-after-free, and the difference matters enough
+to spell out. Nothing in this tree dereferences that pointer. The only
+reads of subif_info[].netif anywhere are the comparison at :961 that
+guards this very function ("if (port_info->subif_info[i].netif != dev)")
+and the %p in the dev_err beside it -- both upstream of the reset block,
+both in the same call. Neither of the two scans over subif_info[] keys
+on netif: :745 keys on flags, :940 on subif. We have no
+dp_get_port_subitf_via_dev and no dp_lan_wan_bridging, which is where
+AVM's framework does look a netdev up this way. RX resolves its delivery
+netdev through a different table entirely, g_cbm_rx_netdev[]
+(cqm/grx500/cbm_intr.c:286) via cbm_rx_resolve_netdev() -- and that one
+is already cleared on the way down, in intel_xrx500's ndo_stop.
+
+What the assignment buys is that a second deregister of the same slot now
+fails the :961 device-match guard instead of passing it, so a
+double-deregister is caught rather than silently repeating the teardown. It
+costs one store on a path that already does a memset.
+
+The comment over the block claimed the reset covered "mib / flags /
+device_name". device_name was never cleared here, and AVM does not clear
+it either; it is written once at :801 and no code in the tree reads it
+back. So the comment now names what is actually reset and says why
+device_name is left alone, rather than describing a store that does not
+exist.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_api.c b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+index 637a79496c22..562261a33b9a 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_api.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+@@ -757,10 +757,10 @@ static int dp_deregister_subif_private(int inst, struct module *owner,
+ 	cqm_port = port_info->subif_info[i].cqm_deq_port;
+ 	bp = port_info->subif_info[i].bp;
+ 
+-	/* (4) AVM:720-724 — reset per-subif mib / flags / device_name. */
+ 	memset(&port_info->subif_info[i].mib, 0,
+ 	       sizeof(port_info->subif_info[i].mib));
+ 	port_info->subif_info[i].flags = 0;
++	port_info->subif_info[i].netif = NULL;
+ 	port_info->num_subif--;
+ 
+ 	/* (5) AVM:725-730 — subif_platform_set unprograms CTP / BridgePort

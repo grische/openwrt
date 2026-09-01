@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 07:17:19 +0200
+Subject: MIPS: dts: intel-mips: drop the stale fifth-GPHY warnings
+
+Two comments in this board file still warn that the fifth GPHY's
+firmware entry is missing and that the board therefore has no ethernet
+at all: the file header, and the ordering note on the WAN port. Both
+stopped being true when the fifth entry was added, and &gphy_fw has
+carried all five since.
+
+The header now says what is actually the case -- the WAN PHY answers
+MDIO and its port instantiates alongside the four LAN ones -- and what
+is genuinely still owed, which is traffic rather than description. Link
+coming up is not the same claim as forwarding, and the port-to-port
+traffic matrix has not been exercised yet.
+
+The ordering note keeps the part of itself that is worth keeping. The
+dependency it describes is real and merely satisfied: remove an entry
+from that list and the WAN PHY stops answering MDIO, no phy_device is
+created, phylink_of_phy_connect returns -ENODEV, and because probe
+requires every declared port to come up, that one failure takes the four
+working LAN netdevs with it. Worth knowing before trimming the list;
+just not worth phrasing as something outstanding. It also pointed at
+&gphy_fw as being below it, which it is not.
+
+Comments only. The built DTB is byte-for-byte identical.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index 5ac493ec88c0..810e9b6462a3 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -284,14 +284,10 @@ gphy_wan: ethernet-phy@1 {
+  * scheduler block 12, DMA1TX channel 15. Note the controller: every LAN port
+  * egresses via DMA2TX, this one does not.
+  *
+- * ⚠ ORDERING: this port cannot come up until the fifth GPHY is added to
+- * &gphy_fw below. Without its firmware the WAN PHY does not answer MDIO, no
+- * phy_device is created for gphy_wan, and phylink_of_phy_connect returns
+- * -ENODEV -- which is NOT deferred and NOT confined to this port. Probe
+- * requires every declared port to come up, so the failure rolls back the four
+- * working LAN netdevs with it and the board ends up with no ethernet at all.
+- * Adding the fifth GPHY is three appended entries; see the comment on
+- * &gphy_fw.
++ * This port depends on the fifth GPHY's firmware entry, which &gphy_fw above
++ * carries along with the other four. Probe requires every declared port to
++ * come up, so that one failure would roll the four working LAN netdevs back
++ * with it and leave the board with no ethernet at all.
+  */
+ &intel_xrx500_net {
+ 	port@4 {

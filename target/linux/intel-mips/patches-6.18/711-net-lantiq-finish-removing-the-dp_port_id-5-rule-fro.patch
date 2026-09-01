@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 08:57:04 +0200
+Subject: net: lantiq: finish removing the dp_port_id + 5 rule from the docs
+
+The series replaced the +5 / +15 closed forms with a resolver over the
+ported vendor tables, and corrected the comments that stated the old
+rule - but only in intel_xrx500.c. The kerneldoc for the two fields the
+rule is actually about still asserted it:
+
+  @cbm_deq_port:    cbm_deq_port = dp_port_id + 5
+  @tmu_egress_port: tmu_egress_port == cbm_deq_port = dp_port_id + 5
+
+Both are false for the WAN port, which is dp-port 15 on dequeue port 19,
+and the header is the more likely place for someone to look the rule up.
+Say instead that the number is resolved, note that the arithmetic held
+for the four LAN ports and does not generalise, and give the WAN value.
+
+@port_idx was stale in the same way: 0..3 became 0..4 when the fifth
+port landed.
+
+Comments only.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/include/intel_xrx500.h b/drivers/net/ethernet/lantiq/include/intel_xrx500.h
+index 51a8ef3084fe..a4dd49bdfdf2 100644
+--- a/drivers/net/ethernet/lantiq/include/intel_xrx500.h
++++ b/drivers/net/ethernet/lantiq/include/intel_xrx500.h
+@@ -97,14 +97,19 @@ struct intel_xrx500_port_stats {
+  * @phylink:          phylink instance returned by phylink_create.
+  *                    NULL between alloc_etherdev_mq and phylink_create.
+  *
+- * @port_idx:         per-port index 0..3 - matches the DT child node
++ * @port_idx:         per-port index 0..4 - matches the DT child node
+  *                    reg = <N> property. Used as the array index back
+  *                    into priv->ports[] from phylink callbacks.
+  *
+- * Identical to the GSWIP silicon port-number for these four LAN ports -
++ * Identical to the GSWIP silicon port-number for the four LAN ports -
+  * directly indexes into MAC_CTRL_0[port] et seq.
+  *
+- * Used when wiring the TMU port-enable sequence.
++ * @cbm_deq_port: the CBM dequeue-port number for this port: eth0=10, eth1=9,
++ * eth2=8, eth3=7, WAN=19. Resolved from the ported vendor tables by
++ * cbm_dp_deq_port_get(), not computed.
++ *
++ * @tmu_egress_port: the TMU egress-port number for this port. Used when
++ * wiring the TMU port-enable sequence.
+  *
+  * @phy_node:         the DT node carrying the phy-handle (= one of
+  *                    &gphy_lan1..&gphy_lan4); used by

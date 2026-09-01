@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 15 Aug 2026 08:42:29 +0200
+Subject: net: lantiq: cbm: drop the blind RCU watchdog-reset write
+
+cbm_hw_init() reproduces three register values from the vendor system's
+boot state before touching the datapath. Two of them, the NGI endian mask
+and the interface mux, belong there: they are sampled at block reset and
+have to be in place before anything in this driver resets anything.
+
+The third does not. RCU_IAP_WDT_RST_EN gates the GIC per-VP watchdog's
+reset request; it was written here only because the vendor system has it
+set and this driver was the earliest place to reproduce that. It has no
+bearing on the ethernet datapath, and now that intel_grx500_wdt owns the
+watchdog it owns this register too. Two uncoordinated writers to one word
+is how the chiptop endian mask went wrong for two phases.
+
+Nothing else observes the register, so the only configuration this
+changes is CONFIG_INTEL_GRX500_WDT=n, where nobody writes it -- and there
+is no watchdog to arm.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+index 921902455b53..c50dcc55d514 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+@@ -275,12 +275,13 @@ int cbm_hw_init(struct platform_device *pdev)
+ 	int ret;
+ 
+ 	/*
+-	 * Endian straps are sampled at block reset, so the value must be held
+-	 * across the whole datapath bring-up.
++	 * The datapath initiators must be strapped big-endian before any CBM
++	 * or GSW reset: the straps are sampled at block reset, so the value
++	 * has to be held across bring-up. SPI_DEBUG_EN (IFMUX_CFG bit 18) is
++	 * cleared as the vendor's own chiptop setup does.
+ 	 */
+ 	{
+ 		void __iomem *ct = ioremap(0x16080000, 0x200);
+-		void __iomem *rcu = ioremap(0x16000000, 0x100);
+ 
+ 		if (ct) {
+ 			u32 pre;
+@@ -290,11 +291,7 @@ int cbm_hw_init(struct platform_device *pdev)
+ 			__raw_writel(pre & ~(BIT(22) | BIT(18)), ct + 0x120);
+ 			iounmap(ct);
+ 		}
+-		if (rcu) {
+-			__raw_writel(0x0000000F, rcu + 0x50);
+-			iounmap(rcu);
+-		}
+-		pr_info("cbm: chiptop/RCU parity applied (ipt_endian, ifmux, wdt_rst_en)\n");
++		pr_info("cbm: chiptop parity applied (ipt_endian, ifmux)\n");
+ 	}
+ 
+ 	(void)pdev;

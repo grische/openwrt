@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 08:39:47 +0200
+Subject: net: lantiq: xrx500_phy_fw: correct the stale reset-framework
+ comments
+
+Two comments still describe an earlier arrangement in which the GPHY
+firmware loader drove the reset-controller framework. It has not done
+that for a long time: xrx500_gphy_boot() discards the reset_control
+handle and does a read-modify-write on RCU_RST_REQ instead, taking the
+bit from xrx500_gphy[].rd.
+
+So the table's .rd field is not "documentary, unused on v6.18" - it is
+the only thing that selects which reset bit is toggled. Saying otherwise
+invites exactly the cleanup that would break the fifth GPHY: moving back
+onto reset_control_assert/deassert makes lantiq_rcu_reset_update() poll
+RST_STAT bit 31, which is also the watchdog reset cause, and a stale bit
+there costs a 0.2-0.4 s spin and an -ETIMEDOUT.
+
+The xrx500.dtsi note on #reset-cells is right about the provider and
+misleading about this consumer; qualify it and say which path the status
+cell is inert on. Its line-number citation into xrx500_phy_fw.c had also
+drifted by several lines, so reference the identifiers instead.
+
+Comments only. All three DTBs are byte-identical to the previous commit.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+index 7d7561f71355..dbf7ad6680ce 100644
+--- a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
++++ b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+@@ -75,16 +75,9 @@
+ #define XRX500_GPHY_SILICON_ID_5 0x05
+ #define XRX500_GPHY_SILICON_ID_F 0x0F
+ 
+-/*
+- * Per-GPHY base-address-register pair. AVM 4.9 xrx500_phy_fw.c:35-44.
+- *
+- * The .rd field (RCU mask bit) is preserved verbatim from the AVM
+- * source for documentation/auditing purposes; it is not consumed by
+- * the v6.18 port because reset_control_assert/deassert now drive the
+- * reset-controller framework rather than a direct RCU register write.
+- */
++/* Per-GPHY base-address-register pair. AVM 4.9 xrx500_phy_fw.c:35-44. */
+ struct ltq_xrx500_gphy_reset {
+-	u32 rd;		/* RCU mask bit (documentary, unused on v6.18) */
++	u32 rd;		/* RCU mask bit, written to RCU_RST_REQ */
+ 	u32 addr;	/* LBADR byte offset within the GSW-L sub-aperture */
+ };
+ 

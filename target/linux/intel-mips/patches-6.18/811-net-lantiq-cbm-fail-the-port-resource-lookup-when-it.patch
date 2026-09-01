@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 27 Aug 2026 12:36:26 +0200
+Subject: net: lantiq: cbm: fail the port-resource lookup when its allocation
+ fails
+
+dp_port_resources_get() hands the caller back two things:
+*num_tmu_ports, and a kmalloc'd cbm_tmu_res_t array through *res_pp. It
+writes the count first, then allocates. If the allocation fails it logs
+"error in allocating memory" and falls out of the if/else chain into the
+trailing "return 0" -- so the caller is told the lookup succeeded, reads
+a count it can believe, and dereferences a *res_pp the function never
+wrote. The caller's pointer is whatever it was before the call.
+
+That is the shape we transcribed, because it is what AVM's 07.30 GPL
+release does (cbm.c:767-768 in Linux 4.9.198). AVM's 08.25 GPL release
+adds the return (cbm.c:791 in Linux 4.9.337), and it is plainly right:
+every other exit from this function that cannot produce a result already
+says -1, at the *num_tmu_ports bounds check, at the
+accel/directpath/checksum arm, at the static-pmac gate and at the
+unallocated-pmac tail. The OOM arm was the one that did not.
+
+08.25 adds a second return -1 in the static-pmac LAN/WAN branch, on the
+kmalloc there. That branch does not exist here -- it is gated off until
+conf_dqm_dma_port is ported -- so there is nothing to take.
+
+Nothing in tree calls cbm_dp_port_resources_get() today; the wrapper is
+exported for the consumers that arrive with the rest of the datapath. Which
+is the argument for fixing it now rather than after one of them exists.
+
+The provenance comments on the function and at the top of the file said
+the body was AVM 07.30 verbatim apart from that gate. That is no longer
+true, so both now name this as the second deviation and say which
+release it comes from.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
+index 797a8462b0a0..bb3a995c18ba 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
+@@ -566,6 +566,7 @@ s32 dp_port_resources_get(
+ 			}
+ 		} else {
+ 			pr_err("cbm: %s error in allocating memory", __func__);
++			return -1;
+ 		}
+ 	} else if ((!local_entry) &&
+ 		   ((flags & DP_F_MPE_ACCEL) ||

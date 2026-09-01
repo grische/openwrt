@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 03:14:55 +0200
+Subject: net: lantiq: tighten the WAN port plumbing after review
+
+Three defects found reviewing the dp-port-15 series, all in code it added.
+
+The egress resolver admitted more datapath ports than the driver can
+serve. Transcribing every Ethernet DQM-DMA row of the vendor's
+cbm_config.c meant dp 1 and dp 6 resolved to dequeue ports 6 and 11 -
+real GSWIP-L ports, but ones no board here wires and for which
+hdma_port_chan_tbl() has no channel. Since that table is also the
+admissibility test now, it silently widened three gates: a DT could
+declare intel,dp-port-id = <1> and get a netdev that fails at ifup, and
+the CBM probe would program DQM and TMU egress state for a port the board
+does not have. Trim it to the rows served end to end, and say in the
+comment which vendor rows are deliberately absent and why. The high-prio
+twin rows (deq 12..17) go too - first-match keeps the primaries, so they
+were unreachable data. The admissible set is now exactly {2,3,4,5,15}.
+
+The lantiq,wan cross-check was one-directional. It rejected lantiq,wan on
+a port other than 15 but accepted dp port 15 without lantiq,wan, which is
+the quieter half of the same mistake: the port comes up, takes the LAN
+PMAC template, and egresses with redirect = 0 - precisely the silent
+class/template disagreement the check exists to catch. The two are
+equivalent, so check the equivalence.
+
+phy_register_fixup_for_uid was called once per bus. phylib's fixup list
+is global and matches on PHY uid, so one registration already covers
+every bus including the WAN PHY; a second makes the whole fixup run twice
+per attach, and it starts with genphy_soft_reset() - the second pass would
+reset the PHY again after the first had configured it, leaving correctness
+resting on the two passes staying idempotent. Register once.
+
+Also corrected four comments the series had left contradicting the code:
+the 7590 DTS header still said the WAN half was absent, intel_xrx500.c's
+header still gave dp_port_id + 5 as the rule, the dp_alloc_flags kerneldoc
+still said LAN-always, and a new comment cited datapath_mib.c as if it
+were in this tree rather than the vendor's.
+
+Re-ran the extract-and-compile LAN-invariance proof against the trimmed
+table: dp 2/3/4/5 still resolve bit-identically to the closed forms, dp 15
+still gives deq 19 / queue 28 / sbid 12 / DMA1TX ch 15, and dp 1 and 6 are
+now rejected. dtc confirms all three DTBs are unchanged by this commit.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
+index 077f83e1bc7c..590a2da420d7 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
+@@ -321,10 +321,10 @@ static u32 get_matching_EP(
+ }
+ 
+ /*
+- * DQM-DMA rows of AVM's xrx500_cbm_config[] (cqm/grx500/cbm_config.c),
+- * Ethernet subset: CBM dequeue port -> TMU queue + the DMA controller and
+- * channel that drains it. num_desc is 2 on every row and lives in hdma.c as
+- * CBM_DQM_DESC_NUM; tmu_queue_nos is 1 on every row here.
++ * DQM-DMA rows of AVM's xrx500_cbm_config[] (cqm/grx500/cbm_config.c): CBM
++ * dequeue port -> TMU queue + the DMA controller and channel that drains it.
++ * num_desc is 2 on every row and lives in hdma.c as CBM_DQM_DESC_NUM;
++ * tmu_queue_nos is 1 on every row here.
+  *
+  * dma_ctrl keeps AVM's own encoding (1 = DMA1TX, 2 = DMA2TX), not the cid
+  * values of enum dma_controller — this table is a transcription of the vendor
+@@ -332,6 +332,21 @@ static u32 get_matching_EP(
+  *
+  * The dp-15 row is the one that matters: dequeue 19 is drained by DMA1TX,
+  * a different controller from every LAN port, not merely a different channel.
++ *
++ * Only the rows this driver can serve end to end are carried, because this
++ * table IS the admissibility test - it is what decides which intel,dp-port-id
++ * a board may declare, and which ports the CBM probe programs DQM and TMU
++ * state for. The vendor's remaining DQM-DMA rows are deliberately absent:
++ *
++ * deq 6 and 11 (dp 1 and 6) are real GSWIP-L ports, but no board here wires
++ * them and hdma_port_chan_tbl() has no channel for either, so admitting them
++ * would hand out a netdev that fails at ifup and program egress state at
++ * probe for a port that does not exist on the board. - deq 12..17 are the
++ * high-priority twins of the six LAN ports (AVM's intel,highprio-lan). They
++ * carry the same pmac values as the primaries, which take precedence in the
++ * lookup below, so these rows could never be selected even if they were here.
++ * - deq 18 and 20..22 are the DSL, checksum and directpath ports, which are
++ * not Ethernet and have no netdev.
+  */
+ static const struct {
+ 	u32 deq_port;
+@@ -339,18 +354,10 @@ static const struct {
+ 	u32 dma_ctrl;
+ 	u32 dma_chan;
+ } cbm_dqm_dma_eth_rows[] = {
+-	{  6, 16, 2,  1 },
+ 	{  7, 17, 2,  2 },
+ 	{  8, 18, 2,  3 },
+ 	{  9, 19, 2,  4 },
+ 	{ 10, 20, 2,  5 },
+-	{ 11, 21, 2,  6 },
+-	{ 12, 22, 2,  9 },
+-	{ 13, 23, 2, 10 },
+-	{ 14, 24, 2, 11 },
+-	{ 15, 25, 2, 12 },
+-	{ 16, 26, 2, 13 },
+-	{ 17, 27, 2, 14 },
+ 	{ 19, 28, 1, 15 },
+ };
+ 
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_misc.c b/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
+index 5a26750292d1..dbca4c609601 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
+@@ -150,7 +150,8 @@ static void init_dma_pmac_template(int portid, u32 flags)
+ 		 * redirect = 1 — that single bit is the whole downstream
+ 		 * difference between the two Ethernet classes, and it is what
+ 		 * makes the WAN port's counters land in the GSW-R redirect RMON
+-		 * block (datapath_mib.c reads WAN stats from there).
++		 * block, which is where the vendor's datapath_mib.c reads WAN
++		 * stats from.
+ 		 */
+ 		for (i = 0; i < MAX_TEMPLATE; i++) {
+ 			dp_info->pmac_template[i].port_map_en = 1;
+diff --git a/drivers/net/ethernet/lantiq/include/intel_xrx500.h b/drivers/net/ethernet/lantiq/include/intel_xrx500.h
+index b3daf9771979..51a8ef3084fe 100644
+--- a/drivers/net/ethernet/lantiq/include/intel_xrx500.h
++++ b/drivers/net/ethernet/lantiq/include/intel_xrx500.h
+@@ -119,9 +119,9 @@ struct intel_xrx500_port_stats {
+  * @parent:           back-pointer to the owning
+  *                    struct intel_xrx500_priv (for dev_err routing).
+  *
+- * Initialized to DP_F_FAST_ETH_LAN at probe time (the four FRITZ!Box 7560 LAN ports
+- * are all fast-Ethernet LAN class). The same value (OR'd with
+- * DP_F_DEREGISTER) is passed on the ndo_stop teardown path so the
++ * Set at probe from the port's DT class: DP_F_FAST_ETH_LAN, or
++ * DP_F_FAST_ETH_WAN where the node carries lantiq,wan. The same value (OR'd
++ * with DP_F_DEREGISTER) is passed on the ndo_stop teardown path so the
+  * alloc/dealloc pair use bit-for-bit identical base flags.
+  *
+  * @dp_subif_id: the @subif handle returned by dp_register_subif on success
+diff --git a/drivers/net/ethernet/lantiq/intel_xrx500.c b/drivers/net/ethernet/lantiq/intel_xrx500.c
+index 1307be2b6544..9dd73d128f6f 100644
+--- a/drivers/net/ethernet/lantiq/intel_xrx500.c
++++ b/drivers/net/ethernet/lantiq/intel_xrx500.c
+@@ -596,7 +596,7 @@ static int intel_xrx500_open_step4_tx(struct intel_xrx500_port *port)
+ 	}
+ 
+ 	if (port->port_idx >= INTEL_XRX500_MAX_PORTS) {
+-		pr_err("intel-xrx500: %s ndo_open step 4 (tx-init): port_idx %u out of table range\n",
++		pr_err("intel-xrx500: %s ndo_open step 4 (tx-init): port_idx %u out of range\n",
+ 		       netdev_name(port->netdev), port->port_idx);
+ 		return -EINVAL;
+ 	}
+@@ -1232,16 +1232,23 @@ static int intel_xrx500_port_setup(struct intel_xrx500_priv *priv,
+ 	/*
+ 	 * DP_F_FAST_ETH_WAN pins the datapath port id: AVM's allocator walks
+ 	 * PMAC_ETH_WAN_ID as both the start and the end of its search, so the
+-	 * WAN class can only ever land on dp port 15. A DT that marks some
+-	 * other port as WAN is describing something the silicon cannot do, and
+-	 * the two properties would then disagree silently about which PMAC
+-	 * template the port gets.
++	 * WAN class can only ever land on dp port 15, and dp port 15 can only
++	 * ever be WAN.
++	 *
++	 * Hence the equivalence, checked in both directions. lantiq,wan on any
++	 * other port describes something the silicon cannot do. dp port 15
++	 * WITHOUT lantiq,wan is the quieter half of the same mistake: the port
++	 * would come up, take the LAN PMAC template, and egress with
++	 * redirect = 0 - which is exactly the silent class/template
++	 * disagreement this check exists to catch.
+ 	 */
+ 	is_wan = of_property_read_bool(port_node, "lantiq,wan");
+-	if (is_wan && dp_port_id != INTEL_XRX500_DP_PORT_WAN) {
++	if (is_wan != (dp_port_id == INTEL_XRX500_DP_PORT_WAN)) {
+ 		dev_err(priv->dev,
+-			"intel-xrx500: port@%u has lantiq,wan but intel,dp-port-id=%u (WAN is always %u)\n",
+-			port_idx, dp_port_id, INTEL_XRX500_DP_PORT_WAN);
++			"intel-xrx500: port@%u intel,dp-port-id=%u %s lantiq,wan (dp %u is the WAN port, and only it)\n",
++			port_idx, dp_port_id,
++			is_wan ? "must not have" : "requires",
++			INTEL_XRX500_DP_PORT_WAN);
+ 		return -EINVAL;
+ 	}
+ 
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c b/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
+index cc8d631c2f0c..a0b208e6f498 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
+@@ -180,6 +180,12 @@ static int ltq_gswip_mdio_dbg_rd(struct ltq_gswip_mdio_priv *priv,
+ #define LTQ_GPHY11G_PHY_MASK	0xfffffff8
+ #define LTQ_CTL1000_MULTIPORT	BIT(10)
+ 
++/*
++ * phylib's fixup list is global and keyed on PHY uid, so the fixup below is
++ * registered once for all buses rather than once per bus. See the probe site.
++ */
++static bool ltq_gswip_mdio_fixup_registered;
++
+ static int ltq_gswip_gphy_mpd_fixup(struct phy_device *phydev)
+ {
+ 	int ret;
+@@ -549,10 +555,15 @@ static int ltq_gswip_mdio_probe(struct platform_device *pdev)
+ 		 __raw_readl(priv->base + LTQ_GSWIP_MDIO_MDC_CFG_0_OFF),
+ 		 priv->n_phys, mdc_cfg_1);
+ 
+-	ret = phy_register_fixup_for_uid(LTQ_GPHY11G_PHY_ID,
+-					 LTQ_GPHY11G_PHY_MASK,
+-					 ltq_gswip_gphy_mpd_fixup);
+-	if (ret)
++	if (ltq_gswip_mdio_fixup_registered)
++		ret = 0;
++	else
++		ret = phy_register_fixup_for_uid(LTQ_GPHY11G_PHY_ID,
++						 LTQ_GPHY11G_PHY_MASK,
++						 ltq_gswip_gphy_mpd_fixup);
++	if (!ret)
++		ltq_gswip_mdio_fixup_registered = true;
++	else
+ 		dev_warn(&pdev->dev,
+ 			 "MPD fixup registration failed: %d\n", ret);
+ 

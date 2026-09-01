@@ -1,0 +1,441 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 02:26:38 +0200
+Subject: net: lantiq: cbm: resolve dp-port egress numbers from the vendor
+ tables
+
+cbm_deq_port, tmu_egress_port, tmu_queue and the egress DMA channel were
+each computed by a closed form: dp_port_id + 5, dp_port_id + 15, and
+"DMA2TX channel == dp_port_id". Those identities are a coincidence of six
+consecutive rows in epg_lookup_table ({6,1}..{11,6}), not a rule, and they
+were duplicated across four files, so they could drift apart as well as be
+wrong together.
+
+For the WAN port they are wrong, and not harmlessly. dp 15 resolves to
+dequeue port 19; dp_port_id + 5 gives 20, and epg_lookup_table's next row
+is { 20, CBM_PMAC_NOT_APPL, DP_F_CHECKSUM } - so extrapolating aims WAN
+egress at a different functional block rather than at an unused number.
+The queue would be 30 instead of 28, and the channel would be picked on
+the wrong DMA controller entirely: WAN egress is drained by DMA1TX, not
+DMA2TX.
+
+Add cbm_dp_egress_res_get() in cbm_ports.c, next to the epg_lookup_table
+it reads, and route all four sites through it. The dequeue port comes out
+of epg_lookup_table, which already carries { 19, 15, DP_F_FAST_ETH_WAN }
+- the answer has been in the tree, ported and unused, all along. The TMU
+queue and DMA binding are not in that table (AVM reads the queue back from
+dqm_port_info[].def_qid, which this tree fills only for the DQM-CPU
+rows), so they are transcribed from the same vendor source
+dqm_port_info is itself filled from: the DQM_DMA rows of cbm_config.c.
+Keeping the four numbers in one row is the point - they are one hardware
+binding and cannot now be updated apart.
+
+intel_xrx500.c takes a scalar wrapper, cbm_dp_deq_port_get(), rather than
+the struct: that TU declares its CQM entry points locally instead of
+including cbm.h, and a duplicated struct definition there would silently
+stop matching.
+
+LAN invariance was checked rather than assumed: the two tables and both
+function bodies were extracted verbatim, compiled against stub types and
+run against the closed forms for every dp port 0..15. All four LAN ports
+come out bit-identical -- dp 2/3/4/5 -> deq 7/8/9/10, queue 17/18/19/20,
+sbid 1/2/3/4, DMA2TX ch 2/3/4/5 -- and dp 15 -> deq 19, queue 28,
+sbid 12, DMA1TX ch 15, which is AVM's cbm_config.c row.
+
+The callers' range gates are unchanged, so dp 15 is still rejected
+everywhere; this commit only changes where the LAN numbers come from.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+index ea130e77136d..de6b1b3e4544 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+@@ -631,13 +631,31 @@ static int cbm_xrx500_probe(struct platform_device *pdev)
+ 
+ 	cbm_rx_engine_init();
+ 
++	/*
++	 * AVM's configure_ports() walks all 17 compiled-in rows at probe
++	 * (cbm_config.c), so every DMA egress port is preconfigured before
++	 * the controllers come up; dp 2..4 were falling through to the
++	 * ndo_open path. The per-port numbers come from
++	 * cbm_dp_egress_res_get() (the ported epg_lookup_table + cbm_config.c
++	 * rows) rather than the dp+5 / dp+15 arithmetic they used to be
++	 * computed with — that arithmetic is a LAN coincidence and does not
++	 * extend.
++	 */
+ 	{
+ 		int dp;
+ 
+ 		for (dp = 2; dp <= 5; dp++) {
+-			u16 deq = (u16)(dp + 5);
+-			u16 qid = (u16)(dp + 15);
+-			u16 sbid = (u16)(qid - SBID_START);
++			struct cbm_dp_egress_res res;
++			u16 deq, qid, sbid;
++
++			if (cbm_dp_egress_res_get((u32)dp, &res)) {
++				pr_err("cbm: dp%d has no egress resources; skipping preconfig\n",
++				       dp);
++				continue;
++			}
++			deq  = (u16)res.deq_port;
++			qid  = (u16)res.tmu_queue;
++			sbid = (u16)(res.tmu_queue - SBID_START);
+ 
+ 			init_cbm_dqm_dma_port((int)deq);
+ 			tmu_create_flat_egress_path(1, deq, sbid, qid, 1);
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+index d0d24d905863..4f8ff5c65780 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+@@ -316,6 +316,34 @@ struct cbm_egp_map {
+ 	u32 port_type;
+ };
+ 
++/**
++ * struct cbm_dp_egress_res - egress resources of one Ethernet datapath port.
++ *
++ * @deq_port: CBM DQM dequeue port.
++ *
++ * @tmu_queue: TMU queue feeding @deq_port. The scheduler block id is
++ *             @tmu_queue - SBID_START.
++ *
++ * @dma_ctrl:  DMA controller draining @deq_port, in AVM cbm_config.c's
++ *             encoding: 1 = DMA1TX, 2 = DMA2TX. NOT an enum dma_controller
++ *             cid — callers translate.
++ *
++ * @dma_chan:  channel within @dma_ctrl.
++ *
++ * Filled by cbm_dp_egress_res_get() from the ported vendor tables. The four
++ * fields always come from one pair of vendor rows, so they cannot drift
++ * apart the way four independent closed forms could.
++ */
++struct cbm_dp_egress_res {
++	u32 deq_port;
++	u32 tmu_queue;
++	u32 dma_ctrl;
++	u32 dma_chan;
++};
++
++int cbm_dp_egress_res_get(u32 dp_port_id, struct cbm_dp_egress_res *res);
++int cbm_dp_deq_port_get(u32 dp_port_id, u32 *deq_port);
++
+ /*
+  * cbm_dq_info_t — REDUCED port of AVM include/net/lantiq_cbm_api.h:486-492.
+  * Member names identical to AVM.
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
+index 9117d87c9194..32aa997630a7 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
+@@ -37,31 +37,22 @@
+  *
+  * @port_id: CBM port (caller-supplied; 0..15 fits the 0xF0 mask).
+  *
+- * dp_port_id 2..5 -> { tmu_egress_port (EPN), tmu_queue (QID) }. The EPN is
+- * dp_port_id + 5 and the QID is dp_port_id + 15, per AVM's epg_lookup_table
+- * and the xrx500_cbm_config[] DQ7..DQ10 rows; the EPN equals the CBM dequeue
+- * port, because AVM's conf_dqm_dma_port passes the same number to
+- * tmu_create_flat_egress_path and init_cbm_dqm_dma_port. SBID_START=16 (AVM
+- * cbm.h:207) -> base_sbid = tmu_queue - 16.
++ * dp_port_id -> { tmu_egress_port (EPN), tmu_queue (QID) } now comes from
++ * cbm_dp_egress_res_get() (cbm_ports.c), which reads the ported vendor
++ * tables. SBID_START=16 (AVM cbm.h:207) -> base_sbid = tmu_queue - 16.
+  *
+- *   dp 2 -> EPN  7, QID 17, SBID 1   (eth3 / LAN4)
+- *   dp 3 -> EPN  8, QID 18, SBID 2   (eth2 / LAN3)
+- *   dp 4 -> EPN  9, QID 19, SBID 3   (eth1 / LAN2)
+- *   dp 5 -> EPN 10, QID 20, SBID 4   (eth0 / LAN1)
++ *   dp  2 -> EPN  7, QID 17, SBID  1   (eth3 / LAN4)
++ *   dp  3 -> EPN  8, QID 18, SBID  2   (eth2 / LAN3)
++ *   dp  4 -> EPN  9, QID 19, SBID  3   (eth1 / LAN2)
++ *   dp  5 -> EPN 10, QID 20, SBID  4   (eth0 / LAN1)
++ *   dp 15 -> EPN 19, QID 28, SBID 12   (wan, GRX550 boards only)
+  *
+- * The code below has been on the +5/+15 form since; only this comment lagged.
++ * The LAN rows read like dp+5 / dp+15 and used to be computed that way. They
++ * are not a formula: dp 15 resolves to 19 and 28, where the arithmetic would
++ * have said 20 and 30 — and 20 is the checksum dequeue port, not an unused
++ * number. See the block comment on cbm_dp_egress_res_get().
+  */
+ 
+-static u32 cbm_dp_tmu_egress_port(int port_id)
+-{
+-	return (u32)port_id + 5u;
+-}
+-
+-static u32 cbm_dp_tmu_queue(int port_id)
+-{
+-	return (u32)port_id + 15u;
+-}
+-
+ static void cbm_qidt_set(int port_id, struct cbm_dp_en_data *cbm_data,
+ 			 u8 qid_val)
+ {
+@@ -167,18 +158,24 @@ int cbm_dp_enable(struct module *owner, u32 port_id,
+ 	}
+ 
+ 	if (port_id >= 2 && port_id <= 5) {
+-		u32 tmu_port  = cbm_dp_tmu_egress_port((int)port_id);
+-		u32 tmu_queue = cbm_dp_tmu_queue((int)port_id);
+-		u32 base_sbid = tmu_queue - SBID_START;
++		struct cbm_dp_egress_res res;
++		u32 base_sbid;
++
++		if (cbm_dp_egress_res_get(port_id, &res)) {
++			pr_err("cbm: cbm_dp_enable: no egress resources for dp port %u\n",
++			       port_id);
++			return -EINVAL;
++		}
++		base_sbid = res.tmu_queue - SBID_START;
+ 
+ 		if (!g_cbm_egress_preconfig[port_id]) {
+-			init_cbm_dqm_dma_port((int)tmu_port);
+-			tmu_create_flat_egress_path(1, (u16)tmu_port,
++			init_cbm_dqm_dma_port((int)res.deq_port);
++			tmu_create_flat_egress_path(1, (u16)res.deq_port,
+ 						    (u16)base_sbid,
+-						    (u16)tmu_queue, 1);
++						    (u16)res.tmu_queue, 1);
+ 		}
+ 
+-		cbm_qidt_set((int)port_id, cbm_data, (u8)tmu_queue);
++		cbm_qidt_set((int)port_id, cbm_data, (u8)res.tmu_queue);
+ 		return 0;
+ 	}
+ 
+@@ -215,6 +212,7 @@ int cbm_dp_port_alloc(struct module *owner, struct net_device *dev,
+ 		      u32 dev_port, s32 port_id,
+ 		      struct cbm_dp_alloc_data *data, u32 flags)
+ {
++	struct cbm_dp_egress_res res;
+ 	u32 dma_chan;
+ 
+ 	(void)owner;
+@@ -234,24 +232,39 @@ int cbm_dp_port_alloc(struct module *owner, struct net_device *dev,
+ 		return -EINVAL;
+ 	}
+ 
++	if (cbm_dp_egress_res_get((u32)port_id, &res)) {
++		pr_err("cbm: cbm_dp_port_alloc: no egress resources for port_id=%d\n",
++		       port_id);
++		return -EINVAL;
++	}
++
+ 	/*
+-	 * DMA2TX channel N, because CBM dequeue port N+5 is served by DMA2TX
+-	 * channel (deq - 5) == N and DMA_CHANNEL_N == N. So
++	 *   dp  5 (eth0/LAN1) -> deq 10 -> DMA2TX ch 5  -> PMAC p5 -> GPHY5
++	 *   dp  4 (eth1/LAN2) -> deq  9 -> DMA2TX ch 4  -> PMAC p4 -> GPHY4
++	 *   dp  3 (eth2/LAN3) -> deq  8 -> DMA2TX ch 3  -> PMAC p3 -> GPHY3
++	 *   dp  2 (eth3/LAN4) -> deq  7 -> DMA2TX ch 2  -> PMAC p2 -> GPHY2
++	 *   dp 15 (wan)       -> deq 19 -> DMA1TX ch 15 -> PMAC-R p15
+ 	 *
+-	 *   dp 5 (eth0/LAN1) -> deq 10 -> DMA2TX_CBM_P10_CLASS5 -> PMAC p5 -> GPHY5
+-	 *   dp 4 (eth1/LAN2) -> deq  9 -> DMA2TX_CBM_P9_CLASS4  -> PMAC p4 -> GPHY4
+-	 *   dp 3 (eth2/LAN3) -> deq  8 -> DMA2TX_CBM_P8_CLASS3  -> PMAC p3 -> GPHY3
+-	 *   dp 2 (eth3/LAN4) -> deq  7 -> DMA2TX_CBM_P7_CLASS2  -> PMAC p2 -> GPHY2
+-	 *
+-	 * matching AVM epg_lookup_table (dp5 -> CBM_P10,
+-	 * cqm/grx500/cbm.c:568) and DT DQ7..DQ10. This replaces a switch that
+-	 * resolved only dp 5 and dp 4 and sent dp 2 / dp 3 to a DMA_CHANNEL_0
+-	 * placeholder.
++	 * WAN is on a DIFFERENT CONTROLLER, so the identity does not survive:
++	 * the controller has to be resolved, not assumed. cbm_config.c
++	 * numbers its controllers 1 = DMA1TX / 2 = DMA2TX, which is not the
++	 * cid ordering of enum dma_controller, hence the map here.
+ 	 */
+-	dma_chan = _DMA_C(DMA2TX, DMA2TX_PORT, (u32)port_id);
++	switch (res.dma_ctrl) {
++	case 1:
++		dma_chan = _DMA_C(DMA1TX, DMA1TX_PORT, res.dma_chan);
++		break;
++	case 2:
++		dma_chan = _DMA_C(DMA2TX, DMA2TX_PORT, res.dma_chan);
++		break;
++	default:
++		pr_err("cbm: cbm_dp_port_alloc: port_id=%d unknown dma_ctrl %u\n",
++		       port_id, res.dma_ctrl);
++		return -EINVAL;
++	}
+ 
+ 	data->dp_port = (u32)port_id;
+-	data->deq_port = (u32)port_id + 5;
++	data->deq_port = res.deq_port;
+ 
+ 	data->deq_port_num = 1;
+ 	data->num_dma_chan = 1;
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
+index d50241a7c756..077f83e1bc7c 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
+@@ -320,6 +320,103 @@ static u32 get_matching_EP(
+ 	return 0;
+ }
+ 
++/*
++ * DQM-DMA rows of AVM's xrx500_cbm_config[] (cqm/grx500/cbm_config.c),
++ * Ethernet subset: CBM dequeue port -> TMU queue + the DMA controller and
++ * channel that drains it. num_desc is 2 on every row and lives in hdma.c as
++ * CBM_DQM_DESC_NUM; tmu_queue_nos is 1 on every row here.
++ *
++ * dma_ctrl keeps AVM's own encoding (1 = DMA1TX, 2 = DMA2TX), not the cid
++ * values of enum dma_controller — this table is a transcription of the vendor
++ * rows and translating it in place would make it un-diffable against them.
++ *
++ * The dp-15 row is the one that matters: dequeue 19 is drained by DMA1TX,
++ * a different controller from every LAN port, not merely a different channel.
++ */
++static const struct {
++	u32 deq_port;
++	u32 tmu_queue;
++	u32 dma_ctrl;
++	u32 dma_chan;
++} cbm_dqm_dma_eth_rows[] = {
++	{  6, 16, 2,  1 },
++	{  7, 17, 2,  2 },
++	{  8, 18, 2,  3 },
++	{  9, 19, 2,  4 },
++	{ 10, 20, 2,  5 },
++	{ 11, 21, 2,  6 },
++	{ 12, 22, 2,  9 },
++	{ 13, 23, 2, 10 },
++	{ 14, 24, 2, 11 },
++	{ 15, 25, 2, 12 },
++	{ 16, 26, 2, 13 },
++	{ 17, 27, 2, 14 },
++	{ 19, 28, 1, 15 },
++};
++
++/*
++ * cbm_dp_egress_res_get - resolve a datapath port's egress resources.
++ *
++ * Return: 0 with @res filled, or -EINVAL if @dp_port_id is not an Ethernet
++ * datapath port on this silicon.
++ */
++int cbm_dp_egress_res_get(u32 dp_port_id, struct cbm_dp_egress_res *res)
++{
++	u32 deq = CBM_PORT_INVALID;
++	int i;
++
++	if (!res)
++		return -EINVAL;
++
++	/*
++	 * Both blocks carry the same pmac values, so taking the first keeps
++	 * the primary.
++	 */
++	for (i = 0; i < ARRAY_SIZE(epg_lookup_table); i++) {
++		if (epg_lookup_table[i].pmac != dp_port_id)
++			continue;
++		if (epg_lookup_table[i].port_type != DP_F_FAST_ETH_LAN &&
++		    epg_lookup_table[i].port_type != DP_F_FAST_ETH_WAN)
++			continue;
++		deq = epg_lookup_table[i].epg;
++		break;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(cbm_dqm_dma_eth_rows); i++) {
++		if (cbm_dqm_dma_eth_rows[i].deq_port != deq)
++			continue;
++		res->deq_port  = deq;
++		res->tmu_queue = cbm_dqm_dma_eth_rows[i].tmu_queue;
++		res->dma_ctrl  = cbm_dqm_dma_eth_rows[i].dma_ctrl;
++		res->dma_chan  = cbm_dqm_dma_eth_rows[i].dma_chan;
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++/*
++ * cbm_dp_deq_port_get — @deq_port only, for callers that have no reason to
++ * see the rest and would otherwise need a duplicate struct definition
++ * (intel_xrx500.c declares its CQM entry points locally rather than including
++ * cbm.h).
++ */
++int cbm_dp_deq_port_get(u32 dp_port_id, u32 *deq_port)
++{
++	struct cbm_dp_egress_res res;
++	int ret;
++
++	if (!deq_port)
++		return -EINVAL;
++
++	ret = cbm_dp_egress_res_get(dp_port_id, &res);
++	if (ret)
++		return ret;
++
++	*deq_port = res.deq_port;
++	return 0;
++}
++
+ /* AVM cbm.c:625-644 verbatim. */
+ static u32 assign_port_from_DT(
+ 	u32 flags,
+diff --git a/drivers/net/ethernet/lantiq/intel_xrx500.c b/drivers/net/ethernet/lantiq/intel_xrx500.c
+index ca44fa3a31dc..f16ad4da049b 100644
+--- a/drivers/net/ethernet/lantiq/intel_xrx500.c
++++ b/drivers/net/ethernet/lantiq/intel_xrx500.c
+@@ -208,6 +208,17 @@ int turn_on_DMA_p2p(void);
+ 
+ void cbm_rx_set_netdev(u32 sppid, struct net_device *dev);
+ 
++/*
++ * Defined in cqm/grx500/cbm_ports.c, next to the epg_lookup_table it reads.
++ *
++ * Scalar rather than the struct the CQM side uses, so this TU needs no
++ * duplicate struct definition to keep in sync — same intra-composite extern
++ * discipline as the declarations above (no cqm/grx500/cbm.h include here).
++ *
++ * Returns 0 with *@deq_port filled, or -EINVAL for a non-Ethernet dp port.
++ */
++int cbm_dp_deq_port_get(u32 dp_port_id, u32 *deq_port);
++
+ #define XRX500_CBM_TX_DATA_OFFSET (128u + NET_IP_ALIGN + NET_SKB_PAD)
+ 
+ /* Forward declarations. */
+@@ -1176,6 +1187,7 @@ static int intel_xrx500_port_setup(struct intel_xrx500_priv *priv,
+ 	struct net_device *netdev;
+ 	struct phylink *phylink;
+ 	u32 dp_port_id;
++	u32 deq_port;
+ 	int ret;
+ 
+ 	ret = of_property_read_u32(port_node, "intel,dp-port-id", &dp_port_id);
+@@ -1194,6 +1206,14 @@ static int intel_xrx500_port_setup(struct intel_xrx500_priv *priv,
+ 		return -EINVAL;
+ 	}
+ 
++	ret = cbm_dp_deq_port_get(dp_port_id, &deq_port);
++	if (ret) {
++		dev_err(priv->dev,
++			"intel-xrx500: port@%u intel,dp-port-id=%u has no CBM egress resources\n",
++			port_idx, dp_port_id);
++		return ret;
++	}
++
+ 	netdev = alloc_etherdev_mq(sizeof(*port), 1);
+ 	if (!netdev)
+ 		return -ENOMEM;
+@@ -1210,11 +1230,15 @@ static int intel_xrx500_port_setup(struct intel_xrx500_priv *priv,
+ 	 *      4             9                              19     (eth1 = LAN2)
+ 	 *      3             8                              18     (eth2 = LAN3)
+ 	 *      2             7                              17     (eth3 = LAN4)
++	 *     15            19                              28     (wan)
+ 	 *
+-	 * Closed-form: cbm_deq_port = tmu_egress_port = dp_port_id + 5.
++	 * The LAN rows used to be computed as dp_port_id + 5. They are not a
++	 * formula — dp 15 resolves to 19, where +5 would say 20, and 20 is the
++	 * checksum dequeue port. See cbm_dp_egress_res_get() in
++	 * cqm/grx500/cbm_ports.c.
+ 	 */
+-	port->cbm_deq_port    = dp_port_id + 5u;
+-	port->tmu_egress_port = dp_port_id + 5u;
++	port->cbm_deq_port    = deq_port;
++	port->tmu_egress_port = deq_port;
+ 	port->parent          = priv;
+ 	port->dp_alloc_flags  = DP_F_FAST_ETH_LAN;
+ 	port->dp_subif_id     = -1;

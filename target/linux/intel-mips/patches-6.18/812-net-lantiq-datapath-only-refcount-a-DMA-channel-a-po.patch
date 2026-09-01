@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 27 Aug 2026 12:39:00 +0200
+Subject: net: lantiq: datapath: only refcount a DMA channel a port actually
+ has
+
+subif_hw_set() and subif_hw_reset() decompose dp_deq_port_tbl[].dma_chan
+into a controller/port/channel triple and bump the refcount of
+dp_dma_chan_tbl[inst][cid][pid][nid] unconditionally. A port registered
+with no DMA channel at all has never had that dma_chan field written to
+anything meaningful, so it decomposes to cid=pid=nid=0 -- and the
+increment lands on the refcount of a real channel, DMA controller 0 port
+0 channel 0, which belongs to somebody else. AVM's 08.25 GPL release
+guards both the inc and the dec with "if (port_info->num_dma_chan)"
+(gswip30/datapath_misc.c:541 and :583 in Linux 4.9.337); 07.30 does not.
+Take the guard. AVM's table is flat and indexed by a dma_ch_offset where
+ours is four-dimensional, but the guard itself transposes unchanged. AVM
+leaves the adjacent DP_DEBUG refcount print outside the guard (:543,
+:585); ours already matches that, so only the inc and the dec move.
+
+This has no behavioural effect on either board today, and the commit is
+worth having anyway as newest-drop alignment. cbm_dp_port_alloc() sets
+data->num_dma_chan = 1 unconditionally (cqm/grx500/cbm_dp.c:483) and
+datapath_api.c:492 copies it into pmac_port_info, so num_dma_chan == 0 is
+unreachable in this tree. There is no port that takes the new branch.
+
+The refcount is not dead, though, so this is not a guard on something
+nobody reads. dp_register_subif_private() tests it at datapath_api.c:824 --
+ref_cnt == 1 together with !DP_F_DIRECT and a non-zero num_dma_chan is what
+sets cbm_data.dma_chnl_init. What makes that inert is one level further
+down: our cbm_dp_enable() is the minimum implementation and reads nothing
+out of cbm_data at all (documented at cbm_dp.c:257), because DMA is
+claimed at ndo_open through intel_xrx500_open_step4_tx instead.
+
+Two related things are deliberately not in this commit.
+
+AVM 08.25 also seeds dp_deq_port_tbl[].dma_chan from port_info->dma_chan
+rather than from a local zero ("dma_chan = port_info->dma_chan",
+gswip30/datapath_misc.c:478). Ours does not. That is a live gap, not a
+blocked one: port_info->dma_chan is populated. cbm_dp_port_alloc()
+computes the correct per-port handle (cbm_dp.c:461-467 -- LAN to DMA2TX
+channels 2..5, WAN to DMA1TX channel 15), stores it in data->dma_chan
+(:484) and sets CBM_PORT_DMA_CHAN_SET (:498); datapath_api.c:499-500
+latches it into dp_port_info[inst][port_id].dma_chan under exactly that
+flag, and :442 reads it back to hand to cbm_dp_port_dealloc. What
+discards the handle is one level further on: port_platform_set() never
+consults port_info->dma_chan and seeds every dp_deq_port_tbl[] entry
+from its own "u32 dma_chan = 0" (datapath_misc.c:564, assigned at
+:574-577). So all ports decompose to cid=pid=nid=0 and share
+dp_dma_chan_tbl[inst][0][0][0].ref_cnt, which is why the == 1 test at
+:824 can only ever fire for the first interface brought up. The fix is
+to seed port_platform_set() from port_info->dma_chan; it is left out
+because it redistributes live refcounts across four channels that today
+all alias one, and that wants a hardware run of its own rather than a
+ride-along on a guard.
+
+AVM's dma_ch_ref teardown gate is also left out. It is written against the
+flat channel table and needs re-deriving for a 4-D one, and the exposure it
+closes -- a subif teardown killing traffic on a sibling interface -- is a
+symptom we have never seen.
+
+The comment at cbm_dp.c:486 is corrected here because this commit's
+reasoning turns on which field is latched where. It named
+datapath_api.c:492 as the site that latches data->dma_chan; :492 is the
+num_dma_chan copy and the dma_chan latch is at :499-500, under
+CBM_PORT_DMA_CHAN_SET. The comment now says that, names :442 as the
+read-back, and points at port_platform_set() as the place the handle is
+actually dropped.
+
+Worth noting while in here: the two refcounts are not symmetric.
+dp_deq_port_tbl[].ref_cnt has an underflow guard at datapath_misc.c:693
+that refuses a reset when it is already zero; dp_dma_chan_tbl[].ref_cnt
+has none, so an unbalanced reset drives the atomic negative silently.
+Not fixed here.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_misc.c b/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
+index dbca4c609601..ef8f24a51306 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
+@@ -486,7 +486,9 @@ static int supported_logic_dev(int inst, struct net_device *dev,
+ 
+ /*
+  * Bounds checks against DP_DMAMAX / DP_MAX_DMA_PORT / DP_MAX_DMA_CHAN are
+- * preserved.
++ * preserved. The num_dma_chan guard on the DMA-channel refcount comes from
++ * AVM's 08.25 drop (gswip30/datapath_misc.c:541), not the 07.30 one this was
++ * transcribed from.
+  */
+ static noinline int subif_hw_set(int inst, int portid, int subif_ix,
+ 				 struct subif_platform_data *data, u32 flags)
+@@ -528,7 +530,8 @@ static noinline int subif_hw_set(int inst, int portid, int subif_ix,
+ 		return DP_FAILURE;
+ 	}
+ 	dp_deq_port_tbl[inst][cqe_deq].ref_cnt++;
+-	atomic_inc(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt);
++	if (port_info->num_dma_chan)
++		atomic_inc(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt);
+ 	DP_DEBUG(DP_DBG_FLAG_REG, "cbm[%d].ref_cnt=%d DMATXCH_Ref.cnt=%d\n",
+ 		 cqe_deq,
+ 		 dp_deq_port_tbl[inst][cqe_deq].ref_cnt,
+@@ -538,7 +541,9 @@ static noinline int subif_hw_set(int inst, int portid, int subif_ix,
+ 
+ /*
+  * subif_hw_reset - AVM:512-548 verbatim with PR_ERR -> dev_err and DP_DEBUG
+- * -> dev_dbg rewrite.
++ * -> dev_dbg rewrite, plus the 08.25 num_dma_chan guard on the DMA-channel
++ * refcount (gswip30/datapath_misc.c:583) that pairs with the one in
++ * subif_hw_set.
+  */
+ static noinline int subif_hw_reset(int inst, int portid, int subif_ix,
+ 				   struct subif_platform_data *data, u32 flags)
+@@ -585,7 +590,8 @@ static noinline int subif_hw_reset(int inst, int portid, int subif_ix,
+ 	}
+ 	DP_DEBUG(DP_DBG_FLAG_DBG, "cid=%d pid=%d nid=%d\n", cid, pid, nid);
+ 	dp_deq_port_tbl[inst][cqe_deq].ref_cnt--;
+-	atomic_dec(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt);
++	if (port_info->num_dma_chan)
++		atomic_dec(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt);
+ 	DP_DEBUG(DP_DBG_FLAG_REG, "cbm[%d].ref_cnt=%d DMATXCH_Ref_cnt=%d\n",
+ 		 cqe_deq,
+ 		 dp_deq_port_tbl[inst][cqe_deq].ref_cnt,

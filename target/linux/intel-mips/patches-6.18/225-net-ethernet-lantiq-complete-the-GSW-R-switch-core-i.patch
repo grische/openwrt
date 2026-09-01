@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 12:07:02 +0000
+Subject: net: ethernet: lantiq: complete the GSW-R switch-core init
+
+AVM's legacy_switch_core_init makes five register writes that it gates on
+sdev == LTQ_FLOW_DEV_INT_R alone - not on the presence of a WAN port - so
+they apply to this board, whose GSW-R carries no WAN netdev but does sit in
+the live host-RX path via the DMA1TX<->DMA2RX peer-to-peer bridge. Our port
+carried none of them. All five register definitions were already present in
+gsw_reg.h; only the writes were missing.
+
+  MAC_FLEN.LEN     = 1612  gsw_flow_core.c:2815-2817
+  PMAC_CTRL_2.MLEN = 1     :2818-2820
+  MAC_CTRL_2.MLEN  = 1     :2821-2822
+  PCE_TFCR_NUM.NUM = 0x80  :2886-2887
+  PMAC_CTRL_0.PADEN = 1    :2800-2802
+
+The first three are one group, AVM's "JZ-33918: enable jumbo frames up
+to mtu 1590 on the GSWIP-R", where 1612 is 1590 + VLAN_ETH_HLEN +
+ETH_FCS_LEN. Our only MAC_FLEN write was explicitly excluded for GSW-R,
+and the matching PMAC_CTRL_2.MLEN = 0 lives in gsw_pmac_glbl_cfg, which
+GSW-R does not call - so GSW-R ran with MAC_FLEN at silicon reset and
+both long-frame enables at zero. It gets AVM's else-arm now, written as
+the else-arm of the same condition so the two arms read the way AVM's
+do.
+
+This does not change any netdev MTU: ndo_change_mtu remains the
+deliberate no-op it is, and the interfaces stay at ETH_DATA_LEN. It
+stops GSW-R's frame budget from being the binding constraint underneath
+them, which matters for full-size VLAN-tagged frames crossing the bridge
+on the way to the CPU.
+
+PCE_TFCR_NUM sizes the PCE flow-engine common region at 128 entries. The
+acronym is not expanded anywhere in the 4.9 source, but the register titles
+in gsw_reg.h settle what it is - 0x46E "PCE Flow Engine Common Region Start
+Index", 0x46F its "Entry Numbers" - a flow-table region descriptor, not a
+MAC transmit flow-control register. AVM writes NUM at three GSW-R-gated
+sites and never writes PCE_TFCR_ID; this follows suit, and goes at the tail
+of the GSWIP-3.0 RMON block where AVM's first site sits.
+
+PMAC_CTRL_0.PADEN = 1 enables padding to 64 bytes. It is a raw gsw_w32
+in AVM's GSW-R arm, and the reason we missed it is a false negative in
+our own comment on gsw_pmac_ig_cfg_r: "AVM issues NO PMAC global-cfg for
+GSW-R". True of GSW_PMAC_Glbl_CfgSet, which AVM really never calls for
+GSW-R - but it reads as though the whole PMAC global block were
+untouched, and it is not. That comment is corrected here rather than
+left to mislead the next audit. AVM writes MAC_CTRL_0.PADEN (0x903) on
+neither instance, so nor do we.
+
+The invariant this change is built around: the GSW-L register sequence
+is byte-identical before and after. Every one of the five writes is
+gated on the GSW-R device - three in a new else-arm, one behind an sdev
+test, one inside the existing GSW-R-only PMAC branch - and the GSW-L
+MAC_FLEN = 1518 write is unchanged but for the braces now around it.
+GSW-R is the live CPU RX path, so this is the highest per-line risk in
+the phase and wants its own A/B against a build without it.
+
+MAC_CTRL_2 @ 0x905 carries an unresolved MAC-index 0-vs-1 ambiguity: the
+gsw_reg.h base arithmetic reads as index 0, while AVM's GSW-L runtime
+formula implies a -1 base, and there is no hardware reference manual to
+arbitrate. It is written with the literal base exactly as AVM writes it.
+Do not "correct" the arithmetic on reasoning alone.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c
+index c94f6ec96d84..c6dc469d30ed 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c
++++ b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c
+@@ -849,6 +849,11 @@ int gsw_pmicro_code_init(void *cdev)
+ 				BM_RMON_CTRL_BCAST_CNT_SHIFT,
+ 				BM_RMON_CTRL_BCAST_CNT_SIZE, 1);
+ 		}
++
++		if (gswdev->sdev == LTQ_FLOW_DEV_INT_R)
++			gsw_w32(cdev, PCE_TFCR_NUM_NUM_OFFSET,
++				PCE_TFCR_NUM_NUM_SHIFT,
++				PCE_TFCR_NUM_NUM_SIZE, 0x80);
+ 	}
+ 
+ 	/*
+@@ -942,16 +947,26 @@ int gsw_pmicro_code_init(void *cdev)
+ 	gsw_w32(cdev, MAC_PFSA_2_PFAD_OFFSET, MAC_PFSA_2_PFAD_SHIFT,
+ 		MAC_PFSA_2_PFAD_SIZE, 0xAC9A);
+ 
+-	if (gswdev->sdev != LTQ_FLOW_DEV_INT_R)
++	if (gswdev->sdev != LTQ_FLOW_DEV_INT_R) {
++		/* "discard jumbo frames on the GSWIP-L" (AVM :2823-2830) */
+ 		gsw_w32(cdev, MAC_FLEN_LEN_OFFSET, MAC_FLEN_LEN_SHIFT,
+ 			MAC_FLEN_LEN_SIZE, 1518);
+-
++	} else {
++		gsw_w32(cdev, MAC_FLEN_LEN_OFFSET, MAC_FLEN_LEN_SHIFT,
++			MAC_FLEN_LEN_SIZE, 1612);
++		gsw_w32(cdev, PMAC_CTRL_2_MLEN_OFFSET, PMAC_CTRL_2_MLEN_SHIFT,
++			PMAC_CTRL_2_MLEN_SIZE, 1);
++		gsw_w32(cdev, MAC_CTRL_2_MLEN_OFFSET, MAC_CTRL_2_MLEN_SHIFT,
++			MAC_CTRL_2_MLEN_SIZE, 1);
++	}
+ 
+ 	if (gswdev->sdev == LTQ_FLOW_DEV_INT) {
+ 		gsw_pmac_glbl_cfg(cdev);
+ 		gsw_pmac_ig_cfg(cdev);
+ 		gsw_pmac_eg_cfg(cdev);
+ 	} else if (gswdev->sdev == LTQ_FLOW_DEV_INT_R) {
++		gsw_w32(cdev, PMAC_CTRL_0_PADEN_OFFSET, PMAC_CTRL_0_PADEN_SHIFT,
++			PMAC_CTRL_0_PADEN_SIZE, 1);
+ 		gsw_pmac_ig_cfg_r(cdev);
+ 		gsw_pmac_eg_cfg_r(cdev);
+ 	}

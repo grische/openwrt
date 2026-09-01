@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 09:01:04 +0200
+Subject: net: lantiq: fold in two review findings
+
+Neither changes behaviour today; both remove a trap for the next editor.
+
+cbm_dp_port_alloc()'s field contract still promised
+"data->deq_port = (u32)port_id + 5" and a "per-port DMA2TX handle". Both
+are false for the WAN port, which resolves to dequeue port 19 on DMA1TX,
+and this is the same class of stale comment the series has already been
+through once -- missed here because the contract sits in the kerneldoc of
+the very function whose body changed. State that the number is resolved
+rather than computed, and name the WAN exception.
+
+INIT_DELAYED_WORK moved inside the is_gswl branch when the MDIO driver
+became per-instance, so a GSW-R priv now carries a delayed_work that was
+never initialised. Harmless as it stands -- the driver has no .remove and
+devm teardown never touches the struct -- but the obvious .remove would
+add cancel_delayed_work_sync() for both buses and find it. Initialise
+unconditionally and gate only the schedule, which is what the instance
+check was ever about.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c b/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
+index a0b208e6f498..15d798ad177c 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
+@@ -589,12 +589,10 @@ static int ltq_gswip_mdio_probe(struct platform_device *pdev)
+ 	 * GSW_HW_Init sequence. It runs from a work function because it must
+ 	 * not run from the MDIO bus callbacks it re-initialises.
+ 	 */
+-	if (priv->is_gswl) {
+-		INIT_DELAYED_WORK(&priv->gsw_reinit_work,
+-				  ltq_gswip_gsw_reinit_work);
++	INIT_DELAYED_WORK(&priv->gsw_reinit_work, ltq_gswip_gsw_reinit_work);
++	if (priv->is_gswl)
+ 		schedule_delayed_work(&priv->gsw_reinit_work,
+ 				      msecs_to_jiffies(LTQ_GSWIP_GSW_REINIT_DELAY_MS));
+-	}
+ 	return 0;
+ }
+ 

@@ -1,0 +1,3375 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:23:06 +0000
+Subject: net: ethernet: lantiq: add datapath manager API layer
+
+Add the datapath manager, the vendor abstraction that glues netdev
+drivers to the CBM and the switch:
+
+ - datapath_api.c: dp_init_module() (fired once after both switch
+   instances have probed), the dp_alloc_port / dp_register_subif /
+   dp_register_dev chain with its port/subif state machine, and the
+   instance lookup helpers. dp_get_inst_via_module accepts ports in
+   PORT_SUBIF_REGISTERED state and checks the per-port info table
+   (not the instance storage) so re-registration after ndo_stop /
+   ndo_open cycles works.
+
+ - datapath_misc.c: the GSWIP-3.0 capability registration,
+   dma-pmac template initialization and the queue-map programming
+   helper used at subif registration.
+
+ - datapath_instance.c: the minimal per-instance registry.
+
+ - Headers: the public dp_* API surface and the GSWIP-3.0
+   parameter blocks, reduced to the subset this port exercises.
+
+The datapath calls into the CBM port-allocation surface
+(cbm_dp_port_alloc/cbm_dp_enable, added in the next patch) and back
+into the switch HAL via gsw_get_swcore_ops().
+
+Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
+datapath/ - Copyright (C) Intel Corporation, Author: Shao Guohua
+<guohua.shao@intel.com>; notices restored to all nine derived
+files. Switchdev/QoS/PPA surfaces are not ported.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
+index 48af7dec1ae7..fd56e833c1af 100644
+--- a/drivers/net/ethernet/lantiq/Makefile
++++ b/drivers/net/ethernet/lantiq/Makefile
+@@ -29,3 +29,4 @@ intel-xrx500-gswip-y += dma/hdma.o
+ intel-xrx500-gswip-y += cqm/grx500/cbm_basic.o cqm/grx500/cbm_buf.o cqm/grx500/fsqm.o
+ intel-xrx500-gswip-y += cqm/grx500/cbm_dma.o
+ intel-xrx500-gswip-y += tmu/tmu_init.o tmu/drv_tmu_ll.o
++intel-xrx500-gswip-y += datapath/datapath_misc.o datapath/datapath_api.o datapath/datapath_instance.o
+diff --git a/drivers/net/ethernet/lantiq/datapath/Makefile b/drivers/net/ethernet/lantiq/datapath/Makefile
+new file mode 100644
+index 000000000000..d90940efe662
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/datapath/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# The intel-xrx500-gswip object list lives in ../Makefile.
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath.h b/drivers/net/ethernet/lantiq/datapath/datapath.h
+new file mode 100644
+index 000000000000..b0c813cee5ff
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/datapath/datapath.h
+@@ -0,0 +1,544 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) Intel Corporation Author: Shao Guohua <guohua.shao@intel.com>
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * datapath/datapath.h.
++ *
++ * Intra-module state and helpers for the datapath manager.
++ */
++
++#ifndef DATAPATH_H
++#define DATAPATH_H
++
++#include <linux/skbuff.h>
++#include <linux/types.h>
++#include <linux/netdevice.h>
++#include <linux/platform_device.h>
++#include <linux/atomic.h>
++#include <linux/spinlock.h>
++#include <linux/mutex.h>
++#include <linux/list.h>
++#include <linux/seq_file.h>
++#include <linux/device.h>
++#include <linux/bug.h>
++
++#include "lantiq_cbm_api.h"
++#include "datapath_api_qos.h"
++#include "datapath_inst.h"
++#include "datapath_api_gswip30.h"
++
++/*
++ * Forward declarations for public-API types that AVM keeps in
++ * include/net/datapath_api.h.
++ */
++struct dp_subif;
++typedef struct dp_subif dp_subif_t;
++
++#ifndef DP_MAX_INST
++#define DP_MAX_INST 1
++#endif
++#define MAX_SUBIFS 256
++#define MAX_DP_PORTS 16
++#define PMAC_SIZE 8
++#define PMAC_CPU_ID 0
++#define DP_MAX_BP_NUM 128
++#define DP_MAX_QUEUE_NUM 256
++#define DP_MAX_SCHED_NUM 2048    /* max scheduler node count */
++#define DP_MAX_CQM_DEQ 128       /* CQM dequeue port */
++
++/* fallbacks for the AVM klogging.h LOGF_* macros now that the include is
++ * dropped (AVM gated each of these behind ifdef LOGF_KLOG_*). */
++#define PR_ERR printk
++#define PR_INFO printk
++#define PR_INFO_ONCE printk_once
++#define PR_RATELIMITED printk_ratelimited
++
++#define DP_PLATFORM_INIT 1
++#define DP_PLATFORM_DE_INIT 2
++
++#define UP_STATS(atomic) atomic_add(1, &(atomic))
++
++#define STATS_GET(atomic) atomic_read(&(atomic))
++#define STATS_SET(atomic, val) atomic_set(&(atomic), val)
++#define DP_CB(i, x) dp_port_prop[i].info.x
++
++#define PORT(inst, ep) (&dp_port_info[inst][ep])
++#define PORT_INFO(inst, ep, x) (dp_port_info[inst][ep].x)
++#define PORT_SUBIF(inst, ep, ix, x) (dp_port_info[inst][ep].subif_info[ix].x)
++#define PORT_VAP_MIB(i, ep, vap, x) (dp_port_info[i][ep].subif_info[vap].mib.x)
++#define PORT_VAP(i, ep, vap, x) (dp_port_info[i][ep].subif_info[vap].x)
++
++#define dp_set_val(reg, val, mask, offset)               \
++	do {                                             \
++		(reg) &= ~(mask);                        \
++		(reg) |= (((val) << (offset)) & (mask)); \
++	} while (0)
++
++#define dp_get_val(val, mask, offset) (((val) & (mask)) >> (offset))
++
++#define DP_DEBUG_ASSERT(expr, fmt, arg...)                  \
++	do {                                                \
++		if (expr)                                   \
++			dev_err(dp_dev, fmt, ##arg);        \
++	} while (0)
++
++#define DP_DEBUG(flags, fmt, arg...) dev_dbg(dp_dev, fmt, ##arg)
++
++/* AVM define IFNAMSIZ inline; v6.18 has linux/if.h providing it. Define
++ * unconditionally for compatibility with the AVM struct layouts. */
++#ifndef IFNAMSIZ
++#define IFNAMSIZ 16
++#endif
++#define DP_MAX_HW_CAP 4
++
++/*
++ * DP_LIB_LOCK / DP_LIB_UNLOCK: AVM picked spin_lock_bh for SOC_GRX500 and
++ * mutex_lock otherwise; the SOC_GRX500 family is in the strip list so the
++ * mutex form is pinned unconditionally.
++ */
++#define DP_LIB_LOCK mutex_lock
++#define DP_LIB_UNLOCK mutex_unlock
++
++#define PARSER_FLAG_SIZE 40
++#define PARSER_OFFSET_SIZE 8
++#define DP_PMAC_OPS(gsw, cmd) (dp_gsw_cb)(gsw)->gsw_pmac_ops.cmd
++
++#define PKT_PASER_FLAG_OFFSET 0
++#define PKT_PASER_OFFSET_OFFSET (PARSER_FLAG_SIZE)
++#define PKT_PMAC_OFFSET ((PARSER_FLAG_SIZE) + (PARSER_OFFSET_SIZE))
++#define PKT_DATA_OFFSET ((PKT_PMAC_OFFSET) + (PMAC_SIZE))
++
++#define CHECK_BIT(var, pos) (((var) & (1 << (pos))) ? 1 : 0)
++
++#define PASAR_OFFSETS_NUM 40 /* 40 bytes offset */
++#define PASAR_FLAGS_NUM 8    /* 8 bytes */
++
++#define GET_VAP(subif, bit_shift, mask) (((subif) >> (bit_shift)) & (mask))
++#define SET_VAP(vap, bit_shift, mask) ((((u32)vap) & (mask)) << (bit_shift))
++
++/* maximum DMA port per controller */
++#define DP_MAX_DMA_PORT 4
++/* maximum dma channels per port */
++#define DP_MAX_DMA_CHAN 64
++/* maximum dma controller */
++#define DP_DMAMAX 7
++
++enum dp_xmit_errors {
++	DP_XMIT_ERR_DEFAULT = 0,
++	DP_XMIT_ERR_NOT_INIT,
++	DP_XMIT_ERR_IN_IRQ,
++	DP_XMIT_ERR_NULL_SUBIF,
++	DP_XMIT_ERR_PORT_TOO_BIG,
++	DP_XMIT_ERR_NULL_SKB,
++	DP_XMIT_ERR_NULL_IF,
++	DP_XMIT_ERR_REALLOC_SKB,
++	DP_XMIT_ERR_EP_ZERO,
++	DP_XMIT_ERR_GSO_NOHEADROOM,
++	DP_XMIT_ERR_CSM_NO_SUPPORT,
++	DP_XMIT_PTP_ERR,
++};
++
++enum PARSER_FLAGS {
++	PASER_FLAGS_NO = 0,
++	PASER_FLAGS_END,
++	PASER_FLAGS_CAPWAP,
++	PASER_FLAGS_GRE,
++	PASER_FLAGS_LEN,
++	PASER_FLAGS_GREK,
++	PASER_FLAGS_NN1,
++	PASER_FLAGS_NN2,
++	PASER_FLAGS_ITAG,
++	PASER_FLAGS_1VLAN,
++	PASER_FLAGS_2VLAN,
++	PASER_FLAGS_3VLAN,
++	PASER_FLAGS_4VLAN,
++	PASER_FLAGS_SNAP,
++	PASER_FLAGS_PPPOES,
++	PASER_FLAGS_1IPV4,
++	PASER_FLAGS_1IPV6,
++	PASER_FLAGS_2IPV4,
++	PASER_FLAGS_2IPV6,
++	PASER_FLAGS_ROUTEXP,
++	PASER_FLAGS_TCP,
++	PASER_FLAGS_1UDP,
++	PASER_FLAGS_IGMP,
++	PASER_FLAGS_IPV4OPT,
++	PASER_FLAGS_IPV6EXT,
++	PASER_FLAGS_TCPACK,
++	PASER_FLAGS_IPFRAG,
++	PASER_FLAGS_EAPOL,
++	PASER_FLAGS_2IPV6EXT,
++	PASER_FLAGS_2UDP,
++	PASER_FLAGS_L2TPNEXP,
++	PASER_FLAGS_LROEXP,
++	PASER_FLAGS_L2TP,
++	PASER_FLAGS_GRE_VLAN1,
++	PASER_FLAGS_GRE_VLAN2,
++	PASER_FLAGS_GRE_PPPOE,
++	PASER_FLAGS_BYTE4_BIT4,
++	PASER_FLAGS_BYTE4_BIT5,
++	PASER_FLAGS_BYTE4_BIT6,
++	PASER_FLAGS_BYTE4_BIT7,
++	PASER_FLAGS_BYTE5_BIT0,
++	PASER_FLAGS_BYTE5_BIT1,
++	PASER_FLAGS_BYTE5_BIT2,
++	PASER_FLAGS_BYTE5_BIT3,
++	PASER_FLAGS_BYTE5_BIT4,
++	PASER_FLAGS_BYTE5_BIT5,
++	PASER_FLAGS_BYTE5_BIT6,
++	PASER_FLAGS_BYTE5_BIT7,
++	PASER_FLAGS_BYTE6_BIT0,
++	PASER_FLAGS_BYTE6_BIT1,
++	PASER_FLAGS_BYTE6_BIT2,
++	PASER_FLAGS_BYTE6_BIT3,
++	PASER_FLAGS_BYTE6_BIT4,
++	PASER_FLAGS_BYTE6_BIT5,
++	PASER_FLAGS_BYTE6_BIT6,
++	PASER_FLAGS_BYTE6_BIT7,
++	PASER_FLAGS_BYTE7_BIT0,
++	PASER_FLAGS_BYTE7_BIT1,
++	PASER_FLAGS_BYTE7_BIT2,
++	PASER_FLAGS_BYTE7_BIT3,
++	PASER_FLAGS_BYTE7_BIT4,
++	PASER_FLAGS_BYTE7_BIT5,
++	PASER_FLAGS_BYTE7_BIT6,
++	PASER_FLAGS_BYTE7_BIT7,
++	/* Must be put at the end of the enum */
++	PASER_FLAGS_MAX
++};
++
++/* PMAC port flag */
++enum PORT_FLAG {
++	PORT_FREE = 0,         /* port is free */
++	PORT_ALLOCATED,        /* port is allocated to others, possibly not
++				* registered, eg LRO/CAPWA */
++	PORT_DEV_REGISTERED,   /* dev registered already */
++	PORT_SUBIF_REGISTERED, /* subif registered already */
++	PORT_FLAG_NO_VALID     /* not valid flag */
++};
++
++#define DP_DBG_ENUM_OR_STRING(name, value, short_name) \
++	{                                              \
++		name = value                           \
++	}
++
++enum PMAC_TCP_TYPE {
++	TCP_OVER_IPV4 = 0,
++	UDP_OVER_IPV4,
++	TCP_OVER_IPV6,
++	UDP_OVER_IPV6,
++	TCP_OVER_IPV6_IPV4,
++	UDP_OVER_IPV6_IPV4,
++	TCP_OVER_IPV4_IPV6,
++	UDP_OVER_IPV4_IPV6
++};
++
++enum DP_DBG_FLAG {
++	DP_DBG_FLAG_DBG = BIT(0),
++	DP_DBG_FLAG_DUMP_RX_DATA = BIT(1),
++	DP_DBG_FLAG_DUMP_RX_DESCRIPTOR = BIT(2),
++	DP_DBG_FLAG_DUMP_RX_PASER = BIT(3),
++	DP_DBG_FLAG_DUMP_RX_PMAC = BIT(4),
++	DP_DBG_FLAG_DUMP_RX = (BIT(1) | BIT(2) | BIT(3) | BIT(4)),
++	DP_DBG_FLAG_DUMP_TX_DATA = BIT(5),
++	DP_DBG_FLAG_DUMP_TX_DESCRIPTOR = BIT(6),
++	DP_DBG_FLAG_DUMP_TX_PMAC = BIT(7),
++	DP_DBG_FLAG_DUMP_TX_SUM = BIT(8),
++	DP_DBG_FLAG_DUMP_TX = (BIT(5) | BIT(6) | BIT(7) | BIT(8)),
++	DP_DBG_FLAG_COC = BIT(9),
++	DP_DBG_FLAG_MIB = BIT(10),
++	DP_DBG_FLAG_MIB_ALGO = BIT(11),
++	DP_DBG_FLAG_CBM_BUF = BIT(12),
++	DP_DBG_FLAG_PAE = BIT(13),
++	DP_DBG_FLAG_INST = BIT(14),
++	DP_DBG_FLAG_SWDEV = BIT(15),
++	DP_DBG_FLAG_NOTIFY = BIT(16),
++	DP_DBG_FLAG_LOGIC = BIT(17),
++	DP_DBG_FLAG_GSWIP_API = BIT(18),
++	DP_DBG_FLAG_QOS = BIT(19),
++	DP_DBG_FLAG_QOS_DETAIL = BIT(20),
++	DP_DBG_FLAG_LOOKUP = BIT(21),
++	DP_DBG_FLAG_REG = BIT(22),
++	DP_DBG_FLAG_MAX = BIT(31)
++};
++
++enum {
++	NODE_LINK_ADD = 0,
++	NODE_LINK_GET,
++	NODE_LINK_EN_GET,
++	NODE_LINK_EN_SET,
++	NODE_UNLINK,
++	LINK_ADD,
++	LINK_GET,
++	LINK_PRIO_SET,
++	LINK_PRIO_GET,
++	QUEUE_CFG_SET,
++	QUEUE_CFG_GET,
++	SHAPER_SET,
++	SHAPER_GET,
++	NODE_ALLOC,
++	NODE_FREE,
++	NODE_CHILDREN_FREE,
++	DEQ_PORT_RES_GET,
++	COUNTER_MODE_SET,
++	COUNTER_MODE_GET,
++	QUEUE_MAP_GET,
++	QUEUE_MAP_SET,
++	NODE_CHILDREN_GET,
++	QOS_LEVEL_GET,
++};
++
++/* Driver-mib network counters (AVM include/net/datapath_api.h dp_drv_mib_t). */
++typedef struct dp_drv_mib {
++	u64 rx_drop_pkts;
++	u64 rx_error_pkts;
++	u64 tx_drop_pkts;
++	u64 tx_error_pkts;
++	u64 tx_pkts;
++	u64 tx_bytes;
++} dp_drv_mib_t;
++
++struct dev_mib {
++	atomic_t rx_fn_rxif_pkt;
++	atomic_t rx_fn_txif_pkt;
++	atomic_t rx_fn_dropped;
++	atomic_t tx_cbm_pkt;
++	atomic_t tx_clone_pkt;
++	atomic_t tx_hdr_room_pkt;
++	atomic_t tx_tso_pkt;
++	atomic_t tx_pkt_dropped;
++};
++
++struct logic_dev {
++	struct list_head list;
++	struct net_device *dev;
++	u16 bp;
++	u16 ep;
++	u16 ctp;
++	u32 subif_flag;
++};
++
++/*
++ * Sub-interface (CTP) detail. Note dp_subif_t is forward-declared and used
++ * by pointer only - struct dp_subif_info uses its own fields, not dp_subif_t.
++ */
++struct dp_subif_info {
++	s32 flags;
++	u32 subif : 15;
++	struct net_device *netif;
++	char device_name[IFNAMSIZ];
++	struct dev_mib mib;
++	struct net_device *ctp_dev;
++	u16 bp;
++	u16 fid;
++	struct list_head logic_dev;
++	struct net_device_ops *old_dev_ops;
++	struct net_device_ops new_dev_ops;
++	s16 qid;
++	s16 sched_id;
++	s16 q_node;
++	s16 qos_deq_port;
++	s16 cqm_deq_port;
++	s16 cqm_port_idx;
++	u32 subif_flag;
++};
++
++struct vlan_info {
++	u16 out_proto;
++	u16 out_vid;
++	u16 in_proto;
++	u16 in_vid;
++	int cnt;
++};
++
++enum DP_TEMP_DMA_PMAC {
++	TEMPL_NORMAL = 0,
++	TEMPL_CHECKSUM,
++	TEMPL_OTHERS,
++	MAX_TEMPLATE
++};
++
++enum DP_PRIV_F {
++	DP_PRIV_PER_CTP_QUEUE = BIT(0), /* manage queue per CTP/subif */
++};
++
++/* Datapath registration callback bundle. */
++typedef int32_t (*dp_rx_fn_t)(struct net_device *rxif, struct net_device *txif,
++			      struct sk_buff *skb, int32_t len);
++typedef int32_t (*dp_stop_tx_fn_t)(struct net_device *dev);
++typedef int32_t (*dp_restart_tx_fn_t)(struct net_device *dev);
++typedef int32_t (*dp_reset_mib_fn_t)(dp_subif_t *subif, int32_t flag);
++typedef int32_t (*dp_get_mib_fn_t)(dp_subif_t *subif,
++				   dp_drv_mib_t *mib, int32_t flag);
++typedef int32_t (*dp_get_netif_subifid_fn_t)(struct net_device *netif,
++					     struct sk_buff *skb,
++					     void *subif_data,
++					     uint8_t *dst_mac,
++					     dp_subif_t *subif,
++					     uint32_t flags);
++
++struct dp_cb {
++	dp_rx_fn_t rx_fn;
++	dp_stop_tx_fn_t stop_fn;
++	dp_restart_tx_fn_t restart_fn;
++	dp_get_netif_subifid_fn_t get_subifid_fn;
++	dp_reset_mib_fn_t reset_mib_fn;
++	dp_get_mib_fn_t get_mib_fn;
++	irqreturn_t (*dma_rx_irq)(int irq, void *dev_instance);
++	int (*aca_fw_stop)(void *cfg, int flags);
++};
++
++struct pmac_port_info {
++	enum PORT_FLAG status;
++	int alloc_flags;
++	struct dp_cb cb;
++	struct module *owner;
++	struct net_device *dev;
++	u32 dev_port;
++	u32 num_subif;
++	s32 port_id;
++	struct dp_subif_info subif_info[MAX_SUBIFS];
++	atomic_t tx_err_drop;
++	atomic_t rx_err_drop;
++	struct gsw_itf *itf_info;
++	int ctp_max;
++	u32 vap_offset;
++	u32 vap_mask;
++	u8 cqe_lu_mode;
++
++	u32 flag_other;
++	u32 deq_port_base;
++	u32 deq_port_num;
++	u32 dma_chan;
++	u32 tx_pkt_credit;
++	u32 tx_b_credit;
++	u32 tx_ring_addr;
++	u32 tx_ring_size;
++	u32 tx_ring_offset;
++	u32 num_dma_chan;
++};
++
++struct pmac_port_info2 {
++	struct pmac_tx_hdr pmac_template[MAX_TEMPLATE];
++	struct dma_tx_desc_0 dma0_template[MAX_TEMPLATE];
++	struct dma_tx_desc_0 dma0_mask_template[MAX_TEMPLATE];
++	struct dma_tx_desc_1 dma1_template[MAX_TEMPLATE];
++	struct dma_tx_desc_1 dma1_mask_template[MAX_TEMPLATE];
++};
++
++#define DP_PMAP_PCP_NUM 8
++#define DP_PMAP_DSCP_NUM 64
++
++struct bp_pmapper_dev {
++	int flag;
++	struct net_device *dev;
++	int pcp[DP_PMAP_PCP_NUM];
++	int dscp[DP_PMAP_DSCP_NUM];
++	int def_ctp;
++	int mode;
++	int ref_cnt;
++};
++
++struct q_info {
++	int flag;
++	int need_free;
++	int q_node_id;
++	int ref_cnt;
++	int cqm_dequeue_port;
++};
++
++/*
++ * Note: AVM datapath.h named this struct sched_info. v6.18's <linux/sched.h>
++ * already defines struct sched_info with different semantics (task-scheduler
++ * accounting), so this port renames the datapath variant to dp_sched_info to
++ * avoid a redefinition collision.
++ */
++struct dp_sched_info {
++	int flag;
++	int ref_cnt;
++	int cqm_dequeue_port;
++};
++
++struct dma_chan_info {
++	atomic_t ref_cnt;
++};
++
++struct cqm_port_info {
++	int f_first_qid : 1;
++	u32 ref_cnt;
++	u32 tx_pkt_credit;
++	u32 tx_ring_addr;
++	u32 tx_ring_size;
++	int qos_port;
++	int first_qid;
++	int q_node;
++	int dp_port;
++	u32 dma_chan;
++};
++
++struct parser_info {
++	u8 v;
++	s8 size;
++};
++
++struct subif_platform_data {
++	struct net_device *dev;
++	struct dp_subif_data *subif_data;
++#define TRIGGER_CQE_DP_ENABLE 1
++	int act;
++};
++
++/*
++ * Global state declared by datapath_api.c. The .c definitions must match the
++ * dimensions used here.
++ */
++extern int dp_inst_num;
++extern struct inst_property dp_port_prop[DP_MAX_INST];
++extern struct pmac_port_info dp_port_info[DP_MAX_INST][MAX_DP_PORTS];
++extern struct pmac_port_info2 dp_port_info2[DP_MAX_INST][MAX_DP_PORTS];
++extern struct cqm_port_info dp_deq_port_tbl[DP_MAX_INST][24];
++extern struct dma_chan_info dp_dma_chan_tbl[DP_MAX_INST][4][8][16];
++extern struct device *dp_dev;
++extern struct mutex dp_lock;
++extern int dp_init_ok;
++
++extern struct dma_rx_desc_1 dma_rx_desc_mask1;
++extern struct dma_rx_desc_3 dma_rx_desc_mask3;
++extern struct dma_tx_desc_0 dma_tx_desc_mask0;
++extern struct dma_tx_desc_1 dma_tx_desc_mask1;
++
++int dp_init_module(void);
++void dp_cleanup_module(void);
++int dp_probe(struct platform_device *pdev);
++int register_dp_cap(u32 flag);
++int request_dp(u32 flag);
++int dp_inst_init(void);
++int register_dp_cap_gswip30(int flag);
++int register_dp_hw_cap(struct dp_hw_cap *info, u32 flag);
++
++int dp_inst_add_dev(struct net_device *dev, char *subif_name, int inst,
++		    int port_id, int bp, int subif, u32 flag);
++int dp_inst_del_dev(struct net_device *dev, char *subif_name, int inst,
++		    int port_id, int bp, int subif);
++int dp_get_inst_via_module(struct module *owner, u32 port_id, u32 dev_port);
++int dp_request_inst(struct dp_inst_info *info, u32 flag);
++int dp_inst_insert_mod(struct module *owner, u16 ep, u32 inst, u32 flag);
++
++static inline int dp_local_add_logic_dev(int inst, int port_id,
++					 struct net_device *dev,
++					 dp_subif_t *subif_id, u32 flag)
++{
++	(void)inst;
++	(void)port_id;
++	(void)dev;
++	(void)subif_id;
++	(void)flag;
++	WARN_ONCE(1,
++		  "add_logic_dev: logical device support is not implemented\n");
++	return -1;
++}
++
++extern uint8_t get_lookup_qid_via_index(uint32_t index);
++
++#endif /* DATAPATH_H */
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_api.c b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+new file mode 100644
+index 000000000000..637a79496c22
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+@@ -0,0 +1,904 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) Intel Corporation Author: Shao Guohua <guohua.shao@intel.com>
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * datapath/datapath_api.c and datapath_soc.c.
++ *
++ * Datapath manager: port and sub-interface registration, wiring a netdev to a
++ * CBM datapath port and a GSWIP port.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <linux/mutex.h>
++#include <linux/atomic.h>
++#include <linux/list.h>
++#include <linux/netdevice.h>
++#include <linux/device.h>
++#include <linux/platform_device.h>
++#include <linux/printk.h>
++#include <linux/bug.h>
++
++#include <net/cqm_cbm_api.h>
++#include "datapath.h"
++#include "datapath_api.h"
++#include "../switch-api/gsw_flow_core.h"
++
++/*
++ * Forward declaration for the dispatch helper defined in
++ * ../switch-api/gsw_flow_core.c. The signature mirrors gsw_flow_core.c:122
++ * verbatim.
++ */
++extern struct core_ops *gsw_get_swcore_ops(u32 devid);
++
++/* File-scope globals declared in datapath.h. */
++int dp_inst_num;
++struct inst_property dp_port_prop[DP_MAX_INST];
++struct pmac_port_info dp_port_info[DP_MAX_INST][MAX_DP_PORTS];
++struct pmac_port_info2 dp_port_info2[DP_MAX_INST][MAX_DP_PORTS];
++struct cqm_port_info dp_deq_port_tbl[DP_MAX_INST][24];
++struct dma_chan_info dp_dma_chan_tbl[DP_MAX_INST][4][8][16];
++
++DEFINE_MUTEX(dp_lock);
++struct device *dp_dev;
++int dp_init_ok;
++
++struct dma_rx_desc_1 dma_rx_desc_mask1 = { .all = 0 };
++struct dma_rx_desc_3 dma_rx_desc_mask3 = { .all = 0 };
++struct dma_tx_desc_0 dma_tx_desc_mask0 = { .all = 0 };
++struct dma_tx_desc_1 dma_tx_desc_mask1 = { .all = 0 };
++
++/*
++ * dp_bp_dev_tbl: pmapper bookkeeping array used by dp_register_subif_private
++ * (AVM datapath_api.c:114).
++ */
++struct bp_pmapper_dev dp_bp_dev_tbl[DP_MAX_INST][DP_MAX_BP_NUM];
++
++#ifndef DP_FAILURE
++#define DP_FAILURE (-1)
++#endif
++#ifndef DP_SUCCESS
++#define DP_SUCCESS 0
++#endif
++
++/*
++ * Local fallbacks for DP_F_* flag bits the AVM public API enum defines in
++ * include/net/datapath_api.h. Same approach as datapath_misc.c: byte values
++ * must match AVM to keep the compiled .o ABI-compatible with future
++ * cross-TU callers. #ifndef guards let a future subtask import the AVM
++ * enum first without redefinition diagnostics.
++ */
++#ifndef DP_F_DEREGISTER
++#define DP_F_DEREGISTER			0x00000001
++#endif
++#ifndef DP_F_FAST_ETH_LAN
++#define DP_F_FAST_ETH_LAN		0x00000002
++#endif
++#ifndef DP_F_FAST_DSL
++#define DP_F_FAST_DSL			0x00000010
++#endif
++#ifndef DP_F_DIRECT
++#define DP_F_DIRECT			0x00000020
++#endif
++#ifndef DP_F_SUBIF_LOGICAL
++#define DP_F_SUBIF_LOGICAL		0x00000100
++#endif
++#ifndef DP_F_ALLOC_EXPLICIT_SUBIFID
++#define DP_F_ALLOC_EXPLICIT_SUBIFID	0x00000400
++#endif
++
++#ifndef CBM_PORT_F_DISABLE
++#define CBM_PORT_F_DISABLE		0x8 /* verbatim */
++#endif
++
++#define _DMA_CONTROLLER(nr)	(((nr) >> 24) & 0xFF)
++#define _DMA_PORT(nr)		(((nr) >> 16) & 0xFF)
++#define _DMA_CHANNEL(nr)	((nr) & 0xFFFF)
++
++/*
++ * Minimal type definitions for the public-API structs that AVM keeps in
++ * include/net/datapath_api.h.
++ *
++ * IMPORTANT: each TU that needs these uses its own local definition because
++ * datapath_inst.h only forward-declares the tag. datapath_misc.c carries an
++ * orthogonal local definition of struct dp_subif_data (deq_port_idx only).
++ * Cross-TU passing is by-pointer so the layouts never need to match.
++ */
++struct dp_subif {
++	s32 port_id;
++	int inst;
++	int subif_num;
++	s32 subif;
++};
++
++struct dp_port_data {
++	int flag_ops;
++	u32 resv_num_port;
++	u32 start_port_no;
++	int num_resv_q;
++	int num_resv_sched;
++	int deq_port_base;
++	int enq_num;
++	int deq_num;
++};
++
++struct dp_subif_data {
++	s8 deq_port_idx;
++};
++
++struct dp_pmac_cfg {
++	int dummy;
++};
++
++
++/*
++ * Defining the privates after their callers requires these forward
++ * declarations to resolve compile-time references inside dp_alloc_port_ext /
++ * dp_register_subif_ext.
++ */
++static int dp_alloc_port_private(int inst, struct module *owner,
++				 struct net_device *dev, u32 dev_port,
++				 s32 port_id, dp_pmac_cfg_t *pmac_cfg,
++				 struct dp_port_data *data, u32 flags);
++static int dp_register_subif_private(int inst, struct module *owner,
++				     struct net_device *dev,
++				     char *subif_name, dp_subif_t *subif_id,
++				     struct dp_subif_data *data, u32 flags);
++static int dp_deregister_subif_private(int inst, struct module *owner,
++				       struct net_device *dev,
++				       char *subif_name, dp_subif_t *subif_id,
++				       struct dp_subif_data *data, u32 flags);
++
++int register_dp_cap(u32 flag)
++{
++	return register_dp_cap_gswip30(flag);
++}
++
++/* request_dp - stripped. */
++int request_dp(u32 flag)
++{
++	(void)flag;
++
++	dp_port_prop[0].ops[0] = gsw_get_swcore_ops(0);
++	dp_port_prop[0].ops[1] = gsw_get_swcore_ops(1);
++	dp_port_prop[0].cbm_inst = 0;
++	dp_port_prop[0].qos_inst = 0;
++
++	if (dp_port_prop[0].info.dp_platform_set &&
++	    dp_port_prop[0].info.dp_platform_set(0, DP_PLATFORM_INIT) < 0) {
++		dev_err(dp_dev,
++			"dp-gswip30: request_dp: dp_platform_set failed\n");
++		return -1;
++	}
++	dp_port_prop[0].valid = 1;
++	return 0;
++}
++
++/*
++ * dp_init_module - probe-time entry point B.
++ *
++ * If gsw_get_swcore_ops(0) returns NULL (somehow the refcount gate fired
++ * before gsw_devs[0] was populated), the function returns -ENODEV with
++ * dev_err(NULL, ...) - dev_err tolerates NULL @dev safely in v6.18.
++ */
++int dp_init_module(void)
++{
++	struct core_ops *gsw_ops;
++	ethsw_api_dev_t *pethdev;
++	struct platform_device *pdev;
++	int ret;
++
++	if (dp_init_ok)
++		return 0;
++
++	ret = dp_inst_init();
++	if (ret)
++		return ret;
++
++	gsw_ops = gsw_get_swcore_ops(0);
++	if (!gsw_ops) {
++		dev_err(NULL,
++			"dp-gswip30: dp_init_module: GSW HAL not available\n");
++		return -ENODEV;
++	}
++
++	pethdev = container_of(gsw_ops, ethsw_api_dev_t, ops);
++	pdev = (struct platform_device *)pethdev->pdev;
++	dp_dev = &pdev->dev;
++
++	register_dp_cap(0);
++	if (request_dp(0)) {
++		dev_err(dp_dev,
++			"dp-gswip30: dp_init_module: request_dp failed\n");
++		return -1;
++	}
++
++	dp_init_ok = 1;
++	return 0;
++}
++
++/*
++ * dp_alloc_port - AVM datapath_api.c:788-797 wrapper around
++ * dp_alloc_port_ext with inst=0 (SOC-side).
++ */
++int dp_alloc_port(struct module *owner, struct net_device *dev,
++		  u32 dev_port, u32 port_id,
++		  dp_pmac_cfg_t *pmac_cfg, u32 flags)
++{
++	return dp_alloc_port_ext(0, owner, dev, dev_port, (int)port_id,
++				 pmac_cfg, NULL, flags);
++}
++
++int dp_alloc_port_ext(int inst, struct module *owner,
++		      struct net_device *dev,
++		      u32 dev_port, int port_id,
++		      dp_pmac_cfg_t *pmac_cfg,
++		      struct dp_port_data *data, u32 flags)
++{
++	int res;
++	struct dp_port_data tmp_data = { 0 };
++
++	if (!dp_init_ok) {
++		dev_err(dp_dev,
++			"dp_alloc_port_ext: dp_init_module not yet run, refusing\n");
++		return DP_FAILURE;
++	}
++	if (!dp_port_prop[0].valid) {
++		dev_err(dp_dev, "No Valid datapath instance yet?\n");
++		return DP_FAILURE;
++	}
++	if (!data)
++		data = &tmp_data;
++	DP_LIB_LOCK(&dp_lock);
++	res = dp_alloc_port_private(inst, owner, dev, dev_port,
++				    (s32)port_id, pmac_cfg, data, flags);
++	DP_LIB_UNLOCK(&dp_lock);
++	return res;
++}
++
++static int dp_alloc_port_private(int inst,
++				  struct module *owner,
++				  struct net_device *dev,
++				  u32 dev_port, s32 port_id,
++				  dp_pmac_cfg_t *pmac_cfg,
++				  struct dp_port_data *data,
++				  u32 flags)
++{
++	int i;
++	struct cbm_dp_alloc_data cbm_data = { 0 };
++
++	(void)pmac_cfg; /* dp_pmac_set call excised - see file header */
++
++	if (!owner) {
++		dev_err(dp_dev, "Allocate port failed for owner NULL\n");
++		return DP_FAILURE;
++	}
++
++	if (port_id >= MAX_DP_PORTS || port_id < 0) {
++		DP_DEBUG_ASSERT((port_id >= MAX_DP_PORTS),
++				"port_id(%d) >= MAX_DP_PORTS(%d)", port_id,
++				MAX_DP_PORTS);
++		DP_DEBUG_ASSERT((port_id < 0), "port_id(%d) < 0", port_id);
++		return DP_FAILURE;
++	}
++
++	cbm_data.dp_inst = inst;
++	cbm_data.cbm_inst = dp_port_prop[inst].cbm_inst;
++
++	if (flags & DP_F_DEREGISTER) { /*De-register */
++		if (dp_port_info[inst][port_id].status != PORT_ALLOCATED) {
++			dev_err(dp_dev,
++				"No Deallocate for module %s w/o deregistered\n",
++				owner->name);
++			return DP_FAILURE;
++		}
++		cbm_data.deq_port = dp_port_info[inst][port_id].deq_port_base;
++		cbm_data.dma_chan = dp_port_info[inst][port_id].dma_chan;
++		cbm_dp_port_dealloc(owner, dev_port, port_id,
++				    &cbm_data, flags);
++		dp_inst_insert_mod(owner, port_id, inst, 0);
++		DP_DEBUG(DP_DBG_FLAG_REG, "de-alloc port %d\n", port_id);
++		DP_CB(inst, port_platform_set)
++		(inst, port_id, data, flags);
++		memset(&dp_port_info[inst][port_id], 0,
++		       sizeof(dp_port_info[inst][port_id]));
++		return DP_SUCCESS;
++	}
++	if (port_id) { /*with specified port_id */
++		if (dp_port_info[inst][port_id].status != PORT_FREE) {
++			dev_err(dp_dev,
++				"module %s(dev_port %d) fail: port %d used by %s %d\n",
++				owner->name, dev_port, port_id,
++				dp_port_info[inst][port_id].owner ?
++					dp_port_info[inst][port_id].owner->name :
++					"NULL",
++				dp_port_info[inst][port_id].dev_port);
++			return DP_FAILURE;
++		}
++	}
++	if (cbm_dp_port_alloc(owner, dev, dev_port, port_id,
++			      &cbm_data, flags)) {
++		dev_err(dp_dev,
++			"cbm_dp_port_alloc fail for %s/dev_port %d: %d\n",
++			owner->name, dev_port, port_id);
++		return DP_FAILURE;
++	} else if (!(cbm_data.flags & CBM_PORT_DP_SET) &&
++		   !(cbm_data.flags & CBM_PORT_DQ_SET)) {
++		dev_err(dp_dev,
++			"cbm_dp_port_alloc NO DP_SET/DQ_SET(%x):%s/dev_port %d\n",
++			cbm_data.flags, owner->name, dev_port);
++		return DP_FAILURE;
++	}
++	port_id = cbm_data.dp_port;
++	memset(&dp_port_info[inst][port_id], 0,
++	       sizeof(dp_port_info[inst][port_id]));
++	/*save info from caller */
++	dp_port_info[inst][port_id].owner = owner;
++	dp_port_info[inst][port_id].dev = dev;
++	dp_port_info[inst][port_id].dev_port = dev_port;
++	dp_port_info[inst][port_id].alloc_flags = flags;
++	dp_port_info[inst][port_id].status = PORT_ALLOCATED;
++	/*save info from cbm_dp_port_alloc*/
++	dp_port_info[inst][port_id].flag_other = cbm_data.flags;
++	dp_port_info[inst][port_id].port_id = cbm_data.dp_port;
++	dp_port_info[inst][port_id].deq_port_base = cbm_data.deq_port;
++	dp_port_info[inst][port_id].deq_port_num = cbm_data.deq_port_num;
++	dp_port_info[inst][port_id].num_dma_chan = cbm_data.num_dma_chan;
++	/*save info to port data*/
++	data->deq_port_base = dp_port_info[inst][port_id].deq_port_base;
++	data->deq_num = dp_port_info[inst][port_id].deq_port_num;
++	DP_DEBUG(DP_DBG_FLAG_REG,
++		 "cbm alloc dp_port:%d deq:%d deq_num:%d\n",
++		 cbm_data.dp_port, cbm_data.deq_port, cbm_data.deq_port_num);
++	if (cbm_data.flags & CBM_PORT_DMA_CHAN_SET)
++		dp_port_info[inst][port_id].dma_chan = cbm_data.dma_chan;
++	if (cbm_data.flags & CBM_PORT_PKT_CRDT_SET)
++		dp_port_info[inst][port_id].tx_pkt_credit =
++			cbm_data.tx_pkt_credit;
++	if (cbm_data.flags & CBM_PORT_BYTE_CRDT_SET)
++		dp_port_info[inst][port_id].tx_b_credit = cbm_data.tx_b_credit;
++	if (cbm_data.flags & CBM_PORT_RING_ADDR_SET)
++		dp_port_info[inst][port_id].tx_ring_addr =
++			cbm_data.tx_ring_addr;
++	if (cbm_data.flags & CBM_PORT_RING_SIZE_SET)
++		dp_port_info[inst][port_id].tx_ring_size =
++			cbm_data.tx_ring_size;
++	if (cbm_data.flags & CBM_PORT_RING_OFFSET_SET)
++		dp_port_info[inst][port_id].tx_ring_offset =
++			cbm_data.tx_ring_offset;
++
++	DP_DEBUG(DP_DBG_FLAG_DBG, "cid=%d pid=%d nid=%d\n",
++		 _DMA_CONTROLLER(cbm_data.dma_chan),
++		 _DMA_PORT(cbm_data.dma_chan),
++		 _DMA_CHANNEL(cbm_data.dma_chan));
++
++	if ((cbm_data.num_dma_chan) && (cbm_data.num_dma_chan >
++					cbm_data.deq_port_num)) {
++		dev_err(dp_dev,
++			"ERROR: deq_port_num=%d not equal to num_dma_chan=%d\n",
++			cbm_data.deq_port_num, cbm_data.num_dma_chan);
++		return DP_FAILURE;
++	}
++
++	if (dp_port_prop[inst].info.port_platform_set(inst, port_id,
++						      data, flags)) {
++		dev_err(dp_dev,
++			"Failed port_platform_set for port_id=%d(%s)\n",
++			port_id, owner ? owner->name : "");
++		cbm_dp_port_dealloc(owner, dev_port, port_id,
++				    &cbm_data,
++				    flags | DP_F_DEREGISTER);
++		memset(&dp_port_info[inst][port_id], 0,
++		       sizeof(dp_port_info[inst][port_id]));
++		return DP_FAILURE;
++	}
++	/*only 1st dp instance support real CPU path traffic */
++	if (!inst && dp_port_prop[inst].info.init_dma_pmac_template)
++		dp_port_prop[inst].info.init_dma_pmac_template(port_id, flags);
++	for (i = 0; i < MAX_SUBIFS; i++)
++		INIT_LIST_HEAD(&dp_port_info[inst][port_id].subif_info[i].logic_dev);
++	dp_inst_insert_mod(owner, port_id, inst, 0);
++
++	DP_DEBUG(DP_DBG_FLAG_REG,
++		 "Port %d allocation succeed for module %s with dev_port %d\n",
++		 port_id, owner->name, dev_port);
++	return port_id;
++}
++
++/*
++ * dp_register_subif - AVM datapath_api.c:1053-1085 thin wrapper around
++ * dp_register_subif_ext. Resolves inst via dp_get_inst_via_module before
++ * dispatch.
++ */
++int dp_register_subif(struct module *owner, struct net_device *dev,
++		      char *subif_name, dp_subif_t *subif_id, u32 flags)
++{
++	int inst;
++	struct dp_subif_data data = { 0 };
++
++	if ((!subif_id) || (!subif_id->port_id) || (!owner) ||
++	    (subif_id->port_id >= MAX_DP_PORTS) ||
++	    (subif_id->port_id <= 0)) {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "register subif fail port_id or owner invalid\n");
++		return DP_FAILURE;
++	}
++	inst = dp_get_inst_via_module(owner, (u32)subif_id->port_id, 0);
++	if (inst < 0) {
++		dev_err(dp_dev, "wrong inst for owner=%s with ep=%d\n",
++			owner->name, subif_id->port_id);
++		return DP_FAILURE;
++	}
++	return dp_register_subif_ext(inst, owner, dev, subif_name,
++				     subif_id, &data, flags);
++}
++
++/* dp_register_subif_ext - AVM datapath_api.c:963-1051. */
++int dp_register_subif_ext(int inst, struct module *owner,
++			  struct net_device *dev,
++			  char *subif_name, dp_subif_t *subif_id,
++			  /*device related info*/
++			  struct dp_subif_data *data, u32 flags)
++{
++	int res = DP_FAILURE;
++	int port_id;
++	struct pmac_port_info *port_info;
++	struct dp_subif_data tmp_data = { 0 };
++
++	if (!dp_init_ok) {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "dp_register_subif fail for datapath not init yet\n");
++		return DP_FAILURE;
++	}
++	DP_DEBUG(DP_DBG_FLAG_REG,
++		 "%s:owner=%s dev=%s subif_name=%s port_id=%d subif=%d\n",
++		 (flags & DP_F_DEREGISTER) ?
++			 "unregister subif:" :
++			 "register subif",
++		 owner ? owner->name : "NULL",
++		 dev ? dev->name : "NULL",
++		 subif_name,
++		 subif_id ? subif_id->port_id : -1,
++		 subif_id ? subif_id->subif : -1);
++
++	if ((!subif_id) || (!subif_id->port_id) || (!owner) ||
++	    (subif_id->port_id >= MAX_DP_PORTS) ||
++	    (subif_id->port_id <= 0) ||
++	    ((inst < 0) || (inst >= DP_MAX_INST))) {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "register subif failed port_id or owner invalid\n");
++		return DP_FAILURE;
++	}
++	port_id = subif_id->port_id;
++	port_info = &dp_port_info[inst][port_id];
++
++	if (((!dev) && !(port_info->alloc_flags & DP_F_FAST_DSL)) ||
++	    !subif_name) {
++		DP_DEBUG(DP_DBG_FLAG_REG, "Wrong dev=%p, subif_name=%p\n",
++			 dev, subif_name);
++		return DP_FAILURE;
++	}
++	if (!data)
++		data = &tmp_data;
++	DP_LIB_LOCK(&dp_lock);
++	if (port_info->owner != owner) {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "Unregister subif fail:Not matching owner\n");
++		DP_LIB_UNLOCK(&dp_lock);
++		return res;
++	}
++
++	if (flags & DP_F_DEREGISTER) {
++		res = dp_deregister_subif_private(inst, owner, dev,
++						  subif_name,
++						  subif_id, data, flags);
++	} else {
++		res = dp_register_subif_private(inst, owner, dev,
++						subif_name,
++						subif_id, data, flags);
++	}
++	DP_LIB_UNLOCK(&dp_lock);
++	return res;
++}
++
++static int dp_register_subif_private(int inst, struct module *owner,
++				     struct net_device *dev,
++				     char *subif_name, dp_subif_t *subif_id,
++				     /*device related info*/
++				     struct dp_subif_data *data, u32 flags)
++{
++	int res = DP_FAILURE;
++
++	int i, port_id, start, end;
++	struct pmac_port_info *port_info;
++	struct cbm_dp_en_data cbm_data = { 0 };
++	struct subif_platform_data platfrm_data = { 0 };
++
++	port_id = subif_id->port_id;
++	port_info = &dp_port_info[inst][port_id];
++	subif_id->inst = inst;
++	subif_id->subif_num = 1;
++	platfrm_data.subif_data = (void *)data;
++	platfrm_data.dev = dev;
++	/*
++	 * TODO(phase-3-dp-register-dev): port AVM dp_register_dev /
++	 * dp_register_dev_ext from datapath_api.c:866-961 in a future
++	 * subtask. Until then, dp_register_subif accepts PORT_ALLOCATED
++	 * status as an entry condition (loosened from AVM line 506:
++	 * status < PORT_DEV_REGISTERED).
++	 */
++	if (port_info->status < PORT_ALLOCATED) {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "register subif failed:%s is not a registered dev!\n",
++			 subif_name);
++		return res;
++	}
++
++	if (subif_id->subif < 0) { /*dynamic mode */
++		if (flags & DP_F_SUBIF_LOGICAL) {
++			if (!(DP_CB(inst, supported_logic_dev)(inst, dev,
++							       subif_name))) {
++				DP_DEBUG(DP_DBG_FLAG_REG,
++					 "reg subif fail:%s not support dev\n",
++					 subif_name);
++				return res;
++			}
++			if (!(flags & DP_F_ALLOC_EXPLICIT_SUBIFID)) {
++				/*Share same subif with its base device */
++				res = dp_local_add_logic_dev(inst, port_id, dev,
++							     subif_id, flags);
++				return res;
++			}
++		}
++		start = 0;
++		end = port_info->ctp_max;
++	} else {
++		/*caller provided subif. Try to get its vap value as start */
++		start = GET_VAP(subif_id->subif, port_info->vap_offset,
++				port_info->vap_mask);
++		end = start + 1;
++	}
++
++	/*allocate a free subif */
++	for (i = start; i < end; i++) {
++		u32 cqm_deq_port;
++		u32 dma_chan;
++		u32 cid, pid, nid;
++		struct dma_chan_info *dp_dma_chan_tbl_info = NULL;
++
++		if (port_info->subif_info[i].flags) /*used already & not free*/
++			continue;
++
++		/*now find a free subif or valid subif
++		 *need to do configuration HW
++		 */
++		if (port_info->status) {
++			if (dp_port_prop[inst].info.subif_platform_set(inst,
++								       port_id,
++								       i,
++								       &platfrm_data,
++								       flags)) {
++				dev_err(dp_dev, "subif_platform_set fail\n");
++				goto EXIT;
++			} else {
++				DP_DEBUG(DP_DBG_FLAG_REG,
++					 "subif_platform_set succeed\n");
++			}
++		} else {
++			dev_err(dp_dev, "port info status fail for 0\n");
++			return res;
++		}
++
++		cqm_deq_port = port_info->subif_info[i].cqm_deq_port;
++		dma_chan = dp_deq_port_tbl[inst][cqm_deq_port].dma_chan;
++		cid = _DMA_CONTROLLER(dma_chan);
++		pid = _DMA_PORT(dma_chan);
++		nid = _DMA_CHANNEL(dma_chan);
++		/* cid, pid and nid bounds match the dp_dma_chan_tbl shape
++		 * declared in datapath.h ([4][8][16]).
++		 */
++		if ((cid >= DP_DMAMAX) || (pid >= DP_MAX_DMA_PORT) ||
++		    nid >= DP_MAX_DMA_CHAN) {
++			dev_err(dp_dev, "ERROR: cid=%d pid=%d nid=%d\n",
++				cid, pid, nid);
++			dev_err(dp_dev,
++				"DMAMAX=%d MAX_DMA_PORT=%d MAX_DMA_CHAN=%d\n",
++				DP_DMAMAX, DP_MAX_DMA_PORT, DP_MAX_DMA_CHAN);
++			return DP_FAILURE;
++		}
++
++		DP_DEBUG(DP_DBG_FLAG_REG, "cid=%d pid=%d nid=%d\n",
++			 cid, pid, nid);
++		dp_dma_chan_tbl_info = &dp_dma_chan_tbl[inst][cid][pid][nid];
++		(void)dp_dma_chan_tbl_info;
++
++		port_info->subif_info[i].flags = 1;
++		port_info->subif_info[i].netif = dev;
++		port_info->port_id = port_id;
++
++		if (subif_id->subif < 0) /*dynamic:shift bits as HW defined*/
++			port_info->subif_info[i].subif =
++				SET_VAP(i, port_info->vap_offset,
++					port_info->vap_mask);
++		else /*provided by caller since it is alerady shifted properly*/
++			port_info->subif_info[i].subif = subif_id->subif;
++		strncpy(port_info->subif_info[i].device_name,
++			subif_name,
++			sizeof(port_info->subif_info[i].device_name) - 1);
++		port_info->subif_info[i].flags = PORT_SUBIF_REGISTERED;
++		port_info->subif_info[i].subif_flag = flags;
++		port_info->status = PORT_SUBIF_REGISTERED;
++		subif_id->port_id = port_id;
++		subif_id->subif = port_info->subif_info[i].subif;
++		port_info->num_subif++;
++		if ((port_info->num_subif == 1) ||
++		    (platfrm_data.act & TRIGGER_CQE_DP_ENABLE)) {
++			cbm_data.dp_inst = inst;
++			cbm_data.num_dma_chan = port_info->num_dma_chan;
++			cbm_data.cbm_inst = dp_port_prop[inst].cbm_inst;
++			cbm_data.deq_port = port_info->deq_port_base +
++					    (data ? data->deq_port_idx : 0);
++			if ((cbm_data.deq_port == 0) ||
++			    (cbm_data.deq_port >= DP_MAX_CQM_DEQ)) {
++				dev_err(dp_dev, "Wrong deq_port: %d\n",
++					cbm_data.deq_port);
++				return res;
++			}
++			/* PPA Directpath/LitePath don't have DMA CH */
++			if ((atomic_read(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt) == 1) &&
++			    !(port_info->alloc_flags & DP_F_DIRECT) &&
++			    (cbm_data.num_dma_chan))
++				cbm_data.dma_chnl_init = 1; /*to enable DMA*/
++			DP_DEBUG(DP_DBG_FLAG_REG,
++				 "cbm_dp_enable: dp_port=%d deq_port=%d dma_chnl_init=%d ref=%d\n",
++				 port_id, cbm_data.deq_port,
++				 cbm_data.dma_chnl_init,
++				 atomic_read(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt));
++			if (cbm_dp_enable(owner, port_id, &cbm_data, 0,
++					  port_info->alloc_flags)) {
++				DP_DEBUG(DP_DBG_FLAG_REG,
++					 "cbm_dp_enable fail\n");
++				return res;
++			}
++			DP_DEBUG(DP_DBG_FLAG_REG, "cbm_dp_enable ok\n");
++		} else {
++			DP_DEBUG(DP_DBG_FLAG_REG,
++				 "No need cbm_dp_enable:dp_port=%d subix=%d\n",
++				 port_id, i);
++		}
++		break;
++	}
++
++	if (i < end) {
++		res = DP_SUCCESS;
++		if (dp_bp_dev_tbl[inst][port_info->subif_info[i].bp].ref_cnt > 1)
++			return res;
++		dp_inst_add_dev(dev, subif_name,
++				subif_id->inst, subif_id->port_id,
++				port_info->subif_info[i].bp,
++				subif_id->subif, flags);
++	} else {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "register subif failed for no matched vap\n");
++	}
++EXIT:
++	return res;
++}
++
++/*
++ * AVM datapath_api.c:664-781.
++ *
++ * AVM dependencies stripped or substituted: - del_logic_dev: AVM logic-dev
++ * path (AVM:708) calls del_logic_dev to unwind add_logic_dev's bookkeeping.
++ * Documented inline. dp_node_children_free: AVM:742 walks PPv4-managed queue
++ * children associated with the deq_port.
++ */
++static int dp_deregister_subif_private(int inst, struct module *owner,
++				       struct net_device *dev,
++				       char *subif_name, dp_subif_t *subif_id,
++				       struct dp_subif_data *data, u32 flags)
++{
++	int res = DP_FAILURE;
++	int i, port_id, cqm_port, bp;
++	u8 find = 0;
++	struct pmac_port_info *port_info;
++	struct cbm_dp_en_data cbm_data = { 0 };
++	struct subif_platform_data platfrm_data = { 0 };
++
++	port_id = subif_id->port_id;
++	port_info = &dp_port_info[inst][port_id];
++	platfrm_data.subif_data = data;
++	platfrm_data.dev = dev;
++
++	DP_DEBUG(DP_DBG_FLAG_REG,
++		 "Try to unregister subif=%s with dp_port=%d subif=%d\n",
++		 subif_name, subif_id->port_id, subif_id->subif);
++
++	/* (1) AVM:686 — only deregister fully-registered subifs. */
++	if (port_info->status != PORT_SUBIF_REGISTERED) {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "Unregister failed:%s not registered subif!\n",
++			 subif_name);
++		return res;
++	}
++
++	/* (2) AVM:693 — find the matching subif slot. */
++	for (i = 0; i < port_info->ctp_max; i++) {
++		if (port_info->subif_info[i].subif ==
++		    (u32)subif_id->subif) {
++			find = 1;
++			break;
++		}
++	}
++	if (!find)
++		return res;
++
++	DP_DEBUG(DP_DBG_FLAG_REG,
++		 "Found matched subif: port_id=%d subif=%x vap=%d\n",
++		 subif_id->port_id, subif_id->subif, i);
++
++	/* (3) AVM:706 — device-match guard. */
++	if (port_info->subif_info[i].netif != dev) {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "Unregister fail: dev mismatch (subif %s, expected dev %p, got %p)\n",
++			 subif_name, port_info->subif_info[i].netif, dev);
++		return res;
++	}
++	if (!list_empty(&port_info->subif_info[i].logic_dev)) {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "Unregister fail: logic_dev of %s not empty yet!\n",
++			 subif_name);
++		return res;
++	}
++
++	cqm_port = port_info->subif_info[i].cqm_deq_port;
++	bp = port_info->subif_info[i].bp;
++
++	/* (4) AVM:720-724 — reset per-subif mib / flags / device_name. */
++	memset(&port_info->subif_info[i].mib, 0,
++	       sizeof(port_info->subif_info[i].mib));
++	port_info->subif_info[i].flags = 0;
++	port_info->num_subif--;
++
++	/* (5) AVM:725-730 — subif_platform_set unprograms CTP / BridgePort
++	 * / PCE_QUEUE_MAP. Continue on failure (matches AVM's commented-out
++	 * `return res;` at AVM:729 — AVM intentionally falls through so the
++	 * remaining teardown still runs).
++	 */
++	if (dp_port_prop[inst].info.subif_platform_set(inst, port_id, i,
++						       &platfrm_data, flags)) {
++		dev_err(dp_dev, "subif_platform_set fail on deregister\n");
++		/* fall through per AVM:729 commented-out return */
++	}
++
++	/*
++	 * (6) Symmetric inverse of dp_register_subif_private's PORT_ALLOCATED
++	 * -> PORT_SUBIF_REGISTERED transition. Dropping back to
++	 * PORT_ALLOCATED here closes the state-machine loop so
++	 * dp_dealloc_port_ext's DEREGISTER branch (which requires status ==
++	 * PORT_ALLOCATED at dp_alloc_port_private's guard) passes.
++	 */
++	if (!port_info->num_subif)
++		port_info->status = PORT_ALLOCATED;
++
++	if (!dp_deq_port_tbl[inst][cqm_port].ref_cnt) {
++		cbm_data.dp_inst = inst;
++		cbm_data.cbm_inst = dp_port_prop[inst].cbm_inst;
++		cbm_data.deq_port = cqm_port;
++		/* PPA Directpath/LitePath don't have DMA CH */
++		if (!(port_info->alloc_flags & DP_F_DIRECT))
++			cbm_data.dma_chnl_init = 1; /* to disable DMA */
++		if (cbm_dp_enable(owner, port_id, &cbm_data,
++				  CBM_PORT_F_DISABLE,
++				  port_info->alloc_flags)) {
++			DP_DEBUG(DP_DBG_FLAG_REG,
++				 "cbm_dp_disable fail:port=%d subix=%d dma_chnl_init=%d\n",
++				 port_id, i, cbm_data.dma_chnl_init);
++			return res;
++		}
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "cbm_dp_disable ok:port=%d subix=%d cqm_port=%d\n",
++			 port_id, i, cqm_port);
++	}
++
++	/* (8) AVM:768-774 — remove the device from the per-instance table
++	 * when the bp ref drops to zero.
++	 */
++	if (!dp_bp_dev_tbl[inst][bp].dev) {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "dp_inst_del_dev for %s inst=%d bp=%d\n",
++			 dev ? dev->name : "(null)", inst, bp);
++		dp_inst_del_dev(dev, subif_name, inst, port_id,
++				bp, subif_id->subif);
++	}
++
++	DP_DEBUG(DP_DBG_FLAG_REG, "  dp_port=%d subif=%d cqm_port=%d\n",
++		 subif_id->port_id, subif_id->subif, cqm_port);
++	res = DP_SUCCESS;
++	return res;
++}
++
++/*
++ * AVM does NOT carry a separate dp_dealloc_port_ext function — AVM uses
++ * dp_alloc_port_ext with the DP_F_DEREGISTER flag bit to drive the dealloc
++ * path inside dp_alloc_port_private (which already carries the `if (flags &
++ * DP_F_DEREGISTER)` branch).
++ *
++ * (b) Per-call-site safety: passing DP_F_DEREGISTER through every
++ * teardown-path call site invites a typo bug (a missing DP_F_DEREGISTER turns
++ * dealloc into alloc). Wrapping the flag-set inside the function eliminates
++ * that footgun class.
++ *
++ * Returns DP_SUCCESS / DP_FAILURE per the same convention as
++ * dp_alloc_port_ext — DP_F_DEREGISTER's branch inside
++ * dp_alloc_port_private returns DP_SUCCESS on the happy path
++ * (datapath_api.c body documented above) and DP_FAILURE on any
++ * intermediate error.
++ *
++ * The function exists at file scope (NOT static) because intel_xrx500.c
++ * in the sibling intel-xrx500-gswip composite calls it from ndo_stop.
++ * Exported in the DATAPATH_INTERNAL namespace alongside dp_alloc_port_ext.
++ */
++int dp_dealloc_port_ext(int inst, struct module *owner,
++			struct net_device *dev,
++			u32 dev_port, int port_id,
++			dp_pmac_cfg_t *pmac_cfg,
++			struct dp_port_data *data, u32 flags)
++{
++	/*
++	 * Route through dp_alloc_port_ext with DP_F_DEREGISTER OR'd into
++	 * flags. dp_alloc_port_ext acquires DP_LIB_LOCK(&dp_lock), validates
++	 * dp_init_ok, then dispatches into dp_alloc_port_private whose
++	 * `if (flags & DP_F_DEREGISTER)` branch frees the per-port state.
++	 *
++	 *   (1) Guard: requires `dp_port_info[inst][port_id].status ==
++	 *       PORT_ALLOCATED`. dp_deregister_subif_private's step (6) is
++	 *       responsible for dropping status back to PORT_ALLOCATED so
++	 *       this guard passes; without that transition this function
++	 *       returns DP_FAILURE on every call.
++	 *   (2) cbm_dp_port_dealloc(owner, dev_port, port_id,
++	 *       &cbm_data, flags) — release CBM-side port resources.
++	 *   (3) dp_inst_insert_mod(owner, port_id, inst, 0) — clear the
++	 *       per-port instance mapping.
++	 *   (4) DP_CB(inst, port_platform_set)(inst, port_id, data, flags)
++	 *       with DP_F_DEREGISTER set — unprogram per-port HW state.
++	 *   (5) memset(&dp_port_info[inst][port_id], 0, ...) — zero the
++	 *       per-port bookkeeping (status -> PORT_FREE, owner -> NULL,
++	 *       dev -> NULL, etc.) so a future dp_alloc_port_ext can rebind
++	 *       the port.
++	 *
++	 * COUPLING CONTRACT: any future widening of dp_alloc_port_private's
++	 * non-DEREGISTER branch that affects shared state (the
++	 * dp_dma_chan_tbl entries, dp_deq_port_tbl ref_cnts, etc.) MUST be
++	 * matched by a corresponding undo in the DEREGISTER branch or
++	 * dp_dealloc_port_ext will silently leak state across ndo_stop ->
++	 * ndo_open cycles. The current AVM-faithful body covers the five
++	 * steps above and is correct.
++	 *
++	 * Several parameters of dp_dealloc_port_ext are no-ops in the
++	 * DEREGISTER path: @pmac_cfg is not consulted (line-excised
++	 * dp_pmac_set), @dev_port is only used inside cbm_dp_port_dealloc's
++	 * tracing, @dev is unused.
++	 */
++	return dp_alloc_port_ext(inst, owner, dev, dev_port, port_id,
++				 pmac_cfg, data, flags | DP_F_DEREGISTER);
++}
++
++/*
++ * The private wrappers (dp_alloc_port_private, dp_register_subif_private),
++ * the probe-time entry (dp_init_module), and the cap/instance helpers
++ * (register_dp_cap, request_dp) are intra-module callers only and are NOT
++ * exported.
++ *
++ * The deregister-side private body (dp_deregister_subif_private) is NOT
++ * exported: it is reached only via dp_register_subif_ext's DP_F_DEREGISTER
++ * dispatch (which IS exported).
++ */
++EXPORT_SYMBOL_NS_GPL(dp_alloc_port, "DATAPATH_INTERNAL");
++EXPORT_SYMBOL_NS_GPL(dp_alloc_port_ext, "DATAPATH_INTERNAL");
++EXPORT_SYMBOL_NS_GPL(dp_dealloc_port_ext, "DATAPATH_INTERNAL");
++EXPORT_SYMBOL_NS_GPL(dp_register_subif, "DATAPATH_INTERNAL");
++EXPORT_SYMBOL_NS_GPL(dp_register_subif_ext, "DATAPATH_INTERNAL");
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_api.h b/drivers/net/ethernet/lantiq/datapath/datapath_api.h
+new file mode 100644
+index 000000000000..8ffddda3b8fd
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_api.h
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) 2026 Grische <github@grische.xyz>
++ *
++ * Public datapath API types and entry points.
++ */
++
++#ifndef DATAPATH_API_PRIV_H
++#define DATAPATH_API_PRIV_H
++
++#include <linux/types.h>
++#include <linux/netdevice.h>
++#include <linux/module.h>
++
++#include "datapath_api_qos.h"
++#include "datapath_api_gswip30.h"
++
++/*
++ * Bare-minimum forward declarations of types consumed by the four prototypes
++ * below. Forward decls are sufficient here because every reference is by
++ * pointer.
++ */
++struct dp_subif;
++typedef struct dp_subif dp_subif_t;
++struct dp_port_data;
++struct dp_subif_data;
++struct dp_dev_data;
++struct cbm_dp_en_data;
++struct dp_pmac_cfg;
++typedef struct dp_pmac_cfg dp_pmac_cfg_t;
++
++/* dp_alloc_port - allocate a datapath/PMAC port for a netdev module. */
++int dp_alloc_port(struct module *owner, struct net_device *dev,
++		  u32 dev_port, u32 port_id,
++		  dp_pmac_cfg_t *pmac_cfg, u32 flags);
++
++/* dp_alloc_port_ext - explicit-instance variant of dp_alloc_port. */
++int dp_alloc_port_ext(int inst, struct module *owner, struct net_device *dev,
++		      u32 dev_port, int port_id, dp_pmac_cfg_t *pmac_cfg,
++		      struct dp_port_data *data, u32 flags);
++
++/*
++ * Frees the per-port state allocated by dp_alloc_port_private and clears
++ * the dp_port_info[][port_id] slot back to PORT_FREE. Internally routes
++ * through dp_alloc_port_ext with DP_F_DEREGISTER OR'd into @flags so the
++ * locking and state-machine invariants match the alloc-side path exactly.
++ *
++ * Returns DP_SUCCESS on success, DP_FAILURE on any intermediate error
++ * (same convention as dp_alloc_port_ext — NOT 0 / -errno).
++ */
++int dp_dealloc_port_ext(int inst, struct module *owner, struct net_device *dev,
++			u32 dev_port, int port_id, dp_pmac_cfg_t *pmac_cfg,
++			struct dp_port_data *data, u32 flags);
++
++/*
++ * dp_register_subif - register a sub-interface (CTP) under an allocated DP
++ * port.
++ */
++int dp_register_subif(struct module *owner, struct net_device *dev,
++		      char *subif_name, dp_subif_t *subif_id, u32 flags);
++
++/*
++ * dp_register_subif_ext - explicit-instance variant of dp_register_subif.
++ */
++int dp_register_subif_ext(int inst, struct module *owner,
++			  struct net_device *dev, char *subif_name,
++			  dp_subif_t *subif_id, struct dp_subif_data *data,
++			  u32 flags);
++
++#endif /* DATAPATH_API_PRIV_H */
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_api_gswip30.h b/drivers/net/ethernet/lantiq/datapath/datapath_api_gswip30.h
+new file mode 100644
+index 000000000000..d4b664ae4e5e
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_api_gswip30.h
+@@ -0,0 +1,428 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) Intel Corporation Author: Shao Guohua <guohua.shao@intel.com>
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * include/net/datapath_api_gswip30.h.
++ *
++ * GSWIP-3.0 datapath capability structures.
++ */
++
++#ifndef DATAPATH_API_GRX500_H
++#define DATAPATH_API_GRX500_H
++
++#include <linux/types.h>
++
++#ifdef CONFIG_LITTLE_ENDIAN
++struct dma_rx_desc_0 {
++	/* DWORD 0 */
++	union {
++		struct {
++			u32 dest_sub_if_id : 15;
++			u32 eth_type : 2;
++			u32 flow_id : 8;
++			u32 tunnel_id : 4;
++			u32 resv0 : 3;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_rx_desc_1 {
++	/* DWORD 1 */
++	union {
++		struct {
++			u32 classid : 4;
++			u32 resv1 : 4;
++			u32 ep : 4;
++			u32 color : 2;
++			u32 mpe1 : 1;
++			u32 mpe2 : 1;
++			u32 enc : 1;
++			u32 dec : 1;
++			u32 nat : 1;
++			u32 tcp_err : 1;
++			u32 session_id : 12;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_rx_desc_2 {
++	/* DWORD 2 */
++	union {
++		struct {
++			u32 data_ptr;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_rx_desc_3 {
++	/* DWORD 3 */
++	union {
++		struct {
++			u32 data_len : 16;
++			u32 mpoa_mode : 2;
++			u32 mpoa_pt : 1;
++			u32 qid : 4;
++			u32 byte_offset : 3;
++			u32 pdu_type : 1;
++			u32 dic : 1;
++			u32 eop : 1;
++			u32 sop : 1;
++			u32 c : 1;
++			u32 own : 1;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_tx_desc_0 {
++	/* DWORD 0 */
++	union {
++		struct {
++			u32 dest_sub_if_id : 15;
++			u32 eth_type : 2;
++			u32 flow_id : 8;
++			u32 tunnel_id : 4;
++			u32 resv0 : 3;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_tx_desc_1 {
++	/* DWORD 1 */
++	union {
++		struct {
++			u32 classid : 4;
++			u32 resv1 : 4;
++			u32 ep : 4;
++			u32 color : 2;
++			u32 mpe1 : 1;
++			u32 mpe2 : 1;
++			u32 enc : 1;
++			u32 dec : 1;
++			u32 nat : 1;
++			u32 tcp_err : 1;
++			u32 session_id : 12;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_tx_desc_2 {
++	/* DWORD 2 */
++	union {
++		struct {
++			u32 data_ptr;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_tx_desc_3 {
++	/* DWORD 3 */
++	union {
++		struct {
++			u32 data_len : 16;
++			u32 mpoa_mode : 2;
++			u32 mpoa_pt : 1;
++			u32 qid : 4;
++			u32 byte_offset : 3;
++			u32 pdu_type : 1;
++			u32 dic : 1;
++			u32 eop : 1;
++			u32 sop : 1;
++			u32 c : 1;
++			u32 own : 1;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++#else /* big endian */
++
++struct dma_rx_desc_0 {
++	/* DWORD 0 */
++	union {
++		struct {
++			u32 resv0 : 3;
++			u32 tunnel_id : 4;
++			u32 flow_id : 8;
++			u32 eth_type : 2;
++			u32 dest_sub_if_id : 15;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_rx_desc_1 {
++	/* DWORD 1 */
++	union {
++		struct {
++			u32 session_id : 12;
++			u32 tcp_err : 1;
++			u32 nat : 1;
++			u32 dec : 1;
++			u32 enc : 1;
++			u32 mpe2 : 1;
++			u32 mpe1 : 1;
++			u32 color : 2;
++			u32 ep : 4;
++			u32 resv1 : 4;
++			u32 classid : 4;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_rx_desc_2 {
++	/* DWORD 2 */
++	union {
++		struct {
++			u32 data_ptr;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_rx_desc_3 {
++	/* DWORD 3 */
++	union {
++		struct {
++			u32 own : 1;
++			u32 c : 1;
++			u32 sop : 1;
++			u32 eop : 1;
++			u32 dic : 1;
++			u32 pdu_type : 1;
++			u32 byte_offset : 3;
++			u32 qid : 4;
++			u32 mpoa_pt : 1;
++			u32 mpoa_mode : 2;
++			u32 data_len : 16;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_tx_desc_0 {
++	union {
++		struct {
++			/* DWORD 0 */
++			u32 resv0 : 3;
++			u32 tunnel_id : 4;
++			u32 flow_id : 8;
++			u32 eth_type : 2;
++			u32 dest_sub_if_id : 15;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_tx_desc_1 {
++	/* DWORD 1 */
++	union {
++		struct {
++			u32 session_id : 12;
++			u32 tcp_err : 1;
++			u32 nat : 1;
++			u32 dec : 1;
++			u32 enc : 1;
++			u32 mpe2 : 1;
++			u32 mpe1 : 1;
++			u32 color : 2;
++			u32 ep : 4;
++			u32 resv1 : 4;
++			u32 classid : 4;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_tx_desc_2 {
++	/* DWORD 2 */
++	union {
++		struct {
++			u32 data_ptr;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++struct dma_tx_desc_3 {
++	/* DWORD 3 */
++	union {
++		struct {
++			u32 own : 1;
++			u32 c : 1;
++			u32 sop : 1;
++			u32 eop : 1;
++			u32 dic : 1;
++			u32 pdu_type : 1;
++			u32 byte_offset : 3;
++			u32 qid : 4;
++			u32 mpoa_pt : 1;
++			u32 mpoa_mode : 2;
++			u32 data_len : 16;
++		} __packed field;
++		u32 all;
++	};
++} __packed;
++
++#endif
++
++#ifdef CONFIG_CPU_BIG_ENDIAN
++/* Note: pmac normally not DWORD aligned. Most time 2 bytes alignment */
++struct pmac_rx_hdr {
++	/* byte 0 */
++	u8 res1 : 1;
++	u8 ver_done : 1;
++	u8 ip_offset : 6;
++
++	/* byte 1 */
++	u8 tcp_h_offset : 5;
++	u8 tcp_type : 3;
++
++	/* byte 2 */
++	u8 sppid : 4;
++	u8 class : 4;
++
++	/* byte 3 */
++	u8 res2 : 6;
++	u8 pkt_type : 2;
++
++	/* byte 4 */
++	u8 res3 : 1;
++	u8 redirect : 1;
++	u8 res4 : 1;
++	u8 src_sub_inf_id : 5; /* high:mc:1 + vap:4 */
++
++	/* byte 5 */
++	u8 src_sub_inf_id2 : 8; /* low:mc:1 + vap:4 */
++
++	/* byte 6 */
++	u8 port_map : 8; /* high:port map */
++
++	/* byte 7 */
++	u8 port_map2 : 8; /* low:port map */
++} __packed;
++
++struct pmac_tx_hdr {
++	/* byte 0 */
++	u8 tcp_chksum : 1;
++	u8 res1 : 1;
++	u8 ip_offset : 6;
++
++	/* byte 1 */
++	u8 tcp_h_offset : 5;
++	u8 tcp_type : 3;
++
++	/* byte 2 */
++	u8 sppid : 4;
++	u8 res : 4;
++
++	/* byte 3 */
++	u8 port_map_en : 1;
++	u8 res2 : 1;
++	u8 time_dis : 1;
++	u8 class_en : 1;
++	u8 res3 : 2;
++	u8 pkt_type : 2;
++
++	/* byte 4 */
++	u8 fcs_ins_dis : 1;
++	u8 redirect : 1;
++	u8 time_stmp : 1;
++	u8 src_sub_inf_id : 5; /* high:mc:1 + vap:4 */
++
++	/* byte 5 */
++	u8 src_sub_inf_id2 : 8; /* low:mc:1 + vap:4 */
++
++	/* byte 6 */
++	u8 port_map : 8; /* high:port map */
++
++	/* byte 7 */
++	u8 port_map2 : 8; /* low:port map */
++} __packed;
++
++#else
++
++/* Note: pmac normally not DWORD aligned. Most time 2 bytes alignment */
++struct pmac_rx_hdr {
++	/* byte 0 */
++	u8 ip_offset : 6;
++	u8 ver_done : 1;
++	u8 res1 : 1;
++
++	/* byte 1 */
++	u8 tcp_type : 3;
++	u8 tcp_h_offset : 5;
++
++	/* byte 2 */
++	u8 class : 4;
++	u8 sppid : 4;
++
++	/* byte 3 */
++	u8 pkt_type : 2; /* refer to PMAC_TCP_TYPE */
++	u8 res2 : 6;
++
++	/* byte 4 */
++	u8 src_sub_inf_id : 5; /* high:mc:1 + vap:4 */
++	u8 res4 : 1;
++	u8 redirect : 1;
++	u8 res3 : 1;
++
++	/* byte 5 */
++	u8 src_sub_inf_id2 : 8; /* low:mc:1 + vap:4 */
++
++	/* byte 6 */
++	u8 port_map : 8; /* high:port map */
++
++	/* byte 7 */
++	u8 port_map2 : 8; /* low:port map */
++} __packed;
++
++struct pmac_tx_hdr {
++	/* byte 0 */
++	u8 ip_offset : 6;
++	u8 res1 : 1;
++	u8 tcp_chksum : 1;
++
++	/* byte 1 */
++	u8 tcp_type : 3;
++	u8 tcp_h_offset : 5;
++
++	/* byte 2 */
++	u8 res : 4;
++	u8 sppid : 4;
++
++	/* byte 3 */
++	u8 pkt_type : 2; /* refer to PMAC_TCP_TYPE */
++	u8 res3 : 2;
++	u8 class_en : 1;
++	u8 time_dis : 1;
++	u8 res2 : 1;
++	u8 port_map_en : 1;
++
++	/* byte 4 */
++	u8 src_sub_inf_id : 5; /* high:mc:1 + vap:4 */
++	u8 time_stmp : 1;
++	u8 redirect : 1;
++	u8 fcs_ins_dis : 1;
++
++	/* byte 5 */
++	u8 src_sub_inf_id2 : 8; /* low:mc:1 + vap:4 */
++
++	/* byte 6 */
++	u8 port_map : 8; /* high:port map */
++
++	/* byte 7 */
++	u8 port_map2 : 8; /* low:port map */
++} __packed;
++
++#endif
++
++#endif /* DATAPATH_API_GRX500_H */
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_api_qos.h b/drivers/net/ethernet/lantiq/datapath/datapath_api_qos.h
+new file mode 100644
+index 000000000000..d35688430238
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_api_qos.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) Intel Corporation Author: Shao Guohua <guohua.shao@intel.com>
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * include/net/datapath_api_qos.h.
++ *
++ * Datapath QoS API types.
++ */
++
++#ifndef DP_QOS_API_H
++#define DP_QOS_API_H
++
++#include <linux/types.h>
++
++/* @brief enum DP_API_STATUS - shared between the QoS API and the main API */
++enum DP_API_STATUS_QOS {
++	DP_QOS_FAILURE = -1,
++	DP_QOS_SUCCESS = 0,
++};
++
++/* Common QoS-link-node identifier carried through subif registration. */
++enum dp_node_type {
++	DP_NODE_UNKNOWN = 0,
++	DP_NODE_QUEUE,
++	DP_NODE_SCH,
++	DP_NODE_PORT
++};
++
++union dp_node_id {
++	int q_id;
++	int sch_id;
++	int cqm_deq_port;
++};
++
++#endif /* DP_QOS_API_H */
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_api_skb.h b/drivers/net/ethernet/lantiq/datapath/datapath_api_skb.h
+new file mode 100644
+index 000000000000..fe9cc19e4301
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_api_skb.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) Intel Corporation Author: Shao Guohua <guohua.shao@intel.com>
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * include/net/datapath_api_skb.h.
++ *
++ * Datapath socket-buffer helper types.
++ */
++
++#ifndef DATAPATH_API_SKB_H
++#define DATAPATH_API_SKB_H
++
++#include <linux/types.h>
++#include <linux/skbuff.h>
++
++/* Wrapper carrying datapath-specific metadata attached to an skb. */
++struct ltq_dp_skb {
++	int _ltq_dp_skb_placeholder; /* avoid empty-struct UB warnings */
++};
++
++static inline void dp_skb_cp(const struct ltq_dp_skb *old,
++			     struct ltq_dp_skb *new)
++{
++	(void)old;
++	(void)new;
++}
++
++static inline void dp_skb_free(struct sk_buff *skb)
++{
++	(void)skb;
++}
++
++#endif /* DATAPATH_API_SKB_H */
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_inst.h b/drivers/net/ethernet/lantiq/datapath/datapath_inst.h
+new file mode 100644
+index 000000000000..9dbcb7ac5e59
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_inst.h
+@@ -0,0 +1,214 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) Intel Corporation Author: Shao Guohua <guohua.shao@intel.com>
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * include/net/datapath_inst.h.
++ *
++ * Per-instance datapath state.
++ */
++
++#ifndef DATAPATH_INST_H
++#define DATAPATH_INST_H
++
++#include <linux/types.h>
++#include <linux/seq_file.h>
++#include <linux/skbuff.h>
++
++/*
++ * Any caller that actually dereferences struct core_ops fields must include
++ * the gsw_dev header itself.
++ */
++struct core_ops;
++struct mac_ops;
++
++#define DP_MAX_GSW_HANDLE 2  /* max GSW instance per SOC */
++#define DP_MAX_MAC_HANDLE 11 /* max MAC instance per SOC */
++
++#ifndef DP_MAX_INST
++#define DP_MAX_INST 1
++#endif
++
++/* Forward decls of types referenced only by pointer below. */
++struct logic_dev;
++struct subif_platform_data;
++struct pmac_port_info;
++struct pmac_port_info2;
++struct gsw_itf;
++struct dp_port_data;
++struct dp_dev_data;
++struct dp_subif_data;
++struct dp_pmapper;
++struct dp_tc_vlan;
++struct dp_tc_vlan_info;
++struct pmac_tx_hdr;
++struct pmac_rx_hdr;
++struct dma_tx_desc_0;
++struct dma_tx_desc_1;
++struct dma_tx_desc_2;
++struct dma_tx_desc_3;
++struct dma_rx_desc_0;
++struct dma_rx_desc_1;
++struct dma_rx_desc_2;
++struct dma_rx_desc_3;
++struct dp_subif;
++typedef struct dp_subif dp_subif_t;
++struct dp_pmac_cfg;
++typedef struct dp_pmac_cfg dp_pmac_cfg_t;
++
++/* enum for DP HW capability type */
++enum DP_HW_CAP_TYPE {
++	GSWIP30_TYPE = 0,
++	GSWIP31_TYPE
++};
++
++/* enum for DP HW version */
++enum DP_HW_CAP_VER {
++	GSWIP30_VER = 0,
++	GSWIP31_VER
++};
++
++#ifndef DP_MAX_NAME
++#define DP_MAX_NAME 20
++#endif
++
++struct dp_umt_cap_mode {
++	u32 enable : 1;
++	u32 rx_accumulate : 1;
++	u32 rx_incremental : 1;
++	u32 tx_accumulate : 1;
++	u32 tx_incremental : 1;
++};
++
++struct dp_umt_cap {
++	struct dp_umt_cap_mode umt_hw_auto;
++	struct dp_umt_cap_mode umt_hw_user;
++	struct dp_umt_cap_mode umt_sw;
++};
++
++/* struct dp_cap: dp capability per instance (AVM datapath_api.h:1149-1178). */
++struct dp_cap {
++	int inst;
++	u32 tx_hw_chksum : 1;
++	u32 rx_hw_chksum : 1;
++	u32 hw_tso : 1;
++	u32 hw_gso : 1;
++	u32 hw_ptp : 1;
++	char qos_eng_name[DP_MAX_NAME];
++	char pkt_eng_name[DP_MAX_NAME];
++	int max_num_queues;
++	int max_num_scheds;
++	int max_num_deq_ports;
++	int max_num_qos_ports;
++	int max_num_dp_ports;
++	int max_num_subif_per_port;
++	int max_num_subif;
++	int max_num_bridge_port;
++	struct dp_umt_cap umt;
++};
++
++struct dp_inst_info {
++	int inst;
++	enum DP_HW_CAP_TYPE type;
++	enum DP_HW_CAP_VER ver;
++	struct core_ops *ops[DP_MAX_GSW_HANDLE];
++	struct mac_ops *mac_ops[DP_MAX_MAC_HANDLE];
++	int cbm_inst;
++	int qos_inst;
++};
++
++/* Per-HW-capability dispatch table. */
++struct inst_info {
++	enum DP_HW_CAP_TYPE type;
++	enum DP_HW_CAP_VER ver;
++	int max_ports;
++	int max_port_subifs;
++	struct dp_cap cap; /* value-embedded */
++	int (*dp_platform_set)(int inst, u32 flag);
++	int (*port_platform_set)(int inst, u8 ep, struct dp_port_data *data,
++				 uint32_t flags);
++	int (*dev_platform_set)(int inst, u8 ep, struct dp_dev_data *data,
++				uint32_t flags);
++	int (*subif_platform_set_unexplicit)(int inst, int port_id,
++					     struct logic_dev *dev,
++					     u32 flag);
++	int (*port_platform_set_unexplicit)(int inst, int port_id,
++					    struct logic_dev *dev,
++					    u32 flag);
++	int (*subif_platform_set)(int inst, int portid, int subif_ix,
++				  struct subif_platform_data *data,
++				  u32 flags);
++	int (*proc_print_ctp_bp_info)(struct seq_file *s, int inst,
++				      struct pmac_port_info *port,
++				      int subif_index, u32 flag);
++	void (*init_dma_pmac_template)(int portid, uint32_t flags);
++	int (*not_valid_rx_ep)(int ep);
++	void (*set_pmac_subif)(struct pmac_tx_hdr *pmac, int32_t subif);
++	void (*update_port_vap)(int inst, u32 *ep, int *vap,
++				struct sk_buff *skb,
++				struct pmac_rx_hdr *pmac, char *decryp);
++	int (*check_csum_cap)(void);
++	void (*get_dma_pmac_templ)(int index, struct pmac_tx_hdr *pmac,
++				   struct dma_tx_desc_0 *desc_0,
++				   struct dma_tx_desc_1 *desc_1,
++				   struct pmac_port_info2 *dp_info);
++	int (*get_itf_start_end)(struct gsw_itf *itf_info, u16 *start,
++				 u16 *end);
++	void (*dump_rx_dma_desc)(struct dma_rx_desc_0 *desc_0,
++				 struct dma_rx_desc_1 *desc_1,
++				 struct dma_rx_desc_2 *desc_2,
++				 struct dma_rx_desc_3 *desc_3);
++	void (*dump_tx_dma_desc)(struct dma_tx_desc_0 *desc_0,
++				 struct dma_tx_desc_1 *desc_1,
++				 struct dma_tx_desc_2 *desc_2,
++				 struct dma_tx_desc_3 *desc_3);
++	void (*dump_rx_pmac)(struct pmac_rx_hdr *pmac);
++	void (*dump_tx_pmac)(struct pmac_tx_hdr *pmac);
++	int (*supported_logic_dev)(int inst, struct net_device *dev,
++				   char *subif_name);
++	int (*dp_pmac_set)(int inst, u32 port, dp_pmac_cfg_t *pmac_cfg);
++	int (*dp_set_gsw_parser)(u8 flag, u8 cpu, u8 mpe1, u8 mpe2, u8 mpe3);
++	int (*dp_get_gsw_parser)(u8 *cpu, u8 *mpe1, u8 *mpe2, u8 *mpe3);
++	int (*dp_qos_platform_set)(int cmd_id, void *cfg, int flag);
++	int (*dp_get_port_vap_mib)(dp_subif_t *subif_id, void *priv,
++				   void *stats,
++				   u32 flags);
++	int (*dp_clear_netif_mib)(dp_subif_t *subif, void *priv, u32 flag);
++	int (*dp_set_gsw_pmapper)(int inst, int bport, int lport,
++				  struct dp_pmapper *mapper, u32 flag);
++	int (*dp_get_gsw_pmapper)(int inst, int bport, int lport,
++				  struct dp_pmapper *mapper, u32 flag);
++	int (*dp_tc_vlan_set)(struct core_ops *ops, struct dp_tc_vlan *vlan,
++			      struct dp_tc_vlan_info *info,
++			      int flag);
++};
++
++struct dp_inst {
++	enum DP_HW_CAP_TYPE type;
++	enum DP_HW_CAP_VER ver;
++	struct inst_info info;
++};
++
++struct dp_hw_cap {
++	u8 valid;
++	struct inst_info info;
++};
++
++struct inst_property {
++	u8 valid;
++	struct inst_info info;
++	/* driver should know which HW to configure, esp for PCIe case */
++	struct core_ops *ops[DP_MAX_GSW_HANDLE];
++	struct mac_ops *mac_ops[DP_MAX_MAC_HANDLE];
++	int cbm_inst;
++	int qos_inst;
++	void *priv_hal; /* private data per HAL */
++};
++
++int register_dp_cap_gswip30(int flag);
++int register_dp_hw_cap(struct dp_hw_cap *info, u32 flag);
++
++/* request a new DP instance based on its HW type/version */
++int dp_request_inst(struct dp_inst_info *info, u32 flag);
++
++#endif /* DATAPATH_INST_H */
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_instance.c b/drivers/net/ethernet/lantiq/datapath/datapath_instance.c
+new file mode 100644
+index 000000000000..ad0cf1adee86
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_instance.c
+@@ -0,0 +1,185 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) Intel Corporation Author: Shao Guohua <guohua.shao@intel.com>
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * datapath/datapath_instance.c.
++ *
++ * Datapath instance bookkeeping: one instance per GSWIP device, resolved at
++ * registration time.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
++#include <linux/mutex.h>
++#include <linux/netdevice.h>
++#include <linux/if.h>
++
++#include "datapath.h"
++#include "datapath_api.h"
++
++/* Field layout matches the plan's enumerated set verbatim. */
++struct dp_inst_storage_entry {
++	struct net_device *dev;
++	char subif_name[IFNAMSIZ];
++	int inst;
++	int ep;
++	int bp;
++	int ctp;
++	u32 flag;
++	bool valid;
++};
++
++/*
++ * dp_inst_storage[DP_MAX_INST][16][16]: file-scope static bookkeeping mesh.
++ */
++static struct dp_inst_storage_entry
++	dp_inst_storage[DP_MAX_INST][MAX_DP_PORTS][MAX_DP_PORTS];
++
++int register_dp_hw_cap(struct dp_hw_cap *info, u32 flag)
++{
++	(void)flag;
++	if (!info)
++		return -1;
++	mutex_lock(&dp_lock);
++	/* Single-instance case: copy cap info into dp_port_prop[0]. */
++	dp_port_prop[0].info = info->info;
++	mutex_unlock(&dp_lock);
++	return 0;
++}
++
++int dp_request_inst(struct dp_inst_info *info, u32 flag)
++{
++	(void)info;
++	(void)flag;
++	/*
++	 * Real per-instance state is set up by request_dp() in datapath_api.c
++	 * (ops[0]/ops[1] population + dp_platform_set call).
++	 */
++	mutex_lock(&dp_lock);
++	if (dp_inst_num == 0)
++		dp_inst_num = 1;
++	mutex_unlock(&dp_lock);
++	return 0;
++}
++
++int dp_inst_init(void)
++{
++	/*
++	 * AVM datapath_instance.c dp_inst_init walks the dp_dev_list /
++	 * dp_dev_list_free hash heads. The minimal stub clears the single
++	 * dp_port_prop[0] slot - the corresponding zero of dp_port_info /
++	 * dp_port_info2 is implicit because they are file-scope BSS
++	 * allocations.
++	 */
++	mutex_lock(&dp_lock);
++	memset(&dp_port_prop[0], 0, sizeof(dp_port_prop[0]));
++	memset(dp_inst_storage, 0, sizeof(dp_inst_storage));
++	mutex_unlock(&dp_lock);
++	return 0;
++}
++
++int dp_inst_add_dev(struct net_device *dev, char *subif_name, int inst,
++		    int port_id, int bp, int subif, u32 flag)
++{
++	int i;
++
++	/*
++	 * No additional locking here; lockdep_assert_held documents the
++	 * requirement.
++	 */
++	lockdep_assert_held(&dp_lock);
++
++	if (inst < 0 || inst >= DP_MAX_INST)
++		return -1;
++	if (port_id < 0 || port_id >= MAX_DP_PORTS)
++		return -1;
++	if (subif < 0 || subif >= MAX_DP_PORTS)
++		return -1;
++
++	for (i = 0; i < MAX_DP_PORTS; i++) {
++		struct dp_inst_storage_entry *e =
++			&dp_inst_storage[inst][port_id][i];
++
++		if (e->valid)
++			continue;
++
++		e->dev = dev;
++		if (subif_name) {
++			strncpy(e->subif_name, subif_name, IFNAMSIZ - 1);
++			e->subif_name[IFNAMSIZ - 1] = '\0';
++		} else {
++			e->subif_name[0] = '\0';
++		}
++		e->inst = inst;
++		e->ep = port_id;
++		e->bp = bp;
++		e->ctp = subif;
++		e->flag = flag;
++		e->valid = true;
++		return 0;
++	}
++	return -1;
++}
++
++int dp_inst_del_dev(struct net_device *dev, char *subif_name, int inst,
++		    int port_id, int bp, int subif)
++{
++	int i;
++
++	(void)bp;
++	(void)subif;
++
++	lockdep_assert_held(&dp_lock);
++
++	if (inst < 0 || inst >= DP_MAX_INST)
++		return -1;
++	if (port_id < 0 || port_id >= MAX_DP_PORTS)
++		return -1;
++
++	for (i = 0; i < MAX_DP_PORTS; i++) {
++		struct dp_inst_storage_entry *e =
++			&dp_inst_storage[inst][port_id][i];
++
++		if (!e->valid)
++			continue;
++		if (e->dev != dev)
++			continue;
++		if (subif_name &&
++		    strncmp(e->subif_name, subif_name, IFNAMSIZ) != 0)
++			continue;
++		e->valid = false;
++		return 0;
++	}
++	return -1;
++}
++
++int dp_get_inst_via_module(struct module *owner, u32 port_id, u32 dev_port)
++{
++	int ret;
++
++	(void)dev_port;
++
++	if (port_id >= MAX_DP_PORTS)
++		return -1;
++
++	mutex_lock(&dp_lock);
++	if (dp_port_info[0][port_id].status >= PORT_ALLOCATED &&
++	    dp_port_info[0][port_id].owner == owner)
++		ret = 0;
++	else
++		ret = -1;
++	mutex_unlock(&dp_lock);
++	return ret;
++}
++
++int dp_inst_insert_mod(struct module *owner, u16 ep, u32 inst, u32 flag)
++{
++	(void)owner;
++	(void)ep;
++	(void)inst;
++	(void)flag;
++	/* No locking here. */
++	return 0;
++}
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_misc.c b/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
+new file mode 100644
+index 000000000000..71eee935253a
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
+@@ -0,0 +1,781 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) Intel Corporation Author: Shao Guohua <guohua.shao@intel.com>
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * datapath/gswip30/datapath_misc.c.
++ *
++ * GSWIP-3.0 datapath platform hooks: PMAC templates, DMA descriptor masks and
++ * the per-port and per-sub-interface hardware setup.
++ */
++
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
++#include <linux/bug.h>
++#include <linux/build_bug.h>
++#include <linux/atomic.h>
++#include <linux/skbuff.h>
++#include <linux/netdevice.h>
++#include <linux/if_vlan.h>
++#include <linux/device.h>
++#include <linux/printk.h>
++
++#include <net/cqm_cbm_api.h>
++#include "datapath.h"
++#include "datapath_misc.h"
++#include "../switch-api/gsw_flow_core.h"
++#include "../switch-api/gsw_tbl_rw.h"
++
++/*
++ * Minimal local types and macros not available in datapath.h.
++ *
++ * Only `deq_port_idx` is dereferenced from datapath_misc.c (subif_hw_set,
++ * subif_hw_reset).
++ *
++ * Define them locally with the same bit layout as AVM (controller<<24 |
++ * port<<16 | channel) so subif_hw_set's dma_chan decoding matches AVM
++ * byte-for-byte.
++ *
++ * (3) DP_FAILURE: AVM macro returning -1 on subif_hw_set / subif_hw_reset
++ *     failure paths. Local define keeps the AVM source readable.
++ */
++struct dp_subif_data {
++	s8 deq_port_idx;
++};
++
++#define _DMA_CONTROLLER(nr) (((nr) >> 24) & 0xFF)
++#define _DMA_PORT(nr)       (((nr) >> 16) & 0xFF)
++#define _DMA_CHANNEL(nr)    ((nr) & 0xFFFF)
++
++#ifndef DP_FAILURE
++#define DP_FAILURE (-1)
++#endif
++
++/*
++ * Local fallbacks for the DP_F_* flag bits the AVM source-of-truth defines in
++ * include/net/datapath_api.h:120-130 as `enum { DP_F_DEREGISTER = BIT(0),
++ * DP_F_FAST_ETH_LAN = BIT(1), ... DP_F_LOOPBACK = BIT(6), DP_F_DIRECTLINK =
++ * BIT(7) }`.
++ *
++ *   DP_F_DEREGISTER   = BIT(0) = 0x01 — subif_platform_set dispatch flag.
++ *   DP_F_FAST_ETH_LAN = BIT(1) = 0x02 — init_dma_pmac_template LAN branch.
++ *   DP_F_LOOPBACK     = BIT(6) = 0x40 — update_port_vap tunnel-loop branch.
++ *
++ * #ifndef guards let any later subtask import the AVM enum first and have
++ * the local defines compile out cleanly per C11 6.10.1 / 6.10.3 semantics.
++ */
++#ifndef DP_F_DEREGISTER
++#define DP_F_DEREGISTER 0x00000001
++#endif
++#ifndef DP_F_FAST_ETH_LAN
++#define DP_F_FAST_ETH_LAN 0x00000002
++#endif
++#ifndef DP_F_LOOPBACK
++#define DP_F_LOOPBACK 0x00000040
++#endif
++
++/*
++ * init_dma_desc_mask — AVM:32-58 verbatim. Populates the four DMA-descriptor
++ * mask globals via the union/bitfield `.field.X` accessors.
++ */
++static void init_dma_desc_mask(void)
++{
++	BUILD_BUG_ON(sizeof(struct dma_rx_desc_1) != 4);
++	BUILD_BUG_ON(sizeof(struct dma_rx_desc_3) != 4);
++	BUILD_BUG_ON(sizeof(struct dma_rx_desc_0) != 4);
++
++	/* mask 0: to remove the bit, 1 -- keep the bit */
++	dma_rx_desc_mask1.all = 0xFFFFFFFF;
++	dma_rx_desc_mask3.all = 0xFFFFFFFF;
++	dma_rx_desc_mask3.field.own = 0;
++	dma_rx_desc_mask3.field.c = 0;
++	dma_rx_desc_mask3.field.sop = 0;
++	dma_rx_desc_mask3.field.eop = 0;
++	dma_rx_desc_mask3.field.dic = 0;
++	dma_rx_desc_mask3.field.byte_offset = 0;
++	dma_rx_desc_mask1.field.dec = 0;
++	dma_rx_desc_mask1.field.enc = 0;
++	dma_rx_desc_mask1.field.mpe2 = 0;
++	dma_rx_desc_mask1.field.mpe1 = 0;
++	/* mask to keep some value via 1
++	 * set by top application all others set to 0
++	 */
++	dma_tx_desc_mask0.all = 0;
++	dma_tx_desc_mask1.all = 0;
++	dma_tx_desc_mask0.field.flow_id = 0xFF;
++	dma_tx_desc_mask0.field.dest_sub_if_id = 0x7FFF;
++	dma_tx_desc_mask1.field.mpe1 = 0x1;
++	dma_tx_desc_mask1.field.color = 0x3;
++	dma_tx_desc_mask1.field.ep = 0xF;
++}
++
++/*
++ * Only the DP_F_FAST_ETH_LAN branch (AVM:79-90) and the final 'else
++ * DP_F_DIRECT' branch (AVM:197-222) are kept; DP_F_FAST_ETH_WAN,
++ * DP_F_DIRECTLINK, DP_F_FAST_DSL, DP_F_FAST_WLAN are line-excised. The memset
++ * block + the 0xFFFFFFFF mask init loop at function entry are preserved
++ * verbatim from AVM:67-77.
++ */
++static void init_dma_pmac_template(int portid, u32 flags)
++{
++	int i;
++	struct pmac_port_info2 *dp_info = &dp_port_info2[0][portid];
++
++	/* Note:
++	 * final tx_dma0 = (tx_dma0 & dma0_mask_template) | dma0_template
++	 * final tx_dma1 = (tx_dma1 & dma1_mask_template) | dma1_template
++	 * final tx_pmac = pmac_template
++	 */
++	memset(dp_info->pmac_template, 0, sizeof(dp_info->pmac_template));
++	memset(dp_info->dma0_template, 0, sizeof(dp_info->dma0_template));
++	memset(dp_info->dma1_template, 0, sizeof(dp_info->dma1_template));
++	for (i = 0; i < MAX_TEMPLATE; i++) {
++		dp_info->dma0_mask_template[i].all = 0xFFFFFFFF;
++		dp_info->dma1_mask_template[i].all = 0xFFFFFFFF;
++	}
++
++	if (flags & DP_F_FAST_ETH_LAN) { /* always with pmac */
++		/* always with pmac */
++		for (i = 0; i < MAX_TEMPLATE; i++) {
++			dp_info->pmac_template[i].port_map_en = 1;
++			dp_info->pmac_template[i].sppid = PMAC_CPU_ID;
++			dp_info->pmac_template[i].redirect = 0;
++			dp_info->pmac_template[i].class_en = 1;
++			SET_PMAC_PORTMAP(&dp_info->pmac_template[i], portid);
++		}
++		/* for checksum for pmac_template[1] */
++		dp_info->pmac_template[TEMPL_CHECKSUM].tcp_chksum = 1;
++	} else { /* DP_F_DIRECT fallback - AVM lines 197-222 */
++		/* normal dirctpath without checksum support */
++		dp_info->pmac_template[TEMPL_NORMAL].port_map_en = 0;
++		dp_info->pmac_template[TEMPL_NORMAL].sppid = portid;
++		dp_info->pmac_template[TEMPL_NORMAL].redirect = 0;
++		dp_info->pmac_template[TEMPL_NORMAL].port_map = 0xff;
++		dp_info->pmac_template[TEMPL_NORMAL].port_map2 = 0xff;
++		dp_info->pmac_template[TEMPL_NORMAL].class_en = 1;
++		dp_info->dma1_template[TEMPL_NORMAL].field.enc = 1;
++		dp_info->dma1_template[TEMPL_NORMAL].field.dec = 1;
++		dp_info->dma1_template[TEMPL_NORMAL].field.mpe2 = 0;
++		dp_info->dma1_mask_template[TEMPL_NORMAL].field.enc = 0;
++		dp_info->dma1_mask_template[TEMPL_NORMAL].field.dec = 0;
++		dp_info->dma1_mask_template[TEMPL_NORMAL].field.mpe2 = 0;
++
++		/* dirctpath with checksum support */
++		dp_info->pmac_template[TEMPL_CHECKSUM].port_map_en = 1;
++		dp_info->pmac_template[TEMPL_CHECKSUM].sppid = PMAC_CPU_ID;
++		dp_info->pmac_template[TEMPL_CHECKSUM].redirect = 1;
++		dp_info->pmac_template[TEMPL_CHECKSUM].tcp_chksum = 1;
++		dp_info->pmac_template[TEMPL_CHECKSUM].class_en = 1;
++		SET_PMAC_PORTMAP(&dp_info->pmac_template[TEMPL_CHECKSUM],
++				 portid);
++		dp_info->dma1_template[TEMPL_CHECKSUM].field.enc = 1;
++		dp_info->dma1_template[TEMPL_CHECKSUM].field.dec = 1;
++		dp_info->dma1_template[TEMPL_CHECKSUM].field.mpe2 = 1;
++		dp_info->dma1_mask_template[TEMPL_CHECKSUM].field.enc = 0;
++		dp_info->dma1_mask_template[TEMPL_CHECKSUM].field.dec = 0;
++		dp_info->dma1_mask_template[TEMPL_CHECKSUM].field.mpe2 = 0;
++	}
++}
++
++static void dump_rx_dma_desc(struct dma_rx_desc_0 *desc_0,
++			     struct dma_rx_desc_1 *desc_1,
++			     struct dma_rx_desc_2 *desc_2,
++			     struct dma_rx_desc_3 *desc_3)
++{
++	if (!desc_0 || !desc_1 || !desc_2 || !desc_3) {
++		dev_err(dp_dev, "rx desc_0/1/2/3 NULL\n");
++		return;
++	}
++	dev_info(dp_dev,
++		 " DMA Descripotr:D0=0x%08x D1=0x%08x D2=0x%08x D3=0x%08x\n",
++		 *(u32 *)desc_0, *(u32 *)desc_1,
++		 *(u32 *)desc_2, *(u32 *)desc_3);
++	dev_info(dp_dev,
++		 "  DW0:%s=%d tunl_id=%d flow_id=%d eth_type=%d subif=0x%04x\n",
++		 "resv0", desc_0->field.resv0,
++		 desc_0->field.tunnel_id,
++		 desc_0->field.flow_id, desc_0->field.eth_type,
++		 desc_0->field.dest_sub_if_id);
++	dev_info(dp_dev,
++		 "  DW1:sess=%d tcp_err=%d nat=%d dec=%d enc=%d mpe2/1=%d/%d\n",
++		 desc_1->field.session_id, desc_1->field.tcp_err,
++		 desc_1->field.nat, desc_1->field.dec, desc_1->field.enc,
++		 desc_1->field.mpe2, desc_1->field.mpe1);
++	dev_info(dp_dev,
++		 "      color=%02d ep=%02d resv1=%d classid=%02d\n",
++		 desc_1->field.color, desc_1->field.ep, desc_1->field.resv1,
++		 desc_1->field.classid);
++	dev_info(dp_dev, "  DW2:data_ptr=0x%08x\n", desc_2->field.data_ptr);
++	dev_info(dp_dev,
++		 "  DW3:own=%d c=%d sop=%d eop=%d dic=%d pdu_type=%d\n",
++		 desc_3->field.own, desc_3->field.c, desc_3->field.sop,
++		 desc_3->field.eop, desc_3->field.dic, desc_3->field.pdu_type);
++	dev_info(dp_dev,
++		 "      offset=%d atm_q=%d mpoa_pt=%d mpoa_mode=%d len=%d\n",
++		 desc_3->field.byte_offset, desc_3->field.qid,
++		 desc_3->field.mpoa_pt, desc_3->field.mpoa_mode,
++		 desc_3->field.data_len);
++}
++
++/* dump_tx_dma_desc — AVM:262-301 ported verbatim. */
++static void dump_tx_dma_desc(struct dma_tx_desc_0 *desc_0,
++			     struct dma_tx_desc_1 *desc_1,
++			     struct dma_tx_desc_2 *desc_2,
++			     struct dma_tx_desc_3 *desc_3)
++{
++	int lookup;
++
++	if (!desc_0 || !desc_1 || !desc_2 || !desc_3) {
++		dev_err(dp_dev, "tx desc_0/1/2/3 NULL\n");
++		return;
++	}
++	dev_info(dp_dev,
++		 " DMA Descripotr:D0=0x%08x D1=0x%08x D2=0x%08x D3=0x%08x\n",
++		 *(u32 *)desc_0, *(u32 *)desc_1,
++		 *(u32 *)desc_2, *(u32 *)desc_3);
++	dev_info(dp_dev,
++		 "  DW0:%s=%d tunl_id=%d flow_id=%d eth_type=%d subif=0x%04x\n",
++		 "resv0", desc_0->field.resv0,
++		 desc_0->field.tunnel_id,
++		 desc_0->field.flow_id, desc_0->field.eth_type,
++		 desc_0->field.dest_sub_if_id);
++	dev_info(dp_dev,
++		 "  DW1:sess=%d tcp_err=%d nat=%d dec=%d enc=%d mpe2/1=%d/%d\n",
++		 desc_1->field.session_id, desc_1->field.tcp_err,
++		 desc_1->field.nat, desc_1->field.dec, desc_1->field.enc,
++		 desc_1->field.mpe2, desc_1->field.mpe1);
++	dev_info(dp_dev,
++		 "  color=%02d ep=%02d resv1=%d classid=%02d\n",
++		 desc_1->field.color, desc_1->field.ep, desc_1->field.resv1,
++		 desc_1->field.classid);
++	dev_info(dp_dev, "  DW2:data_ptr=0x%08x\n", desc_2->field.data_ptr);
++	dev_info(dp_dev,
++		 "  DW3:own=%d c=%d sop=%d eop=%d dic=%d pdu_type=%d\n",
++		 desc_3->field.own, desc_3->field.c, desc_3->field.sop,
++		 desc_3->field.eop, desc_3->field.dic, desc_3->field.pdu_type);
++	dev_info(dp_dev,
++		 "  offset=%d atm_qid=%d mpoa_pt=%d mpoa_mode=%d len=%d\n",
++		 desc_3->field.byte_offset, desc_3->field.qid,
++		 desc_3->field.mpoa_pt, desc_3->field.mpoa_mode,
++		 desc_3->field.data_len);
++	lookup =
++		((desc_0->field.flow_id >> 6) << 12) |
++		((desc_1->field.dec) << 11) |
++		((desc_1->field.enc) << 10) |
++		((desc_1->field.mpe2) << 9) |
++		((desc_1->field.mpe1) << 8) |
++		((desc_1->field.ep) << 4) |
++		((desc_1->field.classid) << 0);
++	dev_info(dp_dev, "  lookup index=0x%x qid=%d\n", lookup,
++		 get_lookup_qid_via_index(lookup));
++}
++
++/*
++ * dump_rx_pmac — AVM:303-330 ported verbatim with PR_* -> dev_*.
++ */
++static void dump_rx_pmac(struct pmac_rx_hdr *pmac)
++{
++	int i, l;
++	unsigned char *p = (char *)pmac;
++	unsigned char buf[100];
++
++	if (!pmac) {
++		dev_err(dp_dev, " pmac NULL ??\n");
++		return;
++	}
++
++	l = sprintf(buf, "PMAC at 0x%p: ", p);
++	for (i = 0; i < 8; i++)
++		l += sprintf(buf + l, "0x%02x ", p[i]);
++	l += sprintf(buf + l, "\n");
++	dev_info(dp_dev, "%s", buf);
++
++	/* byte 0 */
++	dev_info(dp_dev, "  byte 0:res=%d ver_done=%d ip_offset=%d\n",
++		 pmac->res1, pmac->ver_done, pmac->ip_offset);
++	/* byte 1 */
++	dev_info(dp_dev, "  byte 1:tcp_h_offset=%d tcp_type=%d\n",
++		 pmac->tcp_h_offset, pmac->tcp_type);
++	/* byte 2 */
++	dev_info(dp_dev, "  byte 2:ppid=%d class=%d\n",
++		 pmac->sppid, pmac->class);
++	/* byte 3 */
++	dev_info(dp_dev, "  byte 3:res=%d pkt_type=%d\n",
++		 pmac->res2, pmac->pkt_type);
++	/* byte 4 */
++	dev_info(dp_dev,
++		 "  byte 4:res=%d redirect=%d res2=%d src_sub_inf_id=%d\n",
++		 pmac->res3, pmac->redirect, pmac->res4,
++		 pmac->src_sub_inf_id);
++	/* byte 5 */
++	dev_info(dp_dev, "  byte 5:src_sub_inf_id2=%d\n",
++		 pmac->src_sub_inf_id2);
++	/* byte 6 */
++	dev_info(dp_dev, "  byte 6:port_map=%d\n", pmac->port_map);
++	/* byte 7 */
++	dev_info(dp_dev, "  byte 7:port_map2=%d\n", pmac->port_map2);
++}
++
++/*
++ * dump_tx_pmac — AVM:332-359 ported verbatim with PR_* -> dev_*.
++ */
++static void dump_tx_pmac(struct pmac_tx_hdr *pmac)
++{
++	int i, l;
++	unsigned char *p = (char *)pmac;
++	unsigned char buf[100];
++
++	if (!pmac) {
++		dev_err(dp_dev, "dump_tx_pmac pmac NULL ??\n");
++		return;
++	}
++
++	l = sprintf(buf, "PMAC at 0x%p: ", p);
++	for (i = 0; i < 8; i++)
++		l += sprintf(buf + l, "0x%02x ", p[i]);
++	sprintf(buf + l, "\n");
++	dev_info(dp_dev, "%s", buf);
++	/* byte 0 */
++	dev_info(dp_dev, "  byte 0:tcp_chksum=%d res=%d ip_offset=%d\n",
++		 pmac->tcp_chksum, pmac->res1, pmac->ip_offset);
++	/* byte 1 */
++	dev_info(dp_dev, "  byte 1:tcp_h_offset=%d tcp_type=%d\n",
++		 pmac->tcp_h_offset, pmac->tcp_type);
++	/* byte 2 */
++	dev_info(dp_dev, "  byte 2:ppid=%d res=%d\n",
++		 pmac->sppid, pmac->res);
++	/* byte 3 */
++	dev_info(dp_dev,
++		 "  byte 3:%s=%d %s=%d/%d time_dis=%d class_en=%d pkt_type=%d\n",
++		 "map_en", pmac->port_map_en,
++		 "res", pmac->res2, pmac->res3,
++		 pmac->time_dis, pmac->class_en,
++		 pmac->pkt_type);
++	/* byte 4 */
++	dev_info(dp_dev,
++		 "  byte 4:fcs_ins_dis=%d redirect=%d time_stmp=%d subif=%d\n",
++		 pmac->fcs_ins_dis, pmac->redirect, pmac->time_stmp,
++		 pmac->src_sub_inf_id);
++	/* byte 5 */
++	dev_info(dp_dev, "  byte 5:src_sub_inf_id2=%d\n",
++		 pmac->src_sub_inf_id2);
++	/* byte 6 */
++	dev_info(dp_dev, "  byte 6:port_map=%d\n", pmac->port_map);
++	/* byte 7 */
++	dev_info(dp_dev, "  byte 7:port_map2=%d\n", pmac->port_map2);
++}
++
++/*
++ * mib_init — AVM:361-371 ported as a no-op shell per the surgery. The
++ * cbm_counter_mode_set calls resolve to the stub in datapath_cbm_stubs.h.
++ */
++static void mib_init(u32 flag)
++{
++	dev_dbg(dp_dev,
++		"mib reset skipped: no MIB module (flag=0x%x)\n",
++		flag);
++	cbm_counter_mode_set(0, 1); /* enqueue to byte */
++	cbm_counter_mode_set(1, 1); /* dequeue to byte */
++}
++
++void dp_sys_mib_reset_30(u32 flag)
++{
++	dev_dbg(dp_dev,
++		"dp_sys_mib_reset_30 skipped: no MIB module (flag=0x%x)\n",
++		flag);
++}
++
++/*
++ * dp_get_gsw_parser_30 call dropped (task constraint #5). dp_coc_cpufreq_init
++ * / CONFIG_LTQ_DATAPATH_CPUFREQ block excised. mib_init call retained (it is
++ * a no-op shell after the surgery). init_dma_desc_mask retained on inst==0.
++ * The dispatch-table NULL check is retained.
++ */
++static int dp_platform_set(int inst, u32 flag)
++{
++	if (!inst) /* only inst zero needs DMA descriptor masks */
++		init_dma_desc_mask();
++
++	if (!dp_port_prop[inst].ops[0] ||
++	    !dp_port_prop[inst].ops[1]) {
++		dev_err(dp_dev, "Why gswip handle zero?\n");
++		return -1;
++	}
++	if (!inst)
++		mib_init(0);
++
++	dev_info(dp_dev,
++		 "dp-gswip30: dp_platform_set inst=%d, DMA desc masks initialised, MIB-init skipped (no CONFIG_LTQ_DATAPATH_MIB)\n",
++		 inst);
++	return 0;
++}
++
++/*
++ * dev_platform_set — AVM:407-411 verbatim. Returns 0 (no per-dev HW
++ * setup).
++ */
++static int dev_platform_set(int inst, u8 ep, struct dp_dev_data *data,
++			    u32 flags)
++{
++	return 0;
++}
++
++static int gswip30_program_queue_map(int inst, int portid);
++
++/*
++ * DP_DEBUG calls preserved (rewritten to dev_dbg via the macro redefinition
++ * in datapath.h).
++ */
++static int port_platform_set(int inst, u8 ep, struct dp_port_data *data,
++			     u32 flags)
++{
++	int idx, i;
++	struct pmac_port_info *port_info = &dp_port_info[inst][ep];
++	u32 dma_chan = 0;
++
++	dp_port_info[inst][ep].ctp_max = MAX_SUBIF_PER_PORT;
++	dp_port_info[inst][ep].vap_offset = 8;
++	dp_port_info[inst][ep].vap_mask = 0xF;
++	idx = port_info->deq_port_base;
++	for (i = 0; i < port_info->deq_port_num; i++) {
++		dp_deq_port_tbl[inst][i + idx].dp_port = ep;
++
++		/* For G.INT num_dma_chan 8 or 16, for other 1 */
++		if (port_info->num_dma_chan > 1)
++			dp_deq_port_tbl[inst][i + idx].dma_chan = dma_chan++;
++		else
++			dp_deq_port_tbl[inst][i + idx].dma_chan = dma_chan;
++		DP_DEBUG(DP_DBG_FLAG_DBG, "deq_port_tbl[%d][%d].dma_chan=%x\n",
++			 inst, (i + idx), dma_chan);
++	}
++
++	/*
++	 * The vendor datapath performs no PCE QUEUE_MAP writes on the LAN
++	 * path; table 0x11 is left to switch init. The removed call zeroed
++	 * {ep << 4 | tc} -> queue for every registered port at each ifup,
++	 * clobbering whatever switch init established.
++	 */
++	return 0;
++}
++
++/*
++ * supported_logic_dev — AVM:386-390 verbatim. Returns is_vlan_dev result.
++ */
++static int supported_logic_dev(int inst, struct net_device *dev,
++			       char *subif_name)
++{
++	return is_vlan_dev(dev);
++}
++
++/*
++ * Bounds checks against DP_DMAMAX / DP_MAX_DMA_PORT / DP_MAX_DMA_CHAN are
++ * preserved.
++ */
++static noinline int subif_hw_set(int inst, int portid, int subif_ix,
++				 struct subif_platform_data *data, u32 flags)
++{
++	int deq_port_idx = 0, cqe_deq;
++	struct pmac_port_info *port_info;
++	int cid, pid, nid;
++	u32 dma_chan;
++
++	if (!data || !data->subif_data) {
++		dev_err(dp_dev, "data NULL or subif_data NULL\n");
++		return -1;
++	}
++	port_info = &dp_port_info[inst][portid];
++	if (data->subif_data)
++		deq_port_idx = data->subif_data->deq_port_idx;
++	if (port_info->deq_port_num < deq_port_idx + 1) {
++		dev_err(dp_dev, "Wrong deq_port_idx(%d), should < %d\n",
++			deq_port_idx, port_info->deq_port_num);
++		return -1;
++	}
++	cqe_deq = port_info->deq_port_base + deq_port_idx;
++	port_info->subif_info[subif_ix].cqm_deq_port = cqe_deq;
++
++	dma_chan = dp_deq_port_tbl[inst][cqe_deq].dma_chan;
++	cid = _DMA_CONTROLLER(dma_chan);
++	pid = _DMA_PORT(dma_chan);
++	nid = _DMA_CHANNEL(dma_chan);
++	/* cid, pid and nid should not greater than DP_DMAMAX,
++	 * DP_MAX_DMA_PORT and DP_MAX_DMA_CHAN respectively.
++	 */
++	if ((cid >= DP_DMAMAX) || (pid >= DP_MAX_DMA_PORT) ||
++	    nid >= DP_MAX_DMA_CHAN) {
++		dev_err(dp_dev, "ERROR: cid=%d pid=%d nid=%d\n",
++			cid, pid, nid);
++		dev_err(dp_dev,
++			"DMAMAX=%d MAX_DMA_PORT=%d MAX_DMA_CHAN=%d\n",
++			DP_DMAMAX, DP_MAX_DMA_PORT, DP_MAX_DMA_CHAN);
++		return DP_FAILURE;
++	}
++	dp_deq_port_tbl[inst][cqe_deq].ref_cnt++;
++	atomic_inc(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt);
++	DP_DEBUG(DP_DBG_FLAG_REG, "cbm[%d].ref_cnt=%d DMATXCH_Ref.cnt=%d\n",
++		 cqe_deq,
++		 dp_deq_port_tbl[inst][cqe_deq].ref_cnt,
++		 atomic_read(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt));
++	return 0;
++}
++
++/*
++ * subif_hw_reset - AVM:512-548 verbatim with PR_ERR -> dev_err and DP_DEBUG
++ * -> dev_dbg rewrite.
++ */
++static noinline int subif_hw_reset(int inst, int portid, int subif_ix,
++				   struct subif_platform_data *data, u32 flags)
++{
++	int deq_port_idx = 0, cqe_deq;
++	struct pmac_port_info *port_info;
++	u32 cid, pid, nid;
++	u32 dma_chan;
++
++	if (!data || !data->subif_data) {
++		dev_err(dp_dev, "data NULL or subif_data NULL\n");
++		return -1;
++	}
++	port_info = &dp_port_info[inst][portid];
++	if (data->subif_data)
++		deq_port_idx = data->subif_data->deq_port_idx;
++	if (port_info->deq_port_num < deq_port_idx + 1) {
++		dev_err(dp_dev, "Wrong deq_port_idx(%d), should < %d\n",
++			deq_port_idx, port_info->deq_port_num);
++		return -1;
++	}
++	cqe_deq = port_info->deq_port_base + deq_port_idx;
++	if (!dp_deq_port_tbl[inst][cqe_deq].ref_cnt) {
++		dev_err(dp_dev, "Wrong cbm[%d].ref_cnt=%d\n",
++			cqe_deq,
++			dp_deq_port_tbl[inst][cqe_deq].ref_cnt);
++		return -1;
++	}
++	dma_chan = dp_deq_port_tbl[inst][cqe_deq].dma_chan;
++	cid = _DMA_CONTROLLER(dma_chan);
++	pid = _DMA_PORT(dma_chan);
++	nid = _DMA_CHANNEL(dma_chan);
++	/* cid, pid and nid should not greater than DP_DMAMAX,
++	 * DP_MAX_DMA_PORT and DP_MAX_DMA_CHAN respectively.
++	 */
++	if ((cid >= DP_DMAMAX) || (pid >= DP_MAX_DMA_PORT) ||
++	    nid >= DP_MAX_DMA_CHAN) {
++		dev_err(dp_dev, "ERROR: cid=%d pid=%d nid=%d\n",
++			cid, pid, nid);
++		dev_err(dp_dev,
++			"DMAMAX=%d MAX_DMA_PORT=%d MAX_DMA_CHAN=%d\n",
++			DP_DMAMAX, DP_MAX_DMA_PORT, DP_MAX_DMA_CHAN);
++		return DP_FAILURE;
++	}
++	DP_DEBUG(DP_DBG_FLAG_DBG, "cid=%d pid=%d nid=%d\n", cid, pid, nid);
++	dp_deq_port_tbl[inst][cqe_deq].ref_cnt--;
++	atomic_dec(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt);
++	DP_DEBUG(DP_DBG_FLAG_REG, "cbm[%d].ref_cnt=%d DMATXCH_Ref_cnt=%d\n",
++		 cqe_deq,
++		 dp_deq_port_tbl[inst][cqe_deq].ref_cnt,
++		 atomic_read(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt));
++	return 0;
++}
++
++/*
++ * subif_platform_set — AVM:550-557 verbatim. Dispatches to subif_hw_reset
++ * on DP_F_DEREGISTER, otherwise subif_hw_set.
++ */
++static int subif_platform_set(int inst, int portid, int subif_ix,
++			      struct subif_platform_data *data, u32 flags)
++{
++	if (flags & DP_F_DEREGISTER)
++		return subif_hw_reset(inst, portid, subif_ix, data, flags);
++	return subif_hw_set(inst, portid, subif_ix, data, flags);
++}
++
++/*
++ * subif_platform_set_unexplicit — AVM:559-562 verbatim. Returns 0.
++ */
++static int subif_platform_set_unexplicit(int inst, int port_id,
++					 struct logic_dev *dev,
++					 u32 flag)
++{
++	return 0;
++}
++
++/*
++ * not_valid_rx_ep — AVM:564-566 verbatim.
++ */
++static int not_valid_rx_ep(int ep)
++{
++	return (((ep >= 1) && (ep <= 6)) || (ep >= 15));
++}
++
++/*
++ * set_pmac_subif — AVM:568-573 verbatim.
++ */
++static void set_pmac_subif(struct pmac_tx_hdr *pmac, int32_t subif)
++{
++	pmac->src_sub_inf_id2 = subif & 0xff;
++	pmac->src_sub_inf_id = (subif >> 8) & 0x1f;
++}
++
++/*
++ * update_port_vap — AVM:575-590 verbatim. DP_F_LOOPBACK token resolves to
++ * the file-scope local fallback (= 0x40 = AVM BIT(6)).
++ */
++static void update_port_vap(int inst, u32 *ep, int *vap,
++			    struct sk_buff *skb,
++			    struct pmac_rx_hdr *pmac, char *decryp)
++{
++	*ep = pmac->sppid; /* get the port_id from pmac's sppid */
++	if (dp_port_info[inst][*ep].alloc_flags & DP_F_LOOPBACK) {
++		*ep = GET_VAP((u32)pmac->src_sub_inf_id2 +
++				      (u32)(pmac->src_sub_inf_id << 8),
++			      PORT_INFO(inst, *ep, vap_offset),
++			      PORT_INFO(inst, *ep, vap_mask));
++		*vap = 0;
++		*decryp = 1;
++	} else {
++		*vap = GET_VAP((u32)pmac->src_sub_inf_id2 +
++				       (u32)(pmac->src_sub_inf_id << 8),
++			       PORT_INFO(inst, *ep, vap_offset),
++			       PORT_INFO(inst, *ep, vap_mask));
++	}
++}
++
++/*
++ * get_dma_pmac_templ — AVM:592-602 verbatim. Applies the per-CTP DMA1
++ * mask-and-OR template plus optional pmac header memcpy.
++ */
++static void get_dma_pmac_templ(int index, struct pmac_tx_hdr *pmac,
++			       struct dma_tx_desc_0 *desc_0,
++			       struct dma_tx_desc_1 *desc_1,
++			       struct pmac_port_info2 *dp_info)
++{
++	if (likely(pmac))
++		memcpy(pmac, &dp_info->pmac_template[index], sizeof(*pmac));
++	desc_1->all = (desc_1->all & dp_info->dma1_mask_template[index].all) |
++		      dp_info->dma1_template[index].all;
++}
++
++/*
++ * check_csum_cap — AVM:604-606 verbatim. Returns 1.
++ */
++static int check_csum_cap(void)
++{
++	return 1;
++}
++
++/*
++ * get_itf_start_end — AVM:608-616 verbatim. Optional out-pointer fill of
++ * the CTP-interface start/end range.
++ */
++static int get_itf_start_end(struct gsw_itf *itf_info, u16 *start, u16 *end)
++{
++	if (!itf_info)
++		return -1;
++	if (start)
++		*start = itf_info->start;
++	if (end)
++		*end = itf_info->end;
++
++	return 0;
++}
++
++/*
++ * Partial PCE programming is recoverable via dev_warn + continue; aborting on
++ * first failure could leave silicon in a worse state.
++ */
++static int __maybe_unused gswip30_program_queue_map(int inst, int portid)
++{
++	ethsw_api_dev_t *pethdev;
++	void *cdev;
++	int tc;
++
++	BUILD_BUG_ON(PCE_QUEUE_MAP_INDEX > 30);
++
++	pethdev = container_of(dp_port_prop[inst].ops[0],
++			       ethsw_api_dev_t, ops);
++	cdev = pethdev;
++
++	for (tc = 0; tc < 16; tc++) {
++		/*
++		 * pctbl_prog_t carries fixed-size key[34]/mask[4]/val[31]
++		 * arrays. The matching {num_key, num_mask, num_val} triplet
++		 * lives in the gsw_pce_tbl_info_30[] table-shape descriptor
++		 * inside switch-api/gsw_flow_pce.c — the helper reads
++		 * gswdev->pce_tbl_info[table].num_val to decide how many
++		 * val[] entries to push. For PCE_QUEUE_MAP_INDEX the shape
++		 * descriptor sets num_val=1, so a zero-initialised val[0]=0
++		 * (default queue) is exactly what is programmed.
++		 */
++		pctbl_prog_t ptbl = {
++			.table = PCE_QUEUE_MAP_INDEX,
++			.pcindex = (u16)((portid << 4) | tc),
++		};
++		int ret;
++
++		ret = gsw_pce_table_write(cdev, &ptbl);
++		if (ret != 0) {
++			dev_warn(dp_dev,
++				 "gswip30_program_queue_map: gsw_pce_table_write tc=%d failed=%d\n",
++				 tc, ret);
++			continue;
++		}
++	}
++	return 0;
++}
++
++/*
++ * The cap struct is zero-initialised by memset(&cap, 0, sizeof(cap)) at
++ * function entry, so unassigned fields default to NULL.
++ */
++int register_dp_cap_gswip30(int flag)
++{
++	struct dp_hw_cap cap;
++
++	memset(&cap, 0, sizeof(cap));
++	cap.info.type = GSWIP30_TYPE;
++	cap.info.ver = GSWIP30_VER;
++	cap.info.dp_platform_set = dp_platform_set;
++	cap.info.port_platform_set = port_platform_set;
++	cap.info.dev_platform_set = dev_platform_set;
++	cap.info.subif_platform_set_unexplicit = subif_platform_set_unexplicit;
++	cap.info.init_dma_pmac_template = init_dma_pmac_template;
++	cap.info.subif_platform_set = subif_platform_set;
++	cap.info.not_valid_rx_ep = not_valid_rx_ep;
++	cap.info.set_pmac_subif = set_pmac_subif;
++	cap.info.update_port_vap = update_port_vap;
++	cap.info.check_csum_cap = check_csum_cap;
++	cap.info.get_dma_pmac_templ = get_dma_pmac_templ;
++	cap.info.get_itf_start_end = get_itf_start_end;
++	cap.info.dump_rx_dma_desc = dump_rx_dma_desc;
++	cap.info.dump_tx_dma_desc = dump_tx_dma_desc;
++	cap.info.dump_rx_pmac = dump_rx_pmac;
++	cap.info.dump_tx_pmac = dump_tx_pmac;
++	cap.info.supported_logic_dev = supported_logic_dev;
++	cap.info.cap.tx_hw_chksum = 1;
++	cap.info.cap.rx_hw_chksum = 1;
++	cap.info.cap.hw_tso = 1;
++	cap.info.cap.hw_gso = 1;
++	strncpy(cap.info.cap.qos_eng_name, "TMU",
++		sizeof(cap.info.cap.qos_eng_name));
++	strncpy(cap.info.cap.pkt_eng_name, "PAE/MPE",
++		sizeof(cap.info.cap.pkt_eng_name));
++	cap.info.cap.max_num_queues = 128;
++	cap.info.cap.max_num_scheds = 128;
++	cap.info.cap.max_num_deq_ports = 24;
++	cap.info.cap.max_num_qos_ports = 24;
++	cap.info.cap.max_num_dp_ports = PMAC_MAX_NUM;
++	cap.info.cap.max_num_subif_per_port = 16;
++	cap.info.cap.max_num_subif = 256;
++	cap.info.cap.max_num_bridge_port = 0;
++
++	if (register_dp_hw_cap(&cap, flag)) {
++		dev_err(dp_dev, "Why register_dp_hw_cap fail\n");
++		return -1;
++	}
++
++	dev_info(dp_dev,
++		 "dp-gswip30: hw cap registered, type=%d ver=%d max_dp_ports=%u max_subif=%u\n",
++		 cap.info.type, cap.info.ver,
++		 cap.info.cap.max_num_dp_ports, cap.info.cap.max_num_subif);
++	return 0;
++}
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_misc.h b/drivers/net/ethernet/lantiq/datapath/datapath_misc.h
+new file mode 100644
+index 000000000000..25c6c09ebd04
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_misc.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) Intel Corporation Author: Shao Guohua <guohua.shao@intel.com>
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * datapath/gswip30/datapath_misc.h.
++ *
++ * Declarations for the GSWIP-3.0 datapath platform hooks.
++ */
++
++#ifndef DATAPATH_MISC30_H
++#define DATAPATH_MISC30_H
++
++#include <linux/types.h>
++#include <linux/seq_file.h>
++
++#define PMAC_MAX_NUM 16
++#define PAMC_LAN_MAX_NUM 7
++#define VAP_OFFSET 8
++#define VAP_MASK 0xF
++#define VAP_DSL_OFFSET 3
++#define NEW_CBM_API 1
++
++#define GSWIP_L 0
++#define GSWIP_R 1
++#define MAX_SUBIF_PER_PORT 16
++/* PMAC_SIZE comes from datapath.h - do not redefine here. */
++
++struct gsw_itf {
++	u8 ep;    /* -1 means no assigned yet for dynamic case */
++	u8 fixed; /* fixed (1) or dynamically allocate (0) */
++	u16 start;
++	u16 end;
++	u16 n;
++};
++
++#define SET_PMAC_PORTMAP(pmac, port_id)                          \
++	do {                                                     \
++		if ((port_id) <= 7)                              \
++			(pmac)->port_map2 = 1 << (port_id);      \
++		else                                             \
++			(pmac)->port_map = (1 << (port_id - 8)); \
++	} while (0)
++
++#define SET_PMAC_SUBIF(pmac, subif)                             \
++	do {                                                    \
++		(pmac)->src_sub_inf_id2 = (subif) & 0xff;       \
++		(pmac)->src_sub_inf_id = ((subif) >> 8) & 0x1f; \
++	} while (0)
++
++int dp_sub_proc_install_30(void);
++void dp_sys_mib_reset_30(u32 flag);
++int dp_set_gsw_parser_30(u8 flag, u8 cpu, u8 mpe1, u8 mpe2, u8 mpe3);
++int dp_get_gsw_parser_30(u8 *cpu, u8 *mpe1, u8 *mpe2, u8 *mpe3);
++int gsw_mib_reset_30(int dev, u32 flag);
++
++ssize_t proc_get_qid_via_index(struct file *file, const char *buf,
++			       size_t count, loff_t *ppos);
++int lookup_dump30(struct seq_file *s, int pos);
++int lookup_start30(void);
++ssize_t proc_get_qid_via_index30(struct file *file, const char *buf,
++				 size_t count, loff_t *ppos);
++
++#endif /* DATAPATH_MISC30_H */

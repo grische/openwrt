@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 27 Aug 2026 12:51:32 +0200
+Subject: net: lantiq: xrx500-phy-fw: sleep through the firmware boot delay
+
+After the per-PHY reset loop, the probe waits 100 ms for the GPHY
+firmware to come up. It waited with mdelay(), which busy-spins a CPU for
+the whole 100 ms. Probe context can sleep, so it should: msleep() gives
+the time back to whatever else wants to run during boot. Nothing here
+holds a lock or runs with interrupts off.
+
+AVM's 08.25 GPL release makes the same change (msleep(100) in
+drivers/net/ethernet/lantiq/xrx500_phy_fw.c of Linux 4.9.337,
+against mdelay(100) at :141 of Linux 4.9.198).
+
+That one line is the whole of what is taken from AVM's rewrite of this
+file. The rest of 08.25's version is a multi-SoC restructuring whose
+fixes this port already made independently, mostly better: a per-PHY
+devm_reset_control_get() instead of AVM's single file-scope reset
+pointer that each iteration clobbers -- which this file's header comment
+has called out as a latent AVM bug since it was written -- an ioremap
+driven by the DT reg property, a managed DMA allocation, and silicon-id
+validation before anything touches reset control. AVM's
+devm_reset_control_get_optional() is specifically not adopted: both our
+device trees declare every PHY, so a missing reset line is a broken DT
+rather than a configuration, and the mandatory get with its named error
+message says which line is missing.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+index dbf7ad6680ce..1d2c0861f09f 100644
+--- a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
++++ b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+@@ -493,7 +493,8 @@ static int xway_phy_fw_probe(struct platform_device *pdev)
+ 			return ret;
+ 	}
+ 
+-	mdelay(100);
++	/* Let the GPHY firmware boot. Probe context sleeps; no need to spin. */
++	msleep(100);
+ 
+ 	pr_info("xrx500-phy-fw: loaded %s size=%zu sha256-prefix=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+ 		fw_name, fw_size,

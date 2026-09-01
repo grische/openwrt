@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 02:53:21 +0200
+Subject: MIPS: dts: intel-mips: describe the FRITZ!Box 7590 WAN port
+
+The board's fifth Ethernet port, on the second GSWIP instance.
+
+intel,dp-port-id = <15> is forced rather than chosen: DP_F_FAST_ETH_WAN
+drives the datapath allocator over a range whose start and end are both
+PMAC_ETH_WAN_ID, so the WAN class can only land on datapath port 15. The
+driver now rejects a lantiq,wan on any other port rather than quietly
+handing it the wrong PMAC template.
+
+lantiq,wan is not redundant with the port id. It is what selects the PMAC
+template, the two Ethernet classes differ only in the redirect bit, and
+nothing else on the node implies it. It is also the property the vendor's
+own board glue reads.
+
+Everything downstream follows from those two: the CQM resolves dequeue
+port 19 (which is also the TMU egress port), TMU queue 28, scheduler
+block 12 and DMA1TX channel 15 out of its ported vendor tables. The
+controller is the part worth noticing - every LAN port drains via DMA2TX
+and this one does not.
+
+The fifth GPHY is deliberately still absent, pending the reset-bit-31
+question, and the consequence is worse than "WAN stays dark" so both
+comments now say it outright: with no firmware the WAN PHY does not
+answer MDIO, no phy_device is created, and phylink_of_phy_connect returns
+-ENODEV. That is not deferred and not confined to this port - probe
+requires every declared port to come up, so it rolls back the four
+working LAN netdevs too and the board ends up with no ethernet at all.
+The fifth GPHY must land before this board is booted.
+
+dtc: all three boards build; the 7560 and easy350_anywan DTBs are
+byte-identical to before this commit.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index e6ba85f127e1..dc1eeaa54a41 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -172,7 +172,14 @@ partition@1500000 {
+  * and they reverted to ROM.
+  *
+  * Adding the fifth PHY is one appended entry in each of these three
+- * properties. It lands with the WAN port it serves.
++ * properties: phy_id 0x0F, reset-name "phyF", and its reset cell.
++ *
++ * ⚠ Until it is added THIS BOARD HAS NO ETHERNET AT ALL, not merely no WAN.
++ * The WAN port declared above hard-requires its PHY: with no firmware the PHY
++ * does not answer MDIO, phylink_of_phy_connect returns -ENODEV rather than
++ * deferring, and the driver requires every declared port to come up, so the
++ * four working LAN netdevs are rolled back with it. Land the fifth GPHY
++ * before booting this board.
+  */
+ &gphy_fw {
+ 	phy_id = <0x02 0x03 0x04 0x05>;
+@@ -218,3 +225,40 @@ gphy_wan: ethernet-phy@1 {
+ 		};
+ 	};
+ };
++
++/*
++ * The WAN port, on the second GSWIP instance.
++ *
++ * intel,dp-port-id = <15> is not a free choice: DP_F_FAST_ETH_WAN drives the
++ * datapath allocator over a range whose start and end are both
++ * PMAC_ETH_WAN_ID, so the WAN class can only ever land on datapath port 15.
++ * The driver rejects a lantiq,wan on any other port rather than quietly
++ * giving it the wrong PMAC template.
++ *
++ * lantiq,wan is what selects that template. It is not redundant with the port
++ * id: the two Ethernet classes differ only in the PMAC redirect bit, which no
++ * address or phy property implies, and it is the property the vendor's own
++ * board glue reads.
++ *
++ * From here the CQM resolves the rest out of its ported vendor tables --
++ * dequeue port 19 (which is also the TMU egress port), TMU queue 28,
++ * scheduler block 12, DMA1TX channel 15. Note the controller: every LAN port
++ * egresses via DMA2TX, this one does not.
++ *
++ * ⚠ ORDERING: this port cannot come up until the fifth GPHY is added to
++ * &gphy_fw below. Without its firmware the WAN PHY does not answer MDIO, no
++ * phy_device is created for gphy_wan, and phylink_of_phy_connect returns
++ * -ENODEV -- which is NOT deferred and NOT confined to this port. Probe
++ * requires every declared port to come up, so the failure rolls back the four
++ * working LAN netdevs with it and the board ends up with no ethernet at all.
++ * Adding the fifth GPHY is three appended entries; see the comment on
++ * &gphy_fw.
++ */
++&intel_xrx500_net {
++	port@4 {
++		reg = <4>;
++		intel,dp-port-id = <15>;
++		lantiq,wan;
++		phy-handle = <&gphy_wan>;
++	};
++};

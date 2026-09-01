@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 08:38:03 +0200
+Subject: MIPS: dts: intel-mips: add the FRITZ!Box 7590's fifth GPHY
+
+The WAN PHY: silicon id 0x0F on RCU reset bit 31, reset-name "phyF".
+
+This is a device-tree-only change. xrx500_phy_fw.c has carried the fifth
+table entry since the port began - RCU_RD_GPHYF_XRX500 = BIT(31) with
+LBADR 0x268 at index 4 - and seale_avm.dtsi already sizes the aperture
+to 0x280, which covers LBADR/MBADR at 0x268/0x26C. Only the three DT
+properties were missing.
+
+Bit 31 was the open question. On the GRX350 it behaves as the GPHY-group
+master reset: toggling it topples the clock group the four GE cores have
+just booted from and they revert to ROM. On the GRX550 it is not that.
+The vendor device tree's phy-xrx500@3c00 names five reset lines
+phy0..phy4 on bits 29/28/26/25/31, with bit 30 separately claimed as
+intel,global-reset by the reset-controller node itself, so bit 31 is
+GPHY4's own line and the group-master reading does not carry over. The
+bits are also non-contiguous and out of order - 29, 28, 26, 25, 31, 27
+unused - so no closed-form expression can generate them.
+
+The second cell is the RST_STAT status bit and is set to 31 to match.
+Its semantics are unvalidated on GRX550, and RST_STAT bit 31 doubles as
+the watchdog reset cause, so a poll of it could observe the watchdog's
+bit rather than the PHY's. It cannot happen on this path. The
+firmware loader acquires the handle only so the named-line lookup
+succeeds, then discards it - xrx500_phy_fw.c:257, "(void)phy_rst" - and
+drives RCU_RST_REQ by direct read-modify-write at :297 (assert) and :322
+(deassert), taking the bit from xrx500_gphy[] rather than from the DT.
+reset_control_status() is the only reader of the status op in the reset
+core (core.c:631-641); no assert, deassert, reset, acquire or release
+path consults it, and our devm_reset_control_get is EXCLUSIVE, whose
+devres release only calls reset_control_put. Nothing in drivers/net
+calls reset_control_status at all. So the cell is consumed solely by the
+provider's "< nr_resets" bounds check (reset-lantiq.c:152-164), which 31
+passes, and by the shift into an opaque dedupe key. Worth noting for
+anyone tempted to modernise the loader onto the reset framework: doing
+so would make the poll live, and lantiq_rcu_reset_update() would then
+spin on that bit for up to 10000 iterations before returning -ETIMEDOUT.
+
+This also corrects the previous commit's own prediction on the record.
+Landing the WAN port without this GPHY does not merely leave WAN dark.
+of_mdiobus_register tolerates a PHY that does not answer and registers
+the bus without it, so no phy_device is created and
+phylink_of_phy_connect -> phylink_fwnode_phy_connect returns -ENODEV
+(phylink.c:2301-2302) rather than -EPROBE_DEFER. Probe requires every
+declared port to come up, so the failure rolls back all five netdevs and
+the board has no ethernet at all.
+
+dtc: all three boards build; the 7590 builds warning-free and the fifth
+entry is present in the DTB. The 7560 and easy350_anywan are untouched -
+neither includes this file.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index dc1eeaa54a41..119ee3ad01f9 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -163,31 +163,45 @@ partition@1500000 {
+ };
+ 
+ /*
+- * The four LAN GPHYs, which are the same four the FRITZ!Box 7560 has: silicon ids
+- * 0x02..0x05 on RCU reset bits 29 / 28 / 26 / 25, in that order.
++ * All five GPHYs. The first four are the ones the FRITZ!Box 7560 also has -- silicon
++ * ids 0x02..0x05 on RCU reset bits 29 / 28 / 26 / 25 -- and the fifth, silicon
++ * id 0x0F on bit 31, is this board's WAN PHY. The bits are non-contiguous and
++ * out of order: 29, 28, 26, 25, 31, with 27 unused. No closed form fits them,
++ * which is why every entry is spelled out.
+  *
+- * AVM's own DTS gives the fifth reset as bit 31, but bit 31 was found on the
+- * GRX350 to be the GPHY-GROUP MASTER reset rather than a per-PHY GE reset --
+- * toggling it toppled the clock group the four GE cores had just booted from,
+- * and they reverted to ROM.
++ * That reading does not carry over to the GRX550. The vendor's own device
++ * tree names bit 31 "phy4" -- the fifth GPHY's individual reset line --
++ * alongside 29/28/26/25 for phy0..phy3 and bit 30 for the global chip reset,
++ * and its console boots all five GPHYs from this one GSW-L-side block.
+  *
+- * Adding the fifth PHY is one appended entry in each of these three
+- * properties: phy_id 0x0F, reset-name "phyF", and its reset cell.
++ * The second cell is the RST_STAT status bit. It is inert on this path: the
++ * firmware loader takes the reset_control handle only so the named-line
++ * lookup succeeds and then discards it outright -- xrx500_phy_fw.c:257,
++ * "(void)phy_rst" -- and drives RCU_RST_REQ by direct read-modify-write
++ * instead (:297 assert, :322 deassert), with the bit coming from its own
++ * xrx500_gphy[] table rather than from the DT. Neither cell ever reaches the
++ * provider's .status op, which is the only thing in the reset framework that
++ * reads the status register. Both cells must still clear the provider's "<
++ * nr_resets" bounds check, which 31 does.
+  *
+- * ⚠ Until it is added THIS BOARD HAS NO ETHERNET AT ALL, not merely no WAN.
+- * The WAN port declared above hard-requires its PHY: with no firmware the PHY
+- * does not answer MDIO, phylink_of_phy_connect returns -ENODEV rather than
+- * deferring, and the driver requires every declared port to come up, so the
+- * four working LAN netdevs are rolled back with it. Land the fifth GPHY
+- * before booting this board.
++ * The aperture in seale_avm.dtsi is already sized for five: GPHYF's LBADR and
++ * MBADR sit at offsets 0x268 and 0x26C, inside reg = <0x1c003c00 0x280>.
++ *
++ * All five entries are load-bearing for every port, not just the WAN one. A
++ * PHY with no firmware does not answer MDIO; of_mdiobus_register tolerates
++ * that and brings the bus up without it, but no phy_device is created, so
++ * phylink_of_phy_connect -> phylink_fwnode_phy_connect returns -ENODEV rather
++ * than -EPROBE_DEFER. Probe requires every declared port to come up, so that
++ * one failure rolls the four working LAN netdevs back with it.
+  */
+ &gphy_fw {
+-	phy_id = <0x02 0x03 0x04 0x05>;
++	phy_id = <0x02 0x03 0x04 0x05 0x0F>;
+ 	resets = <&rcu_reset0 29 29>,
+ 		 <&rcu_reset0 28 28>,
+ 		 <&rcu_reset0 26 26>,
+-		 <&rcu_reset0 25 25>;
+-	reset-names = "phy2", "phy3", "phy4", "phy5";
++		 <&rcu_reset0 25 25>,
++		 <&rcu_reset0 31 31>;
++	reset-names = "phy2", "phy3", "phy4", "phy5", "phyF";
+ };
+ 
+ /*

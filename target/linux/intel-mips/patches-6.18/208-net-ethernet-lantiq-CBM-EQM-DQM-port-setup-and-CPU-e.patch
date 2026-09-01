@@ -1,0 +1,572 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:21:37 +0000
+Subject: net: ethernet: lantiq: CBM EQM/DQM port setup and CPU enqueue
+ primitive
+
+Add the CBM enqueue/dequeue port programming layer (cbm_dma.c):
+
+ - EQM DMA ingress ports (IGP5-8, standard and jumbo): port config
+   0x701, occupancy clear, and staged ingress descriptors seeded
+   from genuine FSQM pool segments. Descriptor words are packed in
+   the hardware's big-endian layout with the OWN bit written last.
+   The reset-default admit watermark (WM) and DPTR value (0x101,
+   NSD|NJD) must be preserved on the RX admit ports - zeroing them
+   makes the EQM discard every admitted frame with an
+   admit-discard reason code on warm boots.
+
+ - The TOE ingress port (IGP9) and the LDMA port (IGP15, 32
+   8-byte descriptors) are armed as the vendor driver arms them -
+   leaving them unarmed changes EQM arbitration behavior.
+
+ - EQM CPU ingress ports (IGP0-3): config 0xFC7 with all six
+   interrupt sources enabled; these ports both serve CPU TX
+   enqueue and must be armed before the first FSQM buffer pop.
+
+ - DQM ports: DMA egress ports (descriptor zero + DQREQ/DQPCEN/
+   EPMAP config) and CPU dequeue ports (dptr=1, cfg 0x10F) - the
+   latter are the host-RX return/dequeue ports.
+
+ - cbm_fsqm_buf_alloc/free: pop a segment from the FSQM hardware
+   free pool via BUFREQ and return it via the DQM pointer-return
+   window. These primitives are shared by the TX path (buffer
+   source + error rollback), the RX path (recycle) and probe-time
+   descriptor seeding. TX buffers MUST come from the FSQM pool:
+   the CBM store-forward machinery binds payload length via the
+   segment accounting, and frames sourced from arbitrary kmalloc
+   memory are transmitted as zero-length.
+
+ - cbm_cpu_enqueue_hw: the fire-and-forget CPU TX enqueue - four
+   descriptor words into the EQM CPU-port descriptor window,
+   committing DW3 (with own=0, the CPU-enqueue convention) last.
+
+Register sequences derived from the AVM FRITZ!Box 7560 GPL release
+(Linux 4.9.198), cqm/grx500/cbm.c, which carries no copyright notice
+of its own; the file header names it as the origin and per-function
+provenance is recorded in comments.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
+index fc9dafa6ddfc..a06bdabcfbce 100644
+--- a/drivers/net/ethernet/lantiq/Makefile
++++ b/drivers/net/ethernet/lantiq/Makefile
+@@ -27,3 +27,4 @@ intel-xrx500-mdio-y := xrx500_phy_fw.o
+ intel-xrx500-mdio-y += switch-api/mdio_xrx500.o
+ intel-xrx500-gswip-y += dma/hdma.o
+ intel-xrx500-gswip-y += cqm/grx500/cbm_basic.o cqm/grx500/cbm_buf.o cqm/grx500/fsqm.o
++intel-xrx500-gswip-y += cqm/grx500/cbm_dma.o
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dma.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dma.c
+new file mode 100644
+index 000000000000..bab4217ade16
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dma.c
+@@ -0,0 +1,507 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/cqm/grx500/cbm.c.
++ *
++ * CBM DMA port bring-up: the EQM ingress and DQM egress ports, their staging
++ * descriptors, and the enqueue/dequeue primitives the netdev uses.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <linux/build_bug.h>
++#include <linux/io.h>
++#include <linux/types.h>
++#include <linux/device.h>
++#include <linux/dev_printk.h>
++#include <linux/ratelimit.h>
++#include <linux/errno.h>
++#include <linux/smp.h>
++#include <asm/io.h>
++#include <asm/barrier.h>
++
++#include <net/cqm_cbm_api.h>
++#include "cbm.h"
++
++/*
++ * Local mirrors of AVM constants from include/net/lantiq_cbm_api.h:114 and
++ * cqm/cqm_common.h:15.
++ */
++#define CBM_PORT_F_STANDARD_BUF  0x1U
++#define CBM_PORT_F_JUMBO_BUF     0x2U
++#define CBM_DMA_DESC_OWN         1U
++
++/*
++ * Build-time guard for the DMA data offset: CBM_FIXED_RX_OFFSET is
++ * CBM_GRX550_DMA_DATA_OFFSET plus NET_IP_ALIGN plus NET_SKB_PAD, and must
++ * stay >= 128 so a descriptor's data pointer never lands inside the PMAC
++ * header. The check is a BUILD_BUG_ON inside a function rather than a
++ * file-scope static_assert because NET_SKB_PAD expands to a statement
++ * expression, which is not an integer constant expression.
++ */
++
++/*
++ * setup_eqm_dma_desc - stage @desc_count EQM descriptors for DMA port @pid
++ * into the SDESC0_0_IGP_5 + (pid-5)*0x1000 window.
++ *
++ * @pid:        EQM DMA port id (>= 5; AVM cbm_assert at 1287). The
++ *              per-port descriptor window starts at SDESC0_0_IGP_5 with
++ *              (pid-5)*0x1000 stride.
++ *
++ * @desc_count: number of descriptors to stage; AVM hardcodes 2 in
++ * init_cbm_eqm_dma_port.
++ *
++ * @flags: caller flag — CBM_PORT_F_STANDARD_BUF selects std pool, otherwise
++ * jbo.
++ *
++ * @buf_offset: data_offset added to the buffer phys addr; must equal
++ *              CBM_FIXED_RX_OFFSET at the init_cbm_eqm_dma_port call site.
++ */
++int setup_eqm_dma_desc(int pid, int desc_count, u32 flags, u32 buf_offset)
++{
++	int desc_idx;
++
++	BUILD_BUG_ON(CBM_FIXED_RX_OFFSET < 128);
++
++	if (pid < 5) {
++		pr_err("cbm: setup_eqm_dma_desc: pid=%d < 5 (illegal)\n", pid);
++		return -EINVAL;
++	}
++	if (desc_count <= 0) {
++		pr_err("cbm: setup_eqm_dma_desc: desc_count=%d <= 0\n",
++		       desc_count);
++		return -EINVAL;
++	}
++	if (!g_cbm_dma_desc_base) {
++		pr_err("cbm: setup_eqm_dma_desc: g_cbm_dma_desc_base not mapped\n");
++		return -ENODEV;
++	}
++
++	for (desc_idx = 0; desc_idx < desc_count; desc_idx++) {
++		/*
++		 * Per-descriptor base inside the CBM DMA-descriptor staging
++		 * window (g_cbm_dma_desc_base, DT reg idx 11 @ phys
++		 * 0x1e500000 — a SEPARATE MMIO window from the EQM register
++		 * window). AVM computes desc_base = CBM_DMADESC_BASE +
++		 * CBM_EQM_DMA_DESC(...) (cqm/grx500/cbm.c:1290): the
++		 * descriptors are NOT in the EQM register window.
++		 * SDESC0_0_IGP_5 = 0x0 is the offset of the staging window's
++		 * first descriptor within g_cbm_dma_desc_base.
++		 */
++		u32 jbo_flag = (flags & CBM_PORT_F_STANDARD_BUF) ? 0 : 1;
++		u32 base = SDESC0_0_IGP_5 + (pid - 5) * 0x1000
++			   + desc_idx * 16 + jbo_flag * 0x800;
++		u32 frm_size;
++		u32 buf_phys;
++		u32 reg1;
++		u32 reg2;
++
++		if (flags & CBM_PORT_F_STANDARD_BUF)
++			frm_size = g_cbm_buff.std_frm_size;
++		else
++			frm_size = g_cbm_buff.jbo_frm_size;
++
++		{
++			int cpu_pid = smp_processor_id();
++			u32 popped_phys = 0;
++			void *va = cbm_fsqm_buf_alloc(cpu_pid, flags, &popped_phys);
++
++			if (!va) {
++				pr_err("cbm: setup_eqm_dma_desc: FSQM pop failed (pid=%d desc=%d)\n",
++				       pid, desc_idx);
++				return -ENOMEM;
++			}
++			buf_phys = popped_phys;
++		}
++
++		/*
++		 * AVM cbm.c:1310-1314 packing (verbatim):
++		 *   reg1 = (buf + data_offset) & ~0x7;
++		 *   reg2 = frm_size;
++		 *   reg2 |= ((buf + data_offset) & 0x7) << 23;
++		 *   reg2 |= (CBM_DMA_DESC_OWN << 31);
++		 */
++		reg1 = (buf_phys + buf_offset) & ~0x7U;
++		reg2 = frm_size;
++		reg2 |= ((buf_phys + buf_offset) & 0x7U) << 23;
++		reg2 |= (CBM_DMA_DESC_OWN << 31);
++
++#ifdef CONFIG_CPU_BIG_ENDIAN
++		__raw_writel(0,    g_cbm_dma_desc_base + base + 0x4);
++		__raw_writel(0,    g_cbm_dma_desc_base + base + 0x0);
++		__raw_writel(reg1, g_cbm_dma_desc_base + base + 0xC); /* buf ptr */
++		wmb();
++		__raw_writel(reg2, g_cbm_dma_desc_base + base + 0x8); /* OWN/size */
++		wmb();
++#else
++		__raw_writel(0,    g_cbm_dma_desc_base + base + 0x0);
++		__raw_writel(0,    g_cbm_dma_desc_base + base + 0x4);
++		__raw_writel(reg1, g_cbm_dma_desc_base + base + 0x8); /* buf ptr */
++		wmb();
++		__raw_writel(reg2, g_cbm_dma_desc_base + base + 0xC); /* OWN/size */
++		wmb();
++#endif
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(setup_eqm_dma_desc);
++
++/* init_cbm_eqm_dma_port - per-port EQM DMA bring-up. */
++int init_cbm_eqm_dma_port(int idx, u32 flags)
++{
++	int ret;
++
++	if (!g_cbm_eqm_base) {
++		pr_err("cbm: init_cbm_eqm_dma_port: g_cbm_eqm_base not mapped\n");
++		return -ENODEV;
++	}
++
++	/*
++	 * The vendor makes exactly three hardware effects for a DMA ingress
++	 * port (cbm.c:1335-1342): cfg = 0x701, pocc = 0, and the staging
++	 * descriptors. It never writes wm/irncr/irnen/dptr/dicc/eqpc, which
++	 * are cold-reset or hardware-managed.
++	 */
++
++	/* (a) CFG_DMA_IGP_<idx> = 0x701 — enable backpressure (AVM cbm.c:1339) */
++	__raw_writel(0x701, g_cbm_eqm_base + CFG_DMA_IGP_5 + idx * 0x1000);
++	/* (b) POCC_DMA_IGP_<idx> = 0 — clear per-port occupancy (AVM cbm.c:1340) */
++	__raw_writel(0,     g_cbm_eqm_base + CFG_DMA_IGP_5 + idx * 0x1000
++				+ offsetof(struct cbm_eqm_dma_igp_reg, pocc));
++	ret = setup_eqm_dma_desc(idx + 5, 2, flags, CBM_FIXED_RX_OFFSET);
++	if (ret) {
++		pr_err("cbm: init_cbm_eqm_dma_port: setup_eqm_dma_desc(idx=%d) failed: %d\n",
++		       idx, ret);
++		return ret;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(init_cbm_eqm_dma_port);
++
++/*
++ * init_cbm_eqm_ldma_port() - arm the EQM DMA ingress port the DSL companion
++ * feeds.
++ *
++ * The vendor runs this sequence unconditionally at boot, with no driver gate,
++ * so arming the port with no consumer attached is its own steady state.
++ */
++int init_cbm_eqm_ldma_port(void)
++{
++	int i;
++
++	if (!g_cbm_eqm_base) {
++		pr_err("cbm: init_cbm_eqm_ldma_port: g_cbm_eqm_base not mapped\n");
++		return -ENODEV;
++	}
++
++	for (i = 0; i < 32; i++) {
++		void __iomem *desc = g_cbm_eqm_base + SDESC0_0_IGP_15 + i * 8;
++		u32 buf_phys = 0;
++		void *va = cbm_fsqm_buf_alloc(smp_processor_id(),
++					      CBM_PORT_F_STANDARD_BUF,
++					      &buf_phys);
++
++		if (!va) {
++			pr_err("cbm: init_cbm_eqm_ldma_port: FSQM pop failed (desc=%d)\n",
++			       i);
++			return -ENOMEM;
++		}
++		__raw_writel(buf_phys, desc + 0x4);
++		wmb();
++		__raw_writel(0x80000800, desc);
++		wmb();
++	}
++
++	__raw_writel(0x1B01, g_cbm_eqm_base + CFG_DMA_IGP_15);
++	__raw_writel(0,      g_cbm_eqm_base + POCC_DMA_IGP_15);
++	__raw_writel((128 << 16) | (128 / 3 * 2),
++		     g_cbm_eqm_base + WM_DMA_IGP_15);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(init_cbm_eqm_ldma_port);
++
++int init_cbm_eqm_cpu_port(int idx)
++{
++	if (!g_cbm_eqm_base) {
++		pr_err("cbm: init_cbm_eqm_cpu_port: g_cbm_eqm_base not mapped\n");
++		return -ENODEV;
++	}
++	if (idx < 0 || idx >= 4) {
++		pr_err("cbm: init_cbm_eqm_cpu_port: idx=%d out of range (0..3)\n",
++		       idx);
++		return -EINVAL;
++	}
++
++	cbm_eqm_w32(CBM_EQM_CPU_PORT(idx, cfg), 0xFC7);
++	cbm_eqm_w32(CBM_EQM_CPU_PORT(idx, pocc), 0);
++	cbm_eqm_w32(CBM_EQM_CPU_PORT(idx, irnen), 0x3F);
++	wmb();
++	return 0;
++}
++EXPORT_SYMBOL_GPL(init_cbm_eqm_cpu_port);
++
++/* FSQM free-segment pool empty marker + BUFREQ spin bound (AVM cbm.c). */
++#define CBM_FSQM_BUF_EMPTY        0xFFFFF800U
++#define CBM_FSQM_BUF_WAIT_CYCLES  20U  /* AVM DEFAULT_WAIT_CYCLES (cqm_common.h:19) */
++
++/*
++ * cbm_fsqm_buf_alloc - pop a buffer segment from the FSQM hardware
++ * free-segment pool via the EQM CPU-port BUFREQ register.
++ */
++void *cbm_fsqm_buf_alloc(int pid, u32 flags, u32 *buf_phys)
++{
++	u32 reg;
++	u32 buf_addr = CBM_FSQM_BUF_EMPTY;
++	unsigned int i = 0;
++	bool jumbo = !(flags & CBM_PORT_F_STANDARD_BUF);
++	void *va;
++
++	if (!g_cbm_eqm_base) {
++		pr_err_ratelimited("cbm: cbm_fsqm_buf_alloc: g_cbm_eqm_base not mapped\n");
++		return NULL;
++	}
++	if (pid < 0 || pid >= 4) {
++		pr_err_ratelimited("cbm: cbm_fsqm_buf_alloc: pid=%d out of range\n",
++				   pid);
++		return NULL;
++	}
++
++	reg = jumbo ? CBM_EQM_CPU_PORT(pid, new_jptr)
++		    : CBM_EQM_CPU_PORT(pid, new_sptr);
++	do {
++		buf_addr = cbm_eqm_r32(reg);
++	} while ((buf_addr & CBM_FSQM_BUF_EMPTY) == CBM_FSQM_BUF_EMPTY &&
++		 i++ < CBM_FSQM_BUF_WAIT_CYCLES);
++
++	if ((buf_addr & CBM_FSQM_BUF_EMPTY) == CBM_FSQM_BUF_EMPTY) {
++		pr_err_ratelimited("cbm: cbm_fsqm_buf_alloc(pid=%d): FSQM %s pool empty\n",
++				   pid, jumbo ? "jumbo" : "std");
++		return NULL;
++	}
++
++	va = cbm_buf_phys_to_virt(buf_addr);
++	if (!va) {
++		pr_err_ratelimited("cbm: cbm_fsqm_buf_alloc: BUFREQ phys 0x%08x outside carve pool\n",
++				   buf_addr);
++		return NULL;
++	}
++
++	if (buf_phys)
++		*buf_phys = buf_addr;
++	return va;
++}
++EXPORT_SYMBOL_GPL(cbm_fsqm_buf_alloc);
++
++/*
++ * cbm_fsqm_buf_free - return a BUFREQ-popped standard segment to the FSQM
++ * free pool by writing its PHYSICAL (segment-aligned) address to the DQM
++ * CPU-port ptr_rtn register (AVM cbm_buffer_free_grx500, cbm.c:1039).
++ *
++ * Used ONLY to roll back a segment that was popped but never successfully
++ * enqueued (the hardware never took ownership, so it will not auto-recycle
++ * it). On the normal TX success path the CBM hardware recycles the segment
++ * automatically after the DMA2TX egress — do NOT call this there (the
++ * hardware still owns the buffer until egress).
++ */
++int cbm_fsqm_buf_free(int pid, u32 buf_phys)
++{
++	if (!g_cbm_dqm_base) {
++		pr_err_ratelimited("cbm: cbm_fsqm_buf_free: g_cbm_dqm_base not mapped\n");
++		return -ENODEV;
++	}
++	if (pid < 0 || pid >= 4)
++		return -EINVAL;
++
++	cbm_dqm_w32(CBM_DQM_CPU_PORT(pid, ptr_rtn),
++		    buf_phys & CBM_FSQM_BUF_EMPTY);
++	wmb();
++	return 0;
++}
++EXPORT_SYMBOL_GPL(cbm_fsqm_buf_free);
++
++#define CBM_DQM_EGP_CFG_DQREQ   0x1U      /* AVM CFG_DMA_EGP_6_DQREQ  (bit0) */
++#define CBM_DQM_EGP_CFG_DQPCEN  0x100U    /* AVM CFG_DMA_EGP_6_DQPCEN (bit8) */
++#define CBM_DQM_EGP_EPMAP_POS   16        /* AVM CFG_DMA_EGP_6_EPMAP_POS    */
++#define CBM_DQM_EGP_EPMAP_MASK  0x7F0000U /* AVM CFG_DMA_EGP_6_EPMAP_MASK   */
++
++/*
++ * setup_dqm_dma_desc — zero @desc_count dequeue-DMA descriptors for CBM
++ * dequeue port @pid in the DESC0_0_EGP_5 + (pid-5)*0x1000 staging window
++ * (g_cbm_dma_desc_base — the same descriptor window as the EQM side, just the
++ * EGP region). AVM cbm.c:1378-1392.
++ */
++static int setup_dqm_dma_desc(int pid, int desc_count)
++{
++	int i;
++
++	if (!g_cbm_dma_desc_base) {
++		pr_err("cbm: setup_dqm_dma_desc: g_cbm_dma_desc_base not mapped\n");
++		return -ENODEV;
++	}
++	for (i = 0; i < desc_count; i++) {
++		u32 base = DESC0_0_EGP_5 + (pid - 5) * 0x1000 + (i % 2) * 16;
++
++		__raw_writel(0, g_cbm_dma_desc_base + base + 0x0);
++		__raw_writel(0, g_cbm_dma_desc_base + base + 0x4);
++		__raw_writel(0, g_cbm_dma_desc_base + base + 0x8);
++		__raw_writel(0, g_cbm_dma_desc_base + base + 0xc);
++		wmb();
++	}
++	return 0;
++}
++
++/* init_cbm_dqm_dma_port - bring up CBM DQM DMA egress port @dqp. */
++int init_cbm_dqm_dma_port(int dqp)
++{
++	int dmap_idx = dqp - 6;
++	u32 ep_map = ((u32)dqp << CBM_DQM_EGP_EPMAP_POS) & CBM_DQM_EGP_EPMAP_MASK;
++	u32 cfg = CBM_DQM_EGP_CFG_DQREQ | CBM_DQM_EGP_CFG_DQPCEN | ep_map;
++	int ret;
++
++	if (!g_cbm_dqm_base) {
++		pr_err("cbm: init_cbm_dqm_dma_port: g_cbm_dqm_base not mapped\n");
++		return -ENODEV;
++	}
++	if (dqp < 6) {
++		pr_err("cbm: init_cbm_dqm_dma_port: dqp=%d < 6 (not a DMA egress port)\n",
++		       dqp);
++		return -EINVAL;
++	}
++
++	ret = setup_dqm_dma_desc(dqp, 2);
++	if (ret)
++		return ret;
++
++	__raw_writel(cfg, g_cbm_dqm_base + CFG_DMA_EGP_6 + dmap_idx * 0x1000);
++	wmb();
++	pr_info("cbm: init_cbm_dqm_dma_port: dqp=%d slot=%d CFG_DMA_EGP=0x%08x (EPMAP=%d DQREQ DQPCEN)\n",
++		dqp, dmap_idx, cfg, dqp);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(init_cbm_dqm_dma_port);
++
++int init_cbm_dqm_cpu_port(int idx)
++{
++	const u32 num_desc = 2;
++	u32 ep_map = ((u32)idx << CFG_CPU_EGP_0_EPMAP_POS) &
++		     CFG_CPU_EGP_0_EPMAP_MASK;
++	u32 cfg_val = 0x10F | ep_map;
++
++	if (!g_cbm_dqm_base) {
++		pr_err("cbm: init_cbm_dqm_cpu_port: g_cbm_dqm_base not mapped\n");
++		return -ENODEV;
++	}
++	if (idx < 0 || idx >= CPU_DQM_PORT_NUM) {
++		pr_err("cbm: init_cbm_dqm_cpu_port: idx=%d out of range (0..%d)\n",
++		       idx, CPU_DQM_PORT_NUM - 1);
++		return -EINVAL;
++	}
++
++	/* "Number of descriptors enabled = ND+1" (AVM cbm.c:1404). */
++	cbm_dqm_w32(CBM_DQM_CPU_PORT(idx, dptr), num_desc - 1);
++	cbm_dqm_w32(CBM_DQM_CPU_PORT(idx, cfg), cfg_val);
++	wmb();
++	pr_info("cbm: init_cbm_dqm_cpu_port: idx=%d CFG_CPU_EGP=0x%08x (EPMAP=%d dptr=%u)\n",
++		idx, cfg_val, idx, num_desc - 1);
++	return 0;
++}
++
++int dma_port_enable(u32 idx, int dqm_flag)
++{
++	int ret;
++
++	if (dqm_flag) {
++		dev_warn_ratelimited(NULL,
++				     "cbm: DQM-side dma_port_enable is not implemented, idx=%u\n",
++				     idx);
++		return -ENOSYS;
++	}
++
++	ret = init_cbm_eqm_dma_port((int)idx, CBM_PORT_F_STANDARD_BUF);
++	if (ret) {
++		pr_err("cbm: dma_port_enable: init_cbm_eqm_dma_port(idx=%u) failed: %d\n",
++		       idx, ret);
++		return ret;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(dma_port_enable);
++
++/*
++ * cbm_dequeue - return a buffer to CBM EQM CPU port @pid.
++ *
++ * @pid:    EQM CPU port id (0..CPU_EQM_PORT_NUM-1).
++ *
++ * @buf_ptr: physical/IOCU address of the buffer being returned.
++ */
++#define CBM_DEQUEUE_DEFAULT_WAIT_CYCLES  20U
++#define CBM_DEQUEUE_RCNT_CONSUMED        0xFFFFF800U
++
++int cbm_dequeue(int pid, u32 buf_ptr, u32 flags)
++{
++	u32 i = 0;
++	u32 rcnt_off;
++
++	(void)flags;
++
++	if (pid < 0) {
++		pr_err("cbm: cbm_dequeue: pid=%d < 0\n", pid);
++		return -EINVAL;
++	}
++	if (!g_cbm_eqm_base) {
++		pr_err("cbm: cbm_dequeue: g_cbm_eqm_base not mapped\n");
++		return -ENODEV;
++	}
++
++	rcnt_off = CBM_EQM_CPU_PORT(pid, rcnt);
++
++	/* Step 1: write the buffer pointer to the per-port rcnt register. */
++	__raw_writel(buf_ptr, g_cbm_eqm_base + rcnt_off);
++
++	/* Step 2: bounded wait for silicon to ack with 0xFFFFF800. */
++	while (__raw_readl(g_cbm_eqm_base + rcnt_off) !=
++		       CBM_DEQUEUE_RCNT_CONSUMED &&
++	       (i++) < CBM_DEQUEUE_DEFAULT_WAIT_CYCLES) {
++		/* spin */
++	}
++
++	if (i >= CBM_DEQUEUE_DEFAULT_WAIT_CYCLES) {
++		pr_err_ratelimited("cbm: cbm_dequeue: pid=%d buf=0x%x refcnt incr timeout (waited %u cycles)\n",
++				   pid, buf_ptr,
++				   CBM_DEQUEUE_DEFAULT_WAIT_CYCLES);
++		return -ETIMEDOUT;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(cbm_dequeue);
++
++/* cbm_cpu_enqueue_hw - faithful. */
++int cbm_cpu_enqueue_hw(int pid, u32 dw0, u32 dw1, u32 data_phys, u32 dw3)
++{
++	u32 base;
++
++	if (pid < 0 || pid >= 4) {
++		pr_err_ratelimited("cbm: cbm_cpu_enqueue_hw: pid=%d out of range\n",
++				   pid);
++		return -EINVAL;
++	}
++	if (!g_cbm_eqm_base) {
++		pr_err_ratelimited("cbm: cbm_cpu_enqueue_hw: g_cbm_eqm_base not mapped\n");
++		return -ENODEV;
++	}
++
++	/* Offset of desc0.desc0 in the per-CPU-port EQM window (AVM eqmdesc). */
++	base = CBM_EQM_CPU_PORT(pid, desc0.desc0);
++
++	cbm_eqm_w32(base + 0,  dw0);
++	cbm_eqm_w32(base + 4,  dw1);
++	cbm_eqm_w32(base + 8,  data_phys);
++	wmb();                      /* publish DW0..DW2 before the commit */
++	cbm_eqm_w32(base + 12, dw3); /* DW3 (own=0) commits the enqueue */
++	wmb();                      /* ensure commit is globally visible */
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(cbm_cpu_enqueue_hw);

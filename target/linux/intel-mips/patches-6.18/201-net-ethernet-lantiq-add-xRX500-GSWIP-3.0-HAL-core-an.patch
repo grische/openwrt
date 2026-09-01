@@ -1,0 +1,538 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:15:16 +0000
+Subject: net: ethernet: lantiq: add xRX500 GSWIP-3.0 HAL core and Kconfig
+ plumbing
+
+Add the C-side core of the GSWIP-3.0 switch support:
+
+ - gsw_flow_core.c: the per-instance device slot table, the
+   gsw_get_swcore_ops() dispatch used by the other subsystems, and
+   the four word/bitfield register accessors (gsw_r32/gsw_w32 and
+   their raw forms) over the ioremapped switch window, exported in
+   the GSWIP_INTERNAL symbol namespace.
+
+ - gsw_init.c: the platform driver binding the two SoC switch
+   instances ("intel,xrx500-gswip-3.0": GSW-L at 0x1c000000 and
+   GSW-R at 0x1a000000). The probe allocates and populates the
+   per-instance API device (structure layout ported from the vendor
+   headers), registers it in the slot table, then runs the PCE
+   microcode/core initialization added by the following patches;
+   after the second instance has probed it triggers the one-time
+   datapath registration.
+
+ - Kconfig/Makefile: the INTEL_XRX500_NET suite gate (selecting the
+   syscon/regmap/reset infrastructure the drivers need) and the
+   INTEL_XRX500_GSWIP_API tristate that builds everything as one
+   composite module, intel-xrx500-gswip. The suite is not yet wired
+   into drivers/net/ethernet/Makefile; that happens in the final
+   patch of the series, once every object referenced by the
+   composite exists, so the tree builds at every step.
+
+Both C files are derived from the AVM FRITZ!Box 7560 GPL release
+(Linux 4.9.198) switch-api module - Copyright (c) 2012-2015 Lantiq
+Deutschland GmbH, (c) 2016-2017 Intel Corporation; notices added to
+the files - with the register I/O rewritten for the v6.18 ioremap
+world and the ioctl/external-MDIO surface dropped.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/Kconfig b/drivers/net/ethernet/Kconfig
+index aead145dd91d..0ca6b91f798d 100644
+--- a/drivers/net/ethernet/Kconfig
++++ b/drivers/net/ethernet/Kconfig
+@@ -118,6 +118,7 @@ config LANTIQ_XRX200
+ 	  Support for the PMAC of the Gigabit switch (GSWIP) inside the
+ 	  Lantiq / Intel VRX200 VDSL SoC
+ 
++source "drivers/net/ethernet/lantiq/Kconfig"
+ source "drivers/net/ethernet/adi/Kconfig"
+ source "drivers/net/ethernet/litex/Kconfig"
+ source "drivers/net/ethernet/marvell/Kconfig"
+diff --git a/drivers/net/ethernet/lantiq/Kconfig b/drivers/net/ethernet/lantiq/Kconfig
+new file mode 100644
+index 000000000000..91e346075bad
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/Kconfig
+@@ -0,0 +1,35 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# Intel xRX500 GSWIP-3.x ethernet driver suite.
++#
++# INTEL_XRX500_NET is separate from LANTIQ_XRX200 because INTEL_MIPS and
++# LANTIQ are mutually exclusive entries in arch/mips/Kconfig's "System
++# type" choice, so this port cannot depend on SOC_TYPE_XWAY.
++
++menuconfig INTEL_XRX500_NET
++	bool "Intel xRX500 / GRX350 ethernet drivers"
++	depends on INTEL_MIPS && OF && HAS_IOMEM
++	default n
++	select MFD_SYSCON
++	select REGMAP_MMIO
++	select RESET_CONTROLLER
++	select RESET_LANTIQ
++	help
++	  Selects the Intel xRX500-family ethernet driver suite, beginning
++	  with a passive register-access HAL for the GSWIP-3.x switch core.
++	  Say N here unless you are building for a GRX350-class board such
++	  as the AVM FRITZ!Box 7560.
++
++	  Selects MFD_SYSCON + REGMAP_MMIO + RESET_CONTROLLER + RESET_LANTIQ
++	  because the rcu0 reset-controller (lantiq,xrx200-reset, declared
++	  inside the rcu@ syscon node) is the GPHY reset producer for the
++	  phy-xrx500 GPHY firmware loader. RESET_LANTIQ defaults to
++	  SOC_TYPE_XWAY which the INTEL_MIPS target does NOT set, and it
++	  lives inside the RESET_CONTROLLER menu, so both are selected here
++	  for the intel-mips/xrx500 family.
++
++if INTEL_XRX500_NET
++
++source "drivers/net/ethernet/lantiq/switch-api/Kconfig"
++
++endif # INTEL_XRX500_NET
+diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
+new file mode 100644
+index 000000000000..156a670a2e71
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/Makefile
+@@ -0,0 +1,12 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# Makefile for the Intel xRX500 ethernet driver suite.
++#
++# switch-api/, datapath/ and cqm/grx500/ all contribute objects to one
++# composite module, so the object list lives here rather than in the
++# subdirectory Makefiles: symbol resolution between them stays
++# intra-module and needs no exports.
++
++obj-$(CONFIG_INTEL_XRX500_GSWIP_API) += intel-xrx500-gswip.o
++
++intel-xrx500-gswip-y := switch-api/gsw_init.o switch-api/gsw_flow_core.o
+diff --git a/drivers/net/ethernet/lantiq/switch-api/Kconfig b/drivers/net/ethernet/lantiq/switch-api/Kconfig
+new file mode 100644
+index 000000000000..c5b8ec84e5a9
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/switch-api/Kconfig
+@@ -0,0 +1,22 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++config INTEL_XRX500_GSWIP_API
++	tristate "Intel xRX500 GSWIP-3.x register-access HAL"
++	depends on INTEL_XRX500_NET
++	#
++	# The netdev driver ships inside this composite and reaches its
++	# ports through PHYLINK.
++	#
++	select PHYLINK
++	default n
++	help
++	  Passive register-access HAL for the Intel xRX500 (GRX350-class)
++	  GSWIP-3.x switch core. This module binds two SoC-scope platform
++	  devices (gswip@1c000000 and gswip@1a000000), ioremaps their
++	  register windows, and exposes the four word/field accessors used
++	  by higher-level GSWIP feature drivers. It performs no PCE
++	  microcode load, no switch soft-reset toggle, no PHY/MDIO
++	  bring-up, no clock/reset gating, and no interrupt wiring.
++
++	  To compile this driver as a module, choose M here. The module
++	  will be called intel-xrx500-gswip.
+diff --git a/drivers/net/ethernet/lantiq/switch-api/Makefile b/drivers/net/ethernet/lantiq/switch-api/Makefile
+new file mode 100644
+index 000000000000..d90940efe662
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/switch-api/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# The intel-xrx500-gswip object list lives in ../Makefile.
+diff --git a/drivers/net/ethernet/lantiq/switch-api/gsw_flow_core.c b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_core.c
+new file mode 100644
+index 000000000000..b51153bacbb0
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_core.c
+@@ -0,0 +1,186 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2012, 2014, 2015 Lantiq Deutschland GmbH
++ * Copyright (c) 2016, 2017 Intel Corporation
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/switch-api/gsw_flow_core.c.
++ *
++ * GSWIP-3.0 register accessors and the per-instance device slot table.
++ */
++
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/errno.h>
++#include <linux/ethtool.h>
++#include <linux/export.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/printk.h>
++#include <linux/types.h>
++
++#include "gsw_init.h"
++#include "gsw_flow_core.h"
++
++/*
++ * Slot table for per-devid device pointers. Writers (gsw_devs_register and
++ * gsw_devs_unregister) take gsw_devs_lock; readers (gsw_get_swcore_ops and
++ * the register accessors) operate lock-free on the slot pointer because
++ * pointer load/store is atomic on every architecture this driver targets
++ * and the slot table outlives all consumers (driver unload would tear down
++ * consumers before the slot pointers are cleared).
++ */
++static ethsw_api_dev_t *gsw_devs[LTQ_GSW_DEV_MAX];
++static DEFINE_MUTEX(gsw_devs_lock);
++
++/**
++ * gsw_devs_register - install per-instance ethsw_api_dev_t in the slot table.
++ *
++ * @devid: the lantiq,gswip-instance value (must be < LTQ_GSW_DEV_MAX).
++ *
++ * @dev:   the devm-allocated per-instance state.
++ */
++int gsw_devs_register(u32 devid, ethsw_api_dev_t *dev)
++{
++	if (devid >= LTQ_GSW_DEV_MAX)
++		return -EINVAL;
++
++	if (!dev)
++		return -EINVAL;
++
++	mutex_lock(&gsw_devs_lock);
++	if (gsw_devs[devid]) {
++		pr_warn("gsw_devs_register: slot devid=%u already occupied\n",
++			devid);
++		mutex_unlock(&gsw_devs_lock);
++		return -EEXIST;
++	}
++	gsw_devs[devid] = dev;
++	mutex_unlock(&gsw_devs_lock);
++
++	return 0;
++}
++
++/**
++ * gsw_devs_unregister - clear the slot-table entry for @devid.
++ *
++ * @devid: the lantiq,gswip-instance value.
++ */
++void gsw_devs_unregister(u32 devid)
++{
++	if (devid >= LTQ_GSW_DEV_MAX)
++		return;
++
++	mutex_lock(&gsw_devs_lock);
++	gsw_devs[devid] = NULL;
++	mutex_unlock(&gsw_devs_lock);
++}
++
++/**
++ * gsw_get_swcore_ops - return the core_ops vtable for @devid.
++ *
++ * @devid: the lantiq,gswip-instance value.
++ */
++struct core_ops *gsw_get_swcore_ops(u32 devid)
++{
++	ethsw_api_dev_t *dev;
++
++	if (devid >= LTQ_GSW_DEV_MAX)
++		return NULL;
++
++	dev = gsw_devs[devid];
++	if (!dev)
++		return NULL;
++
++	return &dev->ops;
++}
++EXPORT_SYMBOL_NS_GPL(gsw_get_swcore_ops, "GSWIP_INTERNAL");
++
++/**
++ * gsw_r32_raw - read a 32-bit register at word-offset @offset.
++ *
++ * @cdev:   ethsw_api_dev_t pointer carrying the ioremap'd gsw_base.
++ *
++ * @offset: word-offset into the per-instance register window (NOT byte).
++ *
++ * @value:  out-parameter for the read value.
++ */
++void gsw_r32_raw(void *cdev, short offset, u32 *value)
++{
++	ethsw_api_dev_t *pethdev = (ethsw_api_dev_t *)cdev;
++
++	if (!pethdev || !pethdev->gsw_base) {
++		pr_err_once("gsw_r32_raw: NULL device or unmapped gsw_base (offset=0x%x)\n",
++			    (unsigned int)(unsigned short)offset);
++		return;
++	}
++
++	*value = readl((void __iomem *)pethdev->gsw_base + (offset * 4));
++}
++EXPORT_SYMBOL_NS_GPL(gsw_r32_raw, "GSWIP_INTERNAL");
++
++/**
++ * gsw_w32_raw - write a 32-bit register at word-offset @offset.
++ *
++ * @cdev:   ethsw_api_dev_t pointer carrying the ioremap'd gsw_base.
++ *
++ * @offset: word-offset into the per-instance register window.
++ *
++ * @value:  value to write.
++ */
++void gsw_w32_raw(void *cdev, short offset, u32 value)
++{
++	ethsw_api_dev_t *pethdev = (ethsw_api_dev_t *)cdev;
++
++	if (!pethdev || !pethdev->gsw_base) {
++		pr_err_once("gsw_w32_raw: NULL device or unmapped gsw_base (offset=0x%x)\n",
++			    (unsigned int)(unsigned short)offset);
++		return;
++	}
++
++	writel(value, (void __iomem *)pethdev->gsw_base + (offset * 4));
++}
++EXPORT_SYMBOL_NS_GPL(gsw_w32_raw, "GSWIP_INTERNAL");
++
++/**
++ * gsw_r32 - read a bitfield from a 32-bit register.
++ * @cdev:   ethsw_api_dev_t pointer.
++ * @offset: word-offset.
++ * @shift:  bitfield LSB shift inside the 32-bit word.
++ * @size:   bitfield width in bits.
++ * @value:  out-parameter for the extracted field value.
++ *
++ * Layers field-extraction on top of gsw_r32_raw via the static-inline helper
++ * gsw_field_r32 declared in gsw_init.h (verbatim from AVM gsw_init.h:193-196).
++ */
++void gsw_r32(void *cdev, short offset, short shift, short size, u32 *value)
++{
++	u32 rval = 0;
++
++	gsw_r32_raw(cdev, offset, &rval);
++	*value = gsw_field_r32(rval, shift, size);
++}
++EXPORT_SYMBOL_NS_GPL(gsw_r32, "GSWIP_INTERNAL");
++
++/**
++ * gsw_w32 - write a bitfield into a 32-bit register (read-modify-write).
++ * @cdev:   ethsw_api_dev_t pointer.
++ * @offset: word-offset.
++ * @shift:  bitfield LSB shift inside the 32-bit word.
++ * @size:   bitfield width in bits.
++ * @value:  value to write into the field (masked to @size bits).
++ *
++ * Read-modify-write via gsw_r32_raw + gsw_field_w32 (verbatim from AVM
++ * gsw_init.h:198-205) + gsw_w32_raw.
++ */
++void gsw_w32(void *cdev, short offset, short shift, short size, u32 value)
++{
++	u32 rval = 0;
++
++	gsw_r32_raw(cdev, offset, &rval);
++	rval = gsw_field_w32(rval, shift, size, value);
++	gsw_w32_raw(cdev, offset, rval);
++}
++EXPORT_SYMBOL_NS_GPL(gsw_w32, "GSWIP_INTERNAL");
+diff --git a/drivers/net/ethernet/lantiq/switch-api/gsw_init.c b/drivers/net/ethernet/lantiq/switch-api/gsw_init.c
+new file mode 100644
+index 000000000000..007be2459beb
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/switch-api/gsw_init.c
+@@ -0,0 +1,192 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2012, 2014, 2015 Lantiq Deutschland GmbH
++ * Copyright (c) 2016, 2017 Intel Corporation
++ * Copyright (C) 2026 Grische <github@grische.xyz>
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/switch-api/gsw_init.c and gsw_flow_core.h.
++ *
++ * GSWIP-3.0 switch-API probe: maps both instances' register windows, loads
++ * the PCE microcode and publishes the per-instance device.
++ */
++
++#include <linux/atomic.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/ethtool.h>
++#include <linux/io.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/spinlock.h>
++#include <linux/types.h>
++
++/*
++ * gsw_init.h pulls in the full AVM-ported header chain (gsw_flow_core.h ->
++ * gsw_flow_ops.h -> lantiq_gsw_api.h -> ...). This is the single canonical
++ * entry point for AVM types inside switch-api/.c sources.
++ */
++#include "gsw_init.h"
++#include "gsw_flow_core.h"
++#include "../datapath/datapath.h"
++
++/*
++ * Counts probe calls; the datapath dp_init_module() fires exactly once when
++ * atomic_inc_return reaches 2 (i.e. after BOTH GSW-L (devid=0) and GSW-R
++ * (devid=1) have completed gsw_devs_register), because dp_platform_set's
++ * sanity check at AVM datapath_misc.c:294-296 requires dp_port_prop[0].ops[0]
++ * AND ops[1] both populated. The file-scope static keeps the refcount
++ * per-module - there is exactly one .ko, so exactly one atomic_t
++ * dp_init_refcnt declaration across the whole module.
++ */
++static atomic_t dp_init_refcnt = ATOMIC_INIT(0);
++
++static int intel_xrx500_gswip_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	ethsw_api_dev_t *pethdev;
++	void __iomem *base;
++	u32 devid;
++	int ret;
++
++	ret = of_property_read_u32(dev->of_node, "lantiq,gswip-instance",
++				   &devid);
++	if (ret) {
++		dev_err(dev, "missing lantiq,gswip-instance property: %d\n",
++			ret);
++		return ret;
++	}
++
++	if (devid >= LTQ_GSW_DEV_MAX) {
++		dev_err(dev, "lantiq,gswip-instance=%u out of range (max %u)\n",
++			devid, LTQ_GSW_DEV_MAX);
++		return -EINVAL;
++	}
++
++	pethdev = devm_kzalloc(dev, sizeof(*pethdev), GFP_KERNEL);
++	if (!pethdev)
++		return -ENOMEM;
++
++	/*
++	 * Passive mapping only. The vendor probe additionally takes the
++	 * switch gate clock; that gate is on from reset and no driver in this
++	 * tree disables it (see the CGU gate policy), so this probe maps the
++	 * register window and nothing else. It performs no soft-reset and
++	 * acquires no reset line, matching the vendor probe, which does
++	 * neither.
++	 */
++	base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++
++	/*
++	 * Populate the per-devid identity fields. devid=0 is the GSW-L
++	 * instance at physical 0x1c000000 (alias gswl_base); devid=1 is GSW-R
++	 * at physical 0x1a000000 (alias gswr_base).
++	 */
++	pethdev->gsw_base = (void *)base;
++	pethdev->parent_devid = devid;
++	pethdev->pdev = (void *)pdev;
++
++	if (devid == 0) {
++		pethdev->sdev = LTQ_FLOW_DEV_INT;
++		pethdev->gswl_base = (void *)base;
++	} else if (devid == 1) {
++		pethdev->sdev = LTQ_FLOW_DEV_INT_R;
++		pethdev->gswr_base = (void *)base;
++	} else {
++		/*
++		 * The DT-binding limits devid to 0/1 for the FRITZ!Box 7560, so
++		 * this branch is unreachable by design and kept only
++		 * defensively.
++		 */
++		pethdev->sdev = (gsw_devtype_t)devid;
++	}
++
++	/*
++	 * These protect the various functional-area lookaside caches inside
++	 * the ethsw_api_dev_t struct (PCE rule table, buffer manager, PMAC,
++	 * miscellaneous, PAE, allocator free/alloc lists, IRQ link list, MDIO
++	 * bus, MMD).
++	 */
++	spin_lock_init(&pethdev->lock_pce);
++	spin_lock_init(&pethdev->lock_bm);
++	spin_lock_init(&pethdev->lock_pmac);
++	spin_lock_init(&pethdev->lock_misc);
++	spin_lock_init(&pethdev->lock_pae);
++	spin_lock_init(&pethdev->lock_alloc);
++	spin_lock_init(&pethdev->lock_free);
++	spin_lock_init(&pethdev->lock_irq);
++	spin_lock_init(&pethdev->lock_mdio);
++	spin_lock_init(&pethdev->lock_mmd);
++
++	ret = gsw_devs_register(devid, pethdev);
++	if (ret) {
++		dev_err(dev, "gsw_devs_register failed: %d\n", ret);
++		return ret;
++	}
++
++	platform_set_drvdata(pdev, pethdev);
++
++	pethdev->gipver = LTQ_GSWIP_3_0; /* GSWIP-3.0-only driver per architectural constraint; not replaced with a cap-read (AVM gsw_flow_core.h LTQ_GSWIP_3_0 = 0x030) */
++	pethdev->pnum = 8;  /* TODO:replace with ETHSW_CAP_1_PPORTS read */
++	pethdev->tpnum = 16; /* TODO:replace with ETHSW_CAP_1_VPORTS read */
++	gsw_pce_attach_tbl_30(pethdev);
++
++	/*
++	 * Load the GSWIP-3.0 PCE parser microcode (256 rows, version "212"
++	 * per MICRO_CODE_VERSION at gsw_init.h:118). Failure path: dev_err +
++	 * idempotent gsw_devs_unregister (gsw_flow_core.h:997 documents the
++	 * silently-tolerates-devid-out-of-range contract) + return -EIO so
++	 * the platform_driver probe contract is honoured (negative errno on
++	 * failure).
++	 */
++	ret = gsw_pmicro_code_init(pethdev);
++	if (ret) {
++		dev_err(dev, "gsw_pmicro_code_init failed: %d\n", ret);
++		gsw_devs_unregister(devid);
++		return -EIO;
++	}
++
++	if (atomic_inc_return(&dp_init_refcnt) == 2) {
++		int dp_ret = dp_init_module();
++
++		if (dp_ret)
++			dev_err(&pdev->dev,
++				"gsw_init: dp_init_module failed=%d\n", dp_ret);
++	}
++
++	return 0;
++}
++
++static void intel_xrx500_gswip_remove(struct platform_device *pdev)
++{
++	ethsw_api_dev_t *pethdev = platform_get_drvdata(pdev);
++
++	if (pethdev)
++		gsw_devs_unregister(pethdev->parent_devid);
++
++	/* devm_* allocations are released automatically. */
++}
++
++static const struct of_device_id intel_xrx500_gswip_of_match[] = {
++	{ .compatible = "intel,xrx500-gswip-3.0" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, intel_xrx500_gswip_of_match);
++
++static struct platform_driver intel_xrx500_gswip_driver = {
++	.probe = intel_xrx500_gswip_probe,
++	.remove = intel_xrx500_gswip_remove,
++	.driver = {
++		.name = "intel-xrx500-gswip",
++		.of_match_table = intel_xrx500_gswip_of_match,
++	},
++};
++module_platform_driver(intel_xrx500_gswip_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Grische <github@grische.xyz>");
++MODULE_DESCRIPTION("Intel xRX500 (GRX350) GSWIP-3.0 ethernet driver suite");

@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 02:44:56 +0200
+Subject: net: lantiq: hdma: serve the WAN dequeue port on DMA1TX
+
+hdma_port_chan_tbl() served dequeue ports 7..10 and returned NULL for
+anything else, so hdma_port_enable(19) - the first step of the WAN port's
+ndo_open - returned -EINVAL and the egress channel was never opened.
+
+Add the port-19 row. The WAN port is not just another channel on the same
+controller: AVM's cbm_config.c gives its row dma_ctrl = 1, DMA1TX at
+0x1a100000 on the GSWIP-R side, where every LAN row carries DMA2TX at
+0x1c100000. The vendor names the pair itself in dma/lantiq_dmax.h as
+DMA1TX_GSWIP_R_WAN_CBMP19_CLASS15, which is the label used here.
+
+No device-tree work was needed after all: xrx500.dtsi already describes
+dma1tx with its own calibration values (desc-in-sram=1, polling-cnt=108,
+lab-cnt=2 - none of which DMA2TX uses), status="okay", GIC_SHARED 65. It
+has been probing since the DMA controllers landed; nothing had ever asked
+it for a channel.
+
+Two range assumptions moved with the table:
+
+  - HDMA_CBM_DEQ_LAST 10 -> 19, so the armed-latch bitmap covers the WAN
+    port. The range is no longer dense - 11..18 are never served - which
+    costs eight unused bits of a u32 and preserves the "arm once, stay
+    armed" property: a port outside the range reads as never-armed and
+    would have its channel reopened on every ndo_open, which leaves the
+    DQM-to-DMA coupling stale.
+
+  - The CBM probe-tail channel-open loop was a literal 7..10 over dequeue
+    port numbers, which could not have expressed a port on a different
+    controller. It now walks the same DT-declared dp port list as the
+    preconfig loop above it and resolves each port's dequeue number, so
+    the WAN channel opens at probe, before the controllers are enabled,
+    which is the side of that boundary it has to be on.
+
+CBM_DQM_DESC_PHYS() needed no change - it is per-dequeue-port and
+controller-independent, so it serves the WAN port unchanged: deq 19
+gives 0x1e54e000. Checked by extracting it and the armed-latch helpers
+and running them, with bits 0..3 and 12 set for deq 7,8,9,10,19 and
+6/11/20 correctly reading as never-armed.
+
+hdma_port_disable() shares the table, so it follows automatically and the
+two cannot disagree about which channels a port owns.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+index 65cfde734bd9..ef7040600735 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+@@ -721,17 +721,24 @@ static int cbm_xrx500_probe(struct platform_device *pdev)
+ 	cbm_enable_controllers();
+ 
+ 	{
+-		int deq;
++		u32 dp_ports[CBM_MAX_DP_PORTS];
++		int n = cbm_dt_dp_ports(dp_ports, ARRAY_SIZE(dp_ports));
++		int i;
+ 
+-		for (deq = 7; deq <= 10; deq++) {
+-			int hret = hdma_port_enable(deq);
++		for (i = 0; i < n; i++) {
++			struct cbm_dp_egress_res res;
++			int hret;
++
++			if (cbm_dp_egress_res_get(dp_ports[i], &res))
++				continue;
+ 
++			hret = hdma_port_enable((int)res.deq_port);
+ 			if (hret)
+-				dev_warn(dev, "cbm: probe-time hdma_port_enable(%d) = %d (ndo_open will retry)\n",
+-					 deq, hret);
++				dev_warn(dev, "cbm: probe-time hdma_port_enable(%u) = %d (ndo_open will retry)\n",
++					 res.deq_port, hret);
+ 			else
+-				pr_info("cbm: DMA2TX ch%d opened at probe-end for deq %d (AVM order)\n",
+-					deq - 5, deq);
++				pr_info("cbm: DMA%uTX ch%u opened at probe-end for deq %u (AVM order)\n",
++					res.dma_ctrl, res.dma_chan, res.deq_port);
+ 		}
+ 	}
+ 
+diff --git a/drivers/net/ethernet/lantiq/dma/hdma.c b/drivers/net/ethernet/lantiq/dma/hdma.c
+index 2f51c020beb5..b57d7372275d 100644
+--- a/drivers/net/ethernet/lantiq/dma/hdma.c
++++ b/drivers/net/ethernet/lantiq/dma/hdma.c
+@@ -1999,6 +1999,23 @@ static const struct port7_chan_desc port10_channels[] = {
+ 	  .label = "DMA2TX_CBM_P10_CLASS5", .cbm_deq = 10 },
+ };
+ 
++/*
++ * The WAN port (dp 15) egresses via CBM dequeue port 19 on a DIFFERENT
++ * CONTROLLER, not merely a different channel: AVM cbm_config.c's row for
++ * tmu_port 19 carries dma_ctrl = 1 (DMA1TX @ 0x1a100000, on the GSWIP-R side
++ * of the SoC) where every LAN row carries 2 (DMA2TX @ 0x1c100000). The
++ * channel number is 15, and the vendor names the pair in its own header:
++ * DMA1TX_GSWIP_R_WAN_CBMP19_CLASS15 (dma/lantiq_dmax.h).
++ *
++ * The two controllers are not interchangeable - DMA1TX runs desc-in-sram=1,
++ * polling-cnt=108 and lab-cnt=2, none of which DMA2TX uses - but that is a DT
++ * matter and both nodes are already described; nothing here needs to know.
++ */
++static const struct port7_chan_desc port19_channels[] = {
++	{ .cid = DMA1TX, .pid = DMA1TX_PORT, .nid = DMA_CHANNEL_15,
++	  .label = "DMA1TX_GSWIP_R_WAN_CBMP19_CLASS15", .cbm_deq = 19 },
++};
++
+ /*
+  * hdma_port_chan_tbl — the per-CBM-dequeue-port channel table, or NULL for a
+  * dequeue port this driver does not serve. Shared by hdma_port_enable and
+@@ -2022,6 +2039,9 @@ static const struct port7_chan_desc *hdma_port_chan_tbl(int port_id, size_t *n)
+ 	case 10:
+ 		*n = ARRAY_SIZE(port10_channels);
+ 		return port10_channels;
++	case 19:
++		*n = ARRAY_SIZE(port19_channels);
++		return port19_channels;
+ 	default:
+ 		return NULL;
+ 	}
+@@ -2052,7 +2072,7 @@ static const struct port7_chan_desc *hdma_port_chan_tbl(int port_id, size_t *n)
+  * leaves the port pointing at descriptors nothing will refill.
+  */
+ #define HDMA_CBM_DEQ_FIRST 7
+-#define HDMA_CBM_DEQ_LAST  10
++#define HDMA_CBM_DEQ_LAST  19
+ 
+ static u32 g_hdma_deq_armed;
+ 
