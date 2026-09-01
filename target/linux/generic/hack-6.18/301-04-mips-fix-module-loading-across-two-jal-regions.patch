@@ -1,0 +1,211 @@
+From: Grische <github@grische.xyz>
+Date: Tue, 1 Sep 2026 13:00:52 +0200
+Subject: mips: fix module loading across two jal regions
+
+The module allocator of 301-02 builds modules with -mno-long-calls and
+runs module text from the linear map. Three defects in it are harmless
+while the linear map fits in one 256 MiB jump region. They break module
+loading as soon as it does not.
+
+alloc_phys() takes any block that alloc_pages() returns. With more than
+256 MiB of lowmem, or with a zone layout that steers GFP_KERNEL above the
+first 256 MiB, that block can lie in the other jump region. Every call
+out of the module then needs a trampoline.
+
+add_plt_entry_to() writes the four words of a trampoline with plain
+stores and does not flush them. The trampoline tables are not in
+mod->mem[], so flush_module_icache() does not cover them either. A core
+whose I-cache does not refill from the D-cache then runs what the page
+held before.
+
+add_plt_entry() picks the table with is_phys_addr(), which tests a
+512 MiB window. apply_r_mips_26() does not check that the trampoline it
+gets back is within reach of the call site.
+
+For module text, alloc_phys() now checks that the block lies in the jump
+region of the kernel. If it does not and the kernel has ZONE_DMA, it asks
+ZONE_DMA once. If that block is out of reach as well, alloc_phys()
+returns NULL and the caller falls back to vmalloc. Module data is not
+constrained, because HI16/LO16 pairs carry a full address.
+
+The retry takes its block through the same hold as the first attempt.
+On the 24K cores of 301-03 both attempts therefore skip the blocks in the
+first 32 KiB of a segment. The unreachable block of the first attempt
+stays allocated until the retry is done, so the retry is never handed
+that block again.
+
+add_plt_entry_to() now flushes the four words it writes.
+apply_r_mips_26() fails the load with -ENOEXEC when the trampoline is out
+of reach.
+
+Signed-off-by: Grische <github@grische.xyz>
+---
+ arch/mips/kernel/module.c | 109 ++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 101 insertions(+), 8 deletions(-)
+
+--- a/arch/mips/kernel/module.c
++++ b/arch/mips/kernel/module.c
+@@ -22,8 +22,10 @@
+ #include <linux/jump_label.h>
+ #include <linux/sizes.h>
+ #include <linux/vmalloc.h>
++#include <asm/cacheflush.h>
+ #include <asm/cpu-info.h>
+ #include <asm/jump_label.h>
++#include <asm/sections.h>
+ 
+ struct mips_hi16 {
+ 	struct mips_hi16 *next;
+@@ -129,21 +131,31 @@ static bool in_first_32k(void *ptr)
+ 	       ((unsigned long)ptr & (SZ_256M - 1)) < SZ_32K;
+ }
+ 
++/*
++ * A short jump (j/jal, R_MIPS_26) reaches only within its own aligned
++ * 256 MiB region -- the target's top four address bits are taken from the
++ * delay-slot PC, not from the encoded offset. Modules are built
++ * -mno-long-calls above, so every call out of a module is one of these.
++ *
++ * This is deliberately NOT is_phys_addr(): that tests KSEGX() == KSEG0,
++ * which is a 512 MiB window and therefore the wrong oracle for a 256 MiB
++ * reach. is_phys_addr() stays for its linear-map-vs-vmalloc callers.
++ */
++static inline bool jal_reachable(unsigned long from, unsigned long to)
++{
++	return !((from ^ to) & 0xf0000000);
++}
++
+ #ifndef MODULES_VADDR
+-static void *alloc_phys(unsigned long size)
++static struct page *alloc_code_pages(gfp_t gfp, unsigned int order)
+ {
+-	unsigned order;
+ 	struct page *page;
+ 	struct page *p;
+ 	LIST_HEAD(skipped);
+ 
+-	size = PAGE_ALIGN(size);
+-	order = get_order(size);
+-
+ 	/* hold the blocks that start there, or they would be offered again */
+ 	while (1) {
+-		page = alloc_pages(GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN |
+-				__GFP_THISNODE, order);
++		page = alloc_pages(gfp, order);
+ 		if (!page || !in_first_32k(page_address(page)))
+ 			break;
+ 		list_add(&page->lru, &skipped);
+@@ -155,9 +167,63 @@ static void *alloc_phys(unsigned long si
+ 		__free_pages(p, order);
+ 	}
+ 
++	return page;
++}
++
++static void *alloc_phys(unsigned long size, bool need_jal_reach)
++{
++	unsigned order;
++	struct page *page;
++	struct page *p;
++
++	size = PAGE_ALIGN(size);
++	order = get_order(size);
++
++	page = alloc_code_pages(GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN |
++				__GFP_THISNODE, order);
+ 	if (!page)
+ 		return NULL;
+ 
++	/*
++	 * Module text has to be within short-jump reach of the kernel. Where
++	 * the linear map spans more than one 256 MiB jump region a GFP_KERNEL
++	 * page can land in the wrong one, and then every call out of the
++	 * module needs a trampoline. On a platform whose ZONE_DMA *is* the
++	 * reachable low region, asking for that zone by name gets a usable
++	 * page, so retry once before falling back to vmalloc. The retry
++	 * holds the blocks in the first 32 KiB of a segment like the first
++	 * attempt, and the unreachable first page stays allocated until the
++	 * retry is done, so the retry cannot be handed it again.
++	 *
++	 * Only text is constrained. Module data is reached through HI16/LO16
++	 * pairs, which carry a full address, so it may live anywhere and
++	 * asking for low pages on its behalf would just consume the region
++	 * that text needs.
++	 */
++	if (need_jal_reach &&
++	    !jal_reachable((unsigned long)&_stext,
++			   (unsigned long)page_address(page))) {
++		struct page *low = NULL;
++
++		if (IS_ENABLED(CONFIG_ZONE_DMA))
++			low = alloc_code_pages(GFP_KERNEL | __GFP_DMA |
++					       __GFP_NORETRY | __GFP_NOWARN |
++					       __GFP_THISNODE, order);
++
++		if (low && !jal_reachable((unsigned long)&_stext,
++					  (unsigned long)page_address(low))) {
++			__free_pages(low, order);
++			low = NULL;
++		}
++
++		/* The first page is unreachable either way -- give it back. */
++		__free_pages(page, order);
++		if (!low)
++			return NULL;
++
++		page = low;
++	}
++
+ 	split_page(page, order);
+ 
+ 	/* mark all pages except for the last one */
+@@ -205,7 +271,7 @@ void *arch_execmem_alloc(enum execmem_ty
+ {
+ 	void *ptr;
+ 
+-	ptr = alloc_phys(size);
++	ptr = alloc_phys(size, type == EXECMEM_MODULE_TEXT);
+ 
+ 	/* If we failed to allocate physically contiguous memory,
+ 	 * fall back to regular vmalloc. The module loader code will
+@@ -315,6 +381,19 @@ static Elf_Addr add_plt_entry_to(unsigne
+ 	tramp[2] = 0x03200008;                  /* jr t9 */
+ 	tramp[3] = 0x00000000;                  /* nop */
+ 
++	/*
++	 * These four words are instructions, and nothing else flushes them:
++	 * the trampoline tables live in mod->arch.*_plt_tbl, not in
++	 * mod->mem[], so flush_module_icache() never walks over them. On a
++	 * core whose I-cache does not refill from the D-cache -- interAptiv
++	 * is not in c-r4k.c's MIPS_CACHE_IC_F_DC list -- the stores above sit
++	 * in L1-D and the instruction fetch reads whatever the page held
++	 * before, which is how a freshly recycled slab page gets executed as
++	 * code.
++	 */
++	flush_icache_range((unsigned long)tramp,
++			   (unsigned long)tramp + 4 * sizeof(int));
++
+ 	return (Elf_Addr) tramp;
+ }
+ 
+@@ -347,6 +426,20 @@ static int apply_r_mips_26(struct module
+ 			       me->name);
+ 			return -ENOEXEC;
+ 		}
++		/*
++		 * The trampoline is only useful if the short jump can
++		 * actually reach it. add_plt_entry() picks the table by
++		 * is_phys_addr(), a 512 MiB test, so the table it returns
++		 * can sit in the other 256 MiB region -- in which case the
++		 * jump lands on an unrelated live page. Fail the module
++		 * load instead of executing whatever is there.
++		 */
++		if (!jal_reachable((unsigned long)location + 4, v)) {
++			pr_err("module %s: PLT entry 0x%lx unreachable from 0x%lx\n",
++			       me->name, (unsigned long)v,
++			       (unsigned long)location + 4);
++			return -ENOEXEC;
++		}
+ 		ofs = 0;
+ 	}
+ 
