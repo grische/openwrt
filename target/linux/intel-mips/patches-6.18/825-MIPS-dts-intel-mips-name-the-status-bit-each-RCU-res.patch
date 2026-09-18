@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 10 Sep 2026 18:32:50 +0200
+Subject: MIPS: dts: intel-mips: name the status bit each RCU reset reports
+ through
+
+The reset controller in the RCU takes two cells: it sets the first bit in
+RCU_RST_REQ and then polls the second one in RCU_RST_STAT. Every consumer
+in this tree passed the same number twice, on the assumption that the
+status register mirrors the request register.
+
+It does not. RCU_RST_STAT is a remap of RCU_RST_REQ. A few domains do
+report through the bit they are requested with, most report through a
+different one, and two positions in the status word are reset causes with
+no request bit behind them at all. The vendor's own reset driver carries
+the map, one entry per domain with separate request and status masks, and
+it disagrees with the mirror assumption for six of the eight lines this
+tree drives:
+
+	line			REQ	STAT
+	pcie_phy0		12	24
+	pcie_phy1		13	11
+	gphy_fw "phy2"		29	28
+	gphy_fw "phy3"		28	23
+	gphy_fw "phy4"		26	22
+	gphy_fw "phyF"		31	30
+
+pcie_phy2 (10) and gphy_fw "phy5" (25) do mirror, as do both USB PHYs in
+the second bank -- which is why one of the three PCIe PHYs has always come
+out of reset without complaint while the other two report a timeout on
+every boot.
+
+Nothing about the hardware sequence changes. The request cell was already
+right, so the same line was always driven; only the wait afterwards
+watched a bit that could not answer. What changes is that the wait can now
+succeed, and that a reset which genuinely does not complete will say so
+instead of looking like the timeout everybody has learned to ignore.
+
+The GPHY lines are a device tree fix only. Their handles are taken by name
+and then dropped: the firmware loader drives RCU_RST_REQ itself and never
+asks the framework for a transition, so those five cells are consumed by
+the provider's bounds check and by nothing else. They are wrong all the
+same, and a loader moved onto the reset framework would inherit exactly
+the timeout the PCIe PHYs have.
+
+Bit 31 is the sharpest case of the remap and the one worth spelling out,
+because it appears in both registers with different meanings: in
+RCU_RST_REQ it is the fifth GPHY's reset line, in RCU_RST_STAT it is the
+watchdog reset cause. The fifth GPHY's status is bit 30, so a poll of bit
+31 for that PHY would read the watchdog's bit and not the PHY's -- the
+opposite way round from the doubt recorded when that cell was added, where
+the risk was taken to be the poll landing on the PHY's own bit.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+index 1d9661c38f16..863ce6fa36f8 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+@@ -242,14 +242,15 @@ partition@1500000 {
+ 
+ /*
+  * The four LAN GPHYs this board populates. The reset bit list is not
+- * contiguous, so every entry is spelled out; the set bit and the status bit
+- * are the same number here, hence the doubled cell.
++ * contiguous, so every entry is spelled out, and the status bit each request
++ * bit reports through is a different number again on three of the four -- see
++ * the map on the reset controller in xrx500.dtsi.
+  */
+ &gphy_fw {
+ 	phy_id = <0x02 0x03 0x04 0x05>;
+-	resets = <&rcu_reset0 29 29>,
+-		 <&rcu_reset0 28 28>,
+-		 <&rcu_reset0 26 26>,
++	resets = <&rcu_reset0 29 28>,
++		 <&rcu_reset0 28 23>,
++		 <&rcu_reset0 26 22>,
+ 		 <&rcu_reset0 25 25>;
+ 	reset-names = "phy2", "phy3", "phy4", "phy5";
+ };
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
+index 10b3fa80aa9c..9c6ce5add717 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
+@@ -98,17 +98,21 @@ gphy_wan: ethernet-phy@1 {
+ 
+ /*
+  * All five GPHYs. The reset bit list is not contiguous, so every entry is
+- * spelled out; on this die bit 31 is the fifth PHY's own reset line and not a
+- * group master reset, which is how the vendor device tree names it. A PHY
+- * without firmware never answers MDIO and probe is all-or-nothing.
++ * spelled out; on this die request bit 31 is the fifth PHY's own reset line
++ * and not a group master reset, which is how the vendor device tree names it.
++ * That PHY reports its status in bit 30, and bit 31 of the status register
++ * belongs to the watchdog instead -- the request bit and the status bit are
++ * different numbers on four of these five lines, see the map on the reset
++ * controller in xrx500.dtsi. A PHY without firmware never answers MDIO and
++ * probe is all-or-nothing.
+  */
+ &gphy_fw {
+ 	phy_id = <0x02 0x03 0x04 0x05 0x0F>;
+-	resets = <&rcu_reset0 29 29>,
+-		 <&rcu_reset0 28 28>,
+-		 <&rcu_reset0 26 26>,
++	resets = <&rcu_reset0 29 28>,
++		 <&rcu_reset0 28 23>,
++		 <&rcu_reset0 26 22>,
+ 		 <&rcu_reset0 25 25>,
+-		 <&rcu_reset0 31 31>;
++		 <&rcu_reset0 31 30>;
+ 	reset-names = "phy2", "phy3", "phy4", "phy5", "phyF";
+ };
+ 
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index 03cdc0c07436..989c741444e4 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -108,8 +108,34 @@ chiptop: syscon@16080000 {
+ 	/*
+ 	 * Reset Control Unit. The mainline lantiq,xrx200-reset driver must be
+ 	 * a syscon child: its reg is a byte offset into the parent regmap,
+-	 * not an absolute address. #reset-cells = <2> is [set_bit,
+-	 * status_bit], which on this SoC are not always the same number.
++	 * not an absolute address.
++	 *
++	 * #reset-cells = <2> is [set_bit, status_bit]: the driver sets the
++	 * request bit in the first register and then polls the status bit in
++	 * the second one. On this SoC those are usually *different* numbers.
++	 * RCU_RST_STAT is a remap of RCU_RST_REQ, not a mirror of it, so a
++	 * second cell that repeats the first is a bug and not a convention --
++	 * the poll then watches an unrelated bit and can only end in a
++	 * timeout. The per-domain map for the lines this device tree drives,
++	 * in the first bank:
++	 *
++	 *	line				REQ	STAT
++	 *	pcie_phy0			12	24
++	 *	pcie_phy1			13	11
++	 *	pcie_phy2			10	10
++	 *	gphy_fw "phy2"			29	28
++	 *	gphy_fw "phy3"			28	23
++	 *	gphy_fw "phy4"			26	22
++	 *	gphy_fw "phy5"			25	25
++	 *	gphy_fw "phyF" (GRX550 only)	31	30
++	 *
++	 * Two positions in RCU_RST_STAT are reset *causes* rather than line
++	 * statuses, and neither has a request counterpart: bit 31 is the
++	 * watchdog, which the watchdog node below reads through this same
++	 * syscon, and bit 29 is the global software reset that the reboot
++	 * node requests with RCU_RST_REQ bit 30. Bit 31 therefore means one
++	 * thing in the request register -- the fifth GPHY's line -- and
++	 * something else entirely in the status register.
+ 	 */
+ 	rcu: rcu@16000000 {
+ 		compatible = "lantiq,xrx200-rcu", "simple-mfd", "syscon";
+@@ -126,8 +152,10 @@ rcu_reset0: reset-controller@10 {
+ 
+ 		/*
+ 		 * Second reset bank. RCU_RST_REQ2 is at 0x48 and
+-		 * RCU_RST_STAT2 at 0x24, so a vendor reset id of 5 translates
+-		 * to <&rcu_reset1 5 5>.
++		 * RCU_RST_STAT2 at 0x24. Both lines this device tree takes
++		 * from it, the two USB PHYs, are among the domains whose
++		 * status bit does repeat the request bit, so a vendor reset id
++		 * of 5 translates to <&rcu_reset1 5 5>.
+ 		 */
+ 		rcu_reset1: reset-controller@48 {
+ 			compatible = "lantiq,xrx200-reset";
+@@ -379,8 +407,10 @@ dma2rx: dma@1c200000 {
+ 	/*
+ 	 * Serdes PHYs. Both syscon phandles are mandatory: one carries the
+ 	 * PHY configuration word and the other the reset. intel,phy-id has no
+-	 * fallback — the driver cannot derive it — and the reset cell is
+-	 * doubled because the set and status bits differ.
++	 * fallback — the driver cannot derive it — and the second reset
++	 * cell is the status bit the line reports through, which is a
++	 * different number from the request bit on two of the three: see the
++	 * map on the reset controller above.
+ 	 */
+ 	pcie_phy0: phy@18500000 {
+ 		compatible = "intel,grx500-pciephy";
+@@ -390,7 +420,7 @@ pcie_phy0: phy@18500000 {
+ 		intel,syscon = <&chiptop 0x120>;
+ 		intel,cgu-syscon = <&cgu>;
+ 		intel,phy-id = <0>;
+-		resets = <&rcu_reset0 12 12>;
++		resets = <&rcu_reset0 12 24>;
+ 		reset-names = "phy";
+ 		status = "disabled";
+ 	};
+@@ -403,7 +433,7 @@ pcie_phy1: phy@18000000 {
+ 		intel,syscon = <&chiptop 0x120>;
+ 		intel,cgu-syscon = <&cgu>;
+ 		intel,phy-id = <1>;
+-		resets = <&rcu_reset0 13 13>;
++		resets = <&rcu_reset0 13 11>;
+ 		reset-names = "phy";
+ 		status = "disabled";
+ 	};

@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 11 Sep 2026 09:28:34 +0200
+Subject: net: lantiq: xrx500: drop the no-op ndo_change_mtu, clamp max_mtu
+
+intel_xrx500_ndo_change_mtu() range-checked new_mtu and returned 0
+without ever storing it, so netif_set_mtu_ext() ran its whole sequence
+-- the NETDEV_PRECHANGEMTU and NETDEV_CHANGEMTU notifiers included --
+around a dev->mtu that never moved, and reported success. Every MTU
+change through rtnetlink was silently discarded.
+
+The driver has nothing to program on an MTU change: it writes no frame
+length register and resizes no ring. Its own comment says the range
+check is redundant because the netdev core already enforces min_mtu
+and max_mtu, and the function does nothing else. So remove the callback
+rather than adding the store. __netif_set_mtu() does that WRITE_ONCE
+itself when ndo_change_mtu is NULL, and both kinds of caller are
+covered: netif_set_mtu_ext() runs dev_validate_mtu() against
+min_mtu/max_mtu before it, and team and bonding call it directly only to
+put back an MTU the port already carried. No caller in the tree tests
+ndo_change_mtu for presence as a capability.
+
+The bound the driver advertises is wrong as well. netdev->max_mtu is
+9216, the size of the CBM jumbo pool's segments, but no frame that large
+can leave a port:
+
+  - The switch core these ports sit behind is initialised to discard
+    anything longer than a standard Ethernet frame. gsw_flow_pce.c
+    writes MAC_FLEN = 1518 on every core but the WAN-side one, with the
+    vendor's own comment saying that is meant to drop jumbo frames, and
+    the per-port long-frame enables are left clear.
+
+  - intel_xrx500_ndo_start_xmit() checks out a standard 2 KiB FSQM
+    segment and drops anything that would not fit inside it after the
+    128-byte CBM offset, NET_SKB_PAD and the PMAC header. Nothing in
+    the transmit path ever asks for a jumbo segment.
+
+So the two halves have to be fixed in one change. Making the MTU stick
+without lowering the ceiling would replace an operation that visibly
+does nothing with one that quietly breaks the link: the larger MTU
+sticks, the stack starts handing the switch frames it discards, and
+because the discard happens past the MAC neither end counts it --
+tx_packets advances, tx_dropped and the peer's rx_length_errors do not.
+
+Lower max_mtu to ETH_DATA_LEN, which is the MTU every port already runs
+at and the largest the switch is configured to carry; the core then
+refuses anything above it with -EINVAL and an extack. That is also the
+value ether_setup() installs, so what the driver had really done was
+raise the ethernet default; keep the assignment and the comment anyway,
+because the reason 1500 is the ceiling on this hardware is not obvious
+from the default. Raising it later is not a change to this file: it
+needs the switch's frame-length gate opened and the transmit path moved
+off the standard segment, in that order.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/intel_xrx500.c b/drivers/net/ethernet/lantiq/intel_xrx500.c
+index 060aa4245230..fddd52d5e599 100644
+--- a/drivers/net/ethernet/lantiq/intel_xrx500.c
++++ b/drivers/net/ethernet/lantiq/intel_xrx500.c
+@@ -1018,25 +1018,6 @@ void intel_xrx500_rx_drop_account(struct net_device *dev)
+ 	atomic_long_inc(&port->stats.rx_dropped);
+ }
+ 
+-/**
+- * intel_xrx500_ndo_change_mtu() - MTU change handler.
+- *
+- * @dev:     the source netdev.
+- *
+- * @new_mtu: the requested new MTU value.
+- */
+-static int intel_xrx500_ndo_change_mtu(struct net_device *dev, int new_mtu)
+-{
+-	/*
+-	 * Range check is redundant (netdev core already enforced via
+-	 * dev->min_mtu / dev->max_mtu) but kept as a defensive belt-and-
+-	 * braces guard so an out-of-band caller cannot bypass it.
+-	 */
+-	if (new_mtu < ETH_MIN_MTU || new_mtu > 9216)
+-		return -EINVAL;
+-	return 0;
+-}
+-
+ /**
+  * intel_xrx500_ndo_get_stats64() - ndo_get_stats64 implementation.
+  *
+@@ -1063,7 +1044,6 @@ static const struct net_device_ops intel_xrx500_netdev_ops = {
+ 	.ndo_stop        = intel_xrx500_ndo_stop,
+ 	.ndo_start_xmit  = intel_xrx500_ndo_start_xmit,
+ 	.ndo_get_stats64 = intel_xrx500_ndo_get_stats64,
+-	.ndo_change_mtu  = intel_xrx500_ndo_change_mtu,
+ 	.ndo_validate_addr = eth_validate_addr,
+ 	.ndo_set_mac_address = eth_mac_addr,
+ };
+@@ -1323,7 +1303,14 @@ static int intel_xrx500_port_setup(struct intel_xrx500_priv *priv,
+ 	netdev->ethtool_ops = &intel_xrx500_ethtool_ops;
+ 
+ 	netdev->min_mtu = ETH_MIN_MTU;
+-	netdev->max_mtu = 9216;
++	/*
++	 * The switch core these ports sit behind is initialised to discard
++	 * anything longer than a standard Ethernet frame (gsw_flow_pce.c
++	 * writes a frame length of 1518) and intel_xrx500_ndo_start_xmit()
++	 * only ever checks out a standard 2 KiB CBM segment, so a standard
++	 * MTU is the most a port can carry.
++	 */
++	netdev->max_mtu = ETH_DATA_LEN;
+ 
+ 	phylink = phylink_create(&port->phylink_config,
+ 				 of_fwnode_handle(port_node),

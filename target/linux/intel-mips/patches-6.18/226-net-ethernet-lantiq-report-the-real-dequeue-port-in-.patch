@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 12:07:13 +0000
+Subject: net: ethernet: lantiq: report the real dequeue port in the TX-init
+ marker
+
+The per-port marker at the end of ndo_open's TX-init step prints a literal
+"(DMA2TX ch5)". That was written when eth0 was the only port that opened,
+and ch5 is the eth0/GPHY5 path; now that all four LAN ports open it is
+printed unchanged for eth1..eth3, where it is simply false.
+
+Print port->cbm_deq_port instead, which is the value the rest of the TX
+path actually keys off - hdma_port_enable(), hdma_port_disable() and the
+CBM dequeue arithmetic all take it. Four boot lines that used to agree
+with each other and disagree with the hardware now name the port each
+netdev really dequeues from, which is the thing worth having in a boot
+log.
+
+Log text only; no functional change.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/intel_xrx500.c b/drivers/net/ethernet/lantiq/intel_xrx500.c
+index 5a2505a11d6f..ca44fa3a31dc 100644
+--- a/drivers/net/ethernet/lantiq/intel_xrx500.c
++++ b/drivers/net/ethernet/lantiq/intel_xrx500.c
+@@ -598,8 +598,8 @@ static int intel_xrx500_open_step4_tx(struct intel_xrx500_port *port)
+ 
+ 	port->state_tx_initialized = true;
+ 
+-	pr_info("intel-xrx500: %s TX path CPU-ENQUEUE (DMA2TX ch5)\n",
+-		netdev_name(port->netdev));
++	pr_info("intel-xrx500: %s TX path CPU-ENQUEUE (cbm_deq_port %u)\n",
++		netdev_name(port->netdev), port->cbm_deq_port);
+ 
+ 	return 0;
+ }

@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 1 Sep 2026 20:41:41 +0200
+Subject: MIPS: dts: intel-mips: pin the GPHY IDs
+
+Without a compatible naming the identifier, of_mdiobus_register_phy() has
+to go out on the bus and read the identification registers before it can
+create the PHY device. The integrated GPHY cores serve those registers from
+hardwired logic as soon as the MDIO master is alive, well before the
+firmware the SoC loads into them has finished booting, so the scan can
+sample a core that is only half awake: MII_BMSR reads back as 0x0000 on a
+transaction that reports success, and the abilities derived from it stay
+empty for the rest of the boot.
+
+Spelling the identifier out takes the phy_device_create() path instead, so
+enumeration issues no bus transaction at all and the PHY device exists
+whether or not its core has come up yet. This is also what the vendor
+device tree does.
+
+0xd565a409 is what all five cores report on every board using these files;
+the driver matches it under an exact mask, and the low bits of the
+identifier are set by the firmware variant that was loaded.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
+index 45a3edf47e12..4f99e42af75b 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
+@@ -82,20 +82,33 @@ gswip_mdio: gswip-mdio@1c003c10 {
+ 		 * equals this PHY's MDIO address. Getting the pairing wrong
+ 		 * gives a working link on the wrong front-panel socket, which
+ 		 * no probe-time check can catch.
++		 *
++		 * The identifier is spelled out on every node so the PHY device
++		 * is created from the device tree alone. These cores answer
++		 * their ID registers before the firmware the SoC loads has
++		 * finished booting, so a bus scan can sample a half-alive core.
+ 		 */
+ 		gphy_lan1: ethernet-phy@5 {
++			compatible = "ethernet-phy-idd565.a409",
++				     "ethernet-phy-ieee802.3-c22";
+ 			reg = <0x05>;
+ 		};
+ 
+ 		gphy_lan2: ethernet-phy@4 {
++			compatible = "ethernet-phy-idd565.a409",
++				     "ethernet-phy-ieee802.3-c22";
+ 			reg = <0x04>;
+ 		};
+ 
+ 		gphy_lan3: ethernet-phy@3 {
++			compatible = "ethernet-phy-idd565.a409",
++				     "ethernet-phy-ieee802.3-c22";
+ 			reg = <0x03>;
+ 		};
+ 
+ 		gphy_lan4: ethernet-phy@2 {
++			compatible = "ethernet-phy-idd565.a409",
++				     "ethernet-phy-ieee802.3-c22";
+ 			reg = <0x02>;
+ 		};
+ 	};
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
+index 1a27ac69965e..a2ec4dac78a5 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
+@@ -49,6 +49,8 @@ gswr_mdio: gswip-mdio@1a003c10 {
+ 		status = "okay";
+ 
+ 		gphy_wan: ethernet-phy@1 {
++			compatible = "ethernet-phy-idd565.a409",
++				     "ethernet-phy-ieee802.3-c22";
+ 			reg = <0x01>;
+ 		};
+ 	};

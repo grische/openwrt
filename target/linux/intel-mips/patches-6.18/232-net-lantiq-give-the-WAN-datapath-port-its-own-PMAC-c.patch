@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 02:43:06 +0200
+Subject: net: lantiq: give the WAN datapath port its own PMAC class
+
+dp_alloc_flags was hardcoded to DP_F_FAST_ETH_LAN for every port child, so
+a dp-15 port would have been allocated as LAN. That matters in two places,
+and the second one is the one that reaches the wire.
+
+Read the class from the DT "lantiq,wan" marker - the same property the
+vendor's board glue reads - and cross-check it: DP_F_FAST_ETH_WAN drives
+the vendor allocator over a range whose start and end are both
+PMAC_ETH_WAN_ID, so the WAN class can only ever land on dp port 15. A DT
+marking any other port as WAN is rejected rather than silently given the
+wrong PMAC template.
+
+Restore the DP_F_FAST_ETH_WAN branch of init_dma_pmac_template(), excised
+during the original port when only LAN ports existed. Without it dp 15
+fell through to the DP_F_DIRECT fallback, which sets port_map = port_map2
+= 0xff (flood to all sixteen ports), port_map_en = 0 and sppid = portid -
+structurally wrong, not a near miss. The restored branch differs from the
+LAN one in exactly one bit, redirect = 1, which is what puts the port's
+counters in the GSW-R redirect RMON block.
+
+That restore alone would have been inert, and this is worth stating
+plainly: get_dma_pmac_templ() has no caller in this tree because dp_xmit
+is not ported. The TX PMAC header the hardware actually sees is hand-built
+in intel_xrx500_start_xmit, and it zeroed redirect unconditionally. So the
+same bit is set there, keyed on the port's class, or the WAN port would
+have egressed with a LAN-shaped header no matter what the template said.
+The existing port_map/port_map2 split at 8 already produces the right
+0x80 for dp 15.
+
+Two things deliberately NOT done, having checked the vendor:
+
+  - No ep=15 QIDT cube. The vendor programs one at dp_port_alloc pointing
+    at the port's own TX queue 28, and cbm_dp_enable already writes the
+    single slot of that cube our all-zero TX descriptors use. Adding a
+    cube aimed at the CPU queue - by analogy with the existing ep=7 one -
+    would collide on that slot and route any WAN descriptor with a
+    non-zero class back into the host RX path instead of the wire.
+
+  - No RX-side change. A WAN frame delivered to the CPU carries ep=0 and
+    sppid=15, not ep=15: ep is the PCE's destination port for the copy,
+    and update_port_vap overwrites it with sppid when the destination is
+    the CPU. The sppid demux was already widened to admit 15.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_misc.c b/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
+index 71eee935253a..5a26750292d1 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
+@@ -60,6 +60,7 @@ struct dp_subif_data {
+  *
+  *   DP_F_DEREGISTER   = BIT(0) = 0x01 — subif_platform_set dispatch flag.
+  *   DP_F_FAST_ETH_LAN = BIT(1) = 0x02 — init_dma_pmac_template LAN branch.
++ *   DP_F_FAST_ETH_WAN = BIT(2) = 0x04 — init_dma_pmac_template WAN branch.
+  *   DP_F_LOOPBACK     = BIT(6) = 0x40 — update_port_vap tunnel-loop branch.
+  *
+  * #ifndef guards let any later subtask import the AVM enum first and have
+@@ -71,6 +72,9 @@ struct dp_subif_data {
+ #ifndef DP_F_FAST_ETH_LAN
+ #define DP_F_FAST_ETH_LAN 0x00000002
+ #endif
++#ifndef DP_F_FAST_ETH_WAN
++#define DP_F_FAST_ETH_WAN 0x00000004
++#endif
+ #ifndef DP_F_LOOPBACK
+ #define DP_F_LOOPBACK 0x00000040
+ #endif
+@@ -110,13 +114,7 @@ static void init_dma_desc_mask(void)
+ 	dma_tx_desc_mask1.field.ep = 0xF;
+ }
+ 
+-/*
+- * Only the DP_F_FAST_ETH_LAN branch (AVM:79-90) and the final 'else
+- * DP_F_DIRECT' branch (AVM:197-222) are kept; DP_F_FAST_ETH_WAN,
+- * DP_F_DIRECTLINK, DP_F_FAST_DSL, DP_F_FAST_WLAN are line-excised. The memset
+- * block + the 0xFFFFFFFF mask init loop at function entry are preserved
+- * verbatim from AVM:67-77.
+- */
++/* init_dma_pmac_template - AVM:60-223 with the branch surgery applied. */
+ static void init_dma_pmac_template(int portid, u32 flags)
+ {
+ 	int i;
+@@ -146,6 +144,23 @@ static void init_dma_pmac_template(int portid, u32 flags)
+ 		}
+ 		/* for checksum for pmac_template[1] */
+ 		dp_info->pmac_template[TEMPL_CHECKSUM].tcp_chksum = 1;
++	} else if (flags & DP_F_FAST_ETH_WAN) { /* always with pmac */
++		/*
++		 * AVM:91-102. Identical to the LAN branch above but for
++		 * redirect = 1 — that single bit is the whole downstream
++		 * difference between the two Ethernet classes, and it is what
++		 * makes the WAN port's counters land in the GSW-R redirect RMON
++		 * block (datapath_mib.c reads WAN stats from there).
++		 */
++		for (i = 0; i < MAX_TEMPLATE; i++) {
++			dp_info->pmac_template[i].port_map_en = 1;
++			dp_info->pmac_template[i].sppid = PMAC_CPU_ID;
++			dp_info->pmac_template[i].redirect = 1;
++			dp_info->pmac_template[i].class_en = 1;
++			SET_PMAC_PORTMAP(&dp_info->pmac_template[i], portid);
++		}
++		/* for checksum for pmac_template[1] */
++		dp_info->pmac_template[TEMPL_CHECKSUM].tcp_chksum = 1;
+ 	} else { /* DP_F_DIRECT fallback - AVM lines 197-222 */
+ 		/* normal dirctpath without checksum support */
+ 		dp_info->pmac_template[TEMPL_NORMAL].port_map_en = 0;
+diff --git a/drivers/net/ethernet/lantiq/include/intel_xrx500.h b/drivers/net/ethernet/lantiq/include/intel_xrx500.h
+index 953f948afc2a..b3daf9771979 100644
+--- a/drivers/net/ethernet/lantiq/include/intel_xrx500.h
++++ b/drivers/net/ethernet/lantiq/include/intel_xrx500.h
+@@ -44,6 +44,14 @@ struct dma_tx_desc;
+  */
+ #define INTEL_XRX500_MAX_PORTS  5
+ 
++/*
++ * The WAN port's datapath id. Not a choice: DP_F_FAST_ETH_WAN drives the
++ * vendor allocator over a single-entry range whose start and end are both
++ * PMAC_ETH_WAN_ID, so the WAN class can only ever land on dp port 15. It sits
++ * on GSWIP-R / PMAC-R, which is why it is nowhere near the LAN block.
++ */
++#define INTEL_XRX500_DP_PORT_WAN  15
++
+ /**
+  * struct intel_xrx500_port_stats - per-port traffic counters.
+  *
+diff --git a/drivers/net/ethernet/lantiq/intel_xrx500.c b/drivers/net/ethernet/lantiq/intel_xrx500.c
+index 6983430c7b47..1307be2b6544 100644
+--- a/drivers/net/ethernet/lantiq/intel_xrx500.c
++++ b/drivers/net/ethernet/lantiq/intel_xrx500.c
+@@ -58,6 +58,9 @@
+ #ifndef DP_F_FAST_ETH_LAN
+ #define DP_F_FAST_ETH_LAN		0x00000002
+ #endif
++#ifndef DP_F_FAST_ETH_WAN
++#define DP_F_FAST_ETH_WAN		0x00000004
++#endif
+ 
+ /*
+  * Field order/sizes MUST match datapath_api.c's local copy bit-for-bit or
+@@ -875,15 +878,25 @@ static netdev_tx_t intel_xrx500_ndo_start_xmit(struct sk_buff *skb,
+ 
+ 	if (hdr_len) {
+ 		/*
+-		 * LAN-port PMAC tx header (AVM DP_F_FAST_ETH_LAN template):
+-		 * port_map_en=1, sppid=PMAC_CPU_ID(0), class_en=1,
+-		 * port_map2 = 1 << dp_port_id. Only used on a header-channel.
++		 * PMAC tx header, matching AVM's init_dma_pmac_template for this
++		 * port's class: port_map_en=1, sppid=PMAC_CPU_ID(0), class_en=1,
++		 * port_map/port_map2 = the dp port's bit. Only used on a
++		 * header-channel.
++		 *
++		 * redirect is the ONLY field that differs between the LAN and WAN
++		 * templates (datapath/datapath_misc.c init_dma_pmac_template).
++		 * This hand-built header, not that template, is what the wire
++		 * actually sees - get_dma_pmac_templ() has no caller in this tree
++		 * because dp_xmit is not ported - so the bit has to be set here
++		 * too, or the WAN port would egress with a LAN-shaped header.
+ 		 */
+ 		pmac = (struct pmac_tx_hdr *)((u8 *)buf + XRX500_CBM_TX_DATA_OFFSET);
+ 		memset(pmac, 0, sizeof(*pmac));
+ 		pmac->port_map_en = 1;
+ 		pmac->sppid = 0;          /* PMAC_CPU_ID */
+ 		pmac->class_en = 1;
++		pmac->redirect =
++			!!(port->dp_alloc_flags & DP_F_FAST_ETH_WAN);
+ 		if (port->dp_port_id <= 7)
+ 			pmac->port_map2 = (u8)(1u << port->dp_port_id);
+ 		else
+@@ -1188,6 +1201,7 @@ static int intel_xrx500_port_setup(struct intel_xrx500_priv *priv,
+ 	struct phylink *phylink;
+ 	u32 dp_port_id;
+ 	u32 deq_port;
++	bool is_wan;
+ 	int ret;
+ 
+ 	ret = of_property_read_u32(port_node, "intel,dp-port-id", &dp_port_id);
+@@ -1215,6 +1229,22 @@ static int intel_xrx500_port_setup(struct intel_xrx500_priv *priv,
+ 		return ret;
+ 	}
+ 
++	/*
++	 * DP_F_FAST_ETH_WAN pins the datapath port id: AVM's allocator walks
++	 * PMAC_ETH_WAN_ID as both the start and the end of its search, so the
++	 * WAN class can only ever land on dp port 15. A DT that marks some
++	 * other port as WAN is describing something the silicon cannot do, and
++	 * the two properties would then disagree silently about which PMAC
++	 * template the port gets.
++	 */
++	is_wan = of_property_read_bool(port_node, "lantiq,wan");
++	if (is_wan && dp_port_id != INTEL_XRX500_DP_PORT_WAN) {
++		dev_err(priv->dev,
++			"intel-xrx500: port@%u has lantiq,wan but intel,dp-port-id=%u (WAN is always %u)\n",
++			port_idx, dp_port_id, INTEL_XRX500_DP_PORT_WAN);
++		return -EINVAL;
++	}
++
+ 	netdev = alloc_etherdev_mq(sizeof(*port), 1);
+ 	if (!netdev)
+ 		return -ENOMEM;
+@@ -1241,7 +1271,7 @@ static int intel_xrx500_port_setup(struct intel_xrx500_priv *priv,
+ 	port->cbm_deq_port    = deq_port;
+ 	port->tmu_egress_port = deq_port;
+ 	port->parent          = priv;
+-	port->dp_alloc_flags  = DP_F_FAST_ETH_LAN;
++	port->dp_alloc_flags  = is_wan ? DP_F_FAST_ETH_WAN : DP_F_FAST_ETH_LAN;
+ 	port->dp_subif_id     = -1;
+ 	port->state_open      = false;
+ 	port->state_subif_registered = false;

@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 1 Sep 2026 20:44:26 +0200
+Subject: net: ethernet: lantiq: gswip-mdio: do not sample a GPHY before it is
+ ready
+
+Three ways this bus could touch a GPHY core at a moment when the answer it
+gets back is not the core's, all of them during probe:
+
+The cores serve their identification registers out of hardwired logic as
+soon as the MDIO master is alive, but the rest of their register file only
+becomes meaningful once the firmware the SoC loads into them is running. In
+between, BMSR reads back as 0x0000 on a transaction that reports success,
+which is indistinguishable from a healthy PHY with nothing to say. Wait for
+every address the device tree declares to answer with a status word that is
+neither 0x0000 nor 0xffff before handing the bus to phylib, at most two
+seconds for the whole bus. A core that never answers only earns a warning:
+it must not take the bus, and with it every other port, down with it.
+
+MDC_CFG_0.PEN turns the switch's own link poller into a second autonomous
+master on the very MDIO control and read registers this driver drives, so
+its transactions interleave with ours and either side can collect the
+other's result. Enabling it before the bus is registered puts it right in
+the middle of bring-up; move the write past devm_of_mdiobus_register(),
+which is also where the vendor enables it - at switch-core init, not before
+the PHYs are up.
+
+Finally, MBUSY does not go up the instant the control word is written. The
+completion poll can therefore run while the block is still idle from before
+the transaction, find MBUSY clear, and return the previous transaction's
+MDREAD contents as this one's answer. Give the hardware the 10 us it needs
+before looking, on both bus callbacks and on the raw read used at probe
+time - which the wait above depends on for a fresh value.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c b/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
+index 15d798ad177c..3f83ebea22f8 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
+@@ -9,10 +9,13 @@
+  */
+ 
+ #include <linux/bits.h>
++#include <linux/delay.h>
+ #include <linux/err.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/kernel.h>
++#include <linux/ktime.h>
++#include <linux/mii.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -98,6 +101,21 @@
+ #define LTQ_GSWIP_MDIO_POLL_INTERVAL_US  1
+ #define LTQ_GSWIP_MDIO_POLL_TIMEOUT_US   10000
+ 
++/*
++ * Delay between issuing a transaction and polling for its completion. The
++ * hardware needs this long to raise MBUSY; sampling earlier reads back the
++ * idle state that preceded the transaction, so the poll returns at once and
++ * MDREAD still holds the previous transaction's data.
++ */
++#define LTQ_GSWIP_MDIO_ISSUE_DELAY_US    10
++
++/*
++ * Budget for the GPHY cores on one bus to finish booting, and the interval
++ * between attempts.
++ */
++#define LTQ_GSWIP_MDIO_PHY_READY_TIMEOUT_US   2000000
++#define LTQ_GSWIP_MDIO_PHY_READY_INTERVAL_US  10000
++
+ /* Most PHY child nodes any one of these buses carries (GSW-L has four). */
+ #define LTQ_GSWIP_MDIO_MAX_PHYS  8
+ 
+@@ -165,6 +183,7 @@ static int ltq_gswip_mdio_dbg_rd(struct ltq_gswip_mdio_priv *priv,
+ 		return -1;
+ 	cmd = ltq_gswip_mdio_ctrl_word(priv, LTQ_GSWIP_MDIO_OP_READ, addr, reg);
+ 	__raw_writel(cmd, priv->base + LTQ_GSWIP_MDIO_CTRL_OFF);
++	udelay(LTQ_GSWIP_MDIO_ISSUE_DELAY_US);
+ 	if (ltq_gswip_mdio_poll_mbusy(priv))
+ 		return -1;
+ 	return __raw_readl(priv->base + LTQ_GSWIP_MDIO_READ_OFF) & 0xFFFF;
+@@ -237,6 +256,57 @@ static void ltq_gswip_mdio_calibrate_ctrl(struct ltq_gswip_mdio_priv *priv)
+ 		 priv->n_phys, priv->phy_addr[0], last_id & 0xFFFF);
+ }
+ 
++/**
++ * ltq_gswip_mdio_wait_phys_ready() - wait for the GPHY cores to finish booting.
++ *
++ * @priv: per-bus state.
++ *
++ * The cores answer their identification registers out of hardwired logic as
++ * soon as the MDIO master is alive, which is long before the firmware the SoC
++ * loaded into them is running. In that window BMSR reads back as 0x0000 on a
++ * transaction that reports success, so anything sampling a core this early
++ * gets an answer that looks valid and is not. Wait for every declared address
++ * to return a status word that is neither of the two "nothing here" patterns
++ * before the bus is handed to phylib.
++ *
++ * Fails open: a core that never answers must not take the whole bus down with
++ * it, and the PHY devices are created from the device tree either way.
++ */
++static void ltq_gswip_mdio_wait_phys_ready(struct ltq_gswip_mdio_priv *priv)
++{
++	ktime_t deadline = ktime_add_us(ktime_get(),
++					LTQ_GSWIP_MDIO_PHY_READY_TIMEOUT_US);
++	int i;
++
++	for (i = 0; i < priv->n_phys; i++) {
++		s64 budget_us = ktime_us_delta(deadline, ktime_get());
++		int bmsr;
++
++		/*
++		 * read_poll_timeout() reads a zero timeout as "no timeout", so
++		 * an exhausted budget still has to buy one attempt.
++		 */
++		if (budget_us < LTQ_GSWIP_MDIO_PHY_READY_INTERVAL_US)
++			budget_us = LTQ_GSWIP_MDIO_PHY_READY_INTERVAL_US;
++
++		if (!read_poll_timeout(ltq_gswip_mdio_dbg_rd, bmsr,
++				       bmsr > 0 && bmsr != 0xFFFF,
++				       LTQ_GSWIP_MDIO_PHY_READY_INTERVAL_US,
++				       budget_us, false,
++				       priv, priv->phy_addr[i], MII_BMSR))
++			continue;
++
++		if (bmsr < 0)
++			dev_warn(priv->dev,
++				 "mdio: phy %u did not answer within the boot wait; continuing\n",
++				 priv->phy_addr[i]);
++		else
++			dev_warn(priv->dev,
++				 "mdio: phy %u still reports BMSR=0x%04x after the boot wait; continuing\n",
++				 priv->phy_addr[i], bmsr);
++	}
++}
++
+ /*
+  * Read this bus's PHY child nodes: their addresses (for calibration, which
+  * runs before the bus is registered and so cannot use mdiobus_get_phy) and
+@@ -367,6 +437,7 @@ static int ltq_gswip_mdio_read(struct mii_bus *bus, int addr, int reg)
+ 
+ 	cmd = ltq_gswip_mdio_ctrl_word(priv, LTQ_GSWIP_MDIO_OP_READ, addr, reg);
+ 	__raw_writel(cmd, priv->base + LTQ_GSWIP_MDIO_CTRL_OFF);
++	udelay(LTQ_GSWIP_MDIO_ISSUE_DELAY_US);
+ 
+ 	/* Wait for the read transaction to complete (MBUSY -> 0). */
+ 	ret = ltq_gswip_mdio_poll_mbusy(priv);
+@@ -417,6 +488,7 @@ static int ltq_gswip_mdio_write(struct mii_bus *bus, int addr, int reg,
+ 
+ 	cmd = ltq_gswip_mdio_ctrl_word(priv, LTQ_GSWIP_MDIO_OP_WRITE, addr, reg);
+ 	__raw_writel(cmd, priv->base + LTQ_GSWIP_MDIO_CTRL_OFF);
++	udelay(LTQ_GSWIP_MDIO_ISSUE_DELAY_US);
+ 
+ 	/* Wait for the write transaction to retire. */
+ 	ret = ltq_gswip_mdio_poll_mbusy(priv);
+@@ -539,21 +611,7 @@ static int ltq_gswip_mdio_probe(struct platform_device *pdev)
+ 	mdc_cfg_1 = __raw_readl(priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+ 
+ 	ltq_gswip_mdio_calibrate_ctrl(priv);
+-
+-	/*
+-	 * Enable the GSWIP-3.0 hardware MDIO poller (MDC_CFG_0.PEN). It is
+-	 * the only link-to-MAC coupling the vendor uses — its phylib
+-	 * adjust_link is an empty stub — and it is enabled at switch-core
+-	 * init (gsw_flow_core.c legacy init and GSW_HW_Init). The PHY address
+-	 * register is left at its reset default.
+-	 */
+-	__raw_writel(priv->pen_mask, priv->base + LTQ_GSWIP_MDIO_MDC_CFG_0_OFF);
+-
+-	dev_info(&pdev->dev,
+-		 "gswip%c MDC_CFG_0=0x%08x (PEN for %d phy(s)) MDC_CFG_1=0x%08x\n",
+-		 priv->is_gswl ? 'l' : 'r',
+-		 __raw_readl(priv->base + LTQ_GSWIP_MDIO_MDC_CFG_0_OFF),
+-		 priv->n_phys, mdc_cfg_1);
++	ltq_gswip_mdio_wait_phys_ready(priv);
+ 
+ 	if (ltq_gswip_mdio_fixup_registered)
+ 		ret = 0;
+@@ -584,6 +642,25 @@ static int ltq_gswip_mdio_probe(struct platform_device *pdev)
+ 
+ 	ltq_gswip_mdio_log_scanned_phys(pdev, bus);
+ 
++	/*
++	 * Enable the GSWIP-3.0 hardware MDIO poller (MDC_CFG_0.PEN). It is
++	 * the only link-to-MAC coupling the vendor uses — its phylib
++	 * adjust_link is an empty stub — and the vendor enables it at
++	 * switch-core init (gsw_flow_core.c legacy init and GSW_HW_Init), not
++	 * before the bus comes up. It has to stay off until then: the poller
++	 * is a second autonomous master on the same MDIO control and read
++	 * registers, so anything it issues while the bus is being brought up
++	 * lands on a transaction of ours. The PHY address register is left at
++	 * its reset default.
++	 */
++	__raw_writel(priv->pen_mask, priv->base + LTQ_GSWIP_MDIO_MDC_CFG_0_OFF);
++
++	dev_info(&pdev->dev,
++		 "gswip%c MDC_CFG_0=0x%08x (PEN for %d phy(s)) MDC_CFG_1=0x%08x\n",
++		 priv->is_gswl ? 'l' : 'r',
++		 __raw_readl(priv->base + LTQ_GSWIP_MDIO_MDC_CFG_0_OFF),
++		 priv->n_phys, mdc_cfg_1);
++
+ 	/*
+ 	 * One-shot GSW-L switch-core re-init, matching the vendor's
+ 	 * GSW_HW_Init sequence. It runs from a work function because it must

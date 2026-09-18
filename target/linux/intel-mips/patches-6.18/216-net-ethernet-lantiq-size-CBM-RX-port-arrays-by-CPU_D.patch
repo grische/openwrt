@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 12 Aug 2026 15:54:37 +0000
+Subject: net: ethernet: lantiq: size CBM RX port arrays by CPU_DQM_PORT_NUM
+
+g_cbm_dlist, cbm_tasklet and g_cbm_resched_cnt in the GRX500 CBM
+interrupt code are indexed by CBM load-spreader / CPU-DQM port id, not
+by Linux CPU id, but they were declared with NR_CPUS as their extent.
+
+The indices are unambiguously port ids: cbm_ls_deq_list() stages the LS
+ring of port @pid into g_cbm_dlist[pid][], bounded only by the
+cbm_cpu_dequeue_list() guard "pid >= CPU_DQM_PORT_NUM"; cbm_isr_4/5/6/7
+schedule cbm_tasklet[0]/[1]/[2]/[3] for the LS interrupt of their
+respective port; and cbm_rx_engine_init() runs tasklet_init() on all
+four entries, passing the port id as the tasklet data word, which
+do_cbm_tasklet() then uses to index g_cbm_dlist[] and g_cbm_resched_cnt[]
+(its "cpu" parameter is a port id despite the AVM-inherited name).
+
+Sizing by NR_CPUS therefore only happened to work because every config
+built so far has NR_CPUS >= 4. In any NR_CPUS < 4 build the host-RX path
+writes out of bounds as soon as the hardware uses a port beyond the last
+slot: the tasklet servicing LS port 2 - which is where host RX actually
+lands on this SoC - stages up to 64 descriptors at
+g_cbm_dlist[2][0..63], i.e. up to about 1 KB past the end of a
+two-element array, corrupting whatever the linker placed after it. The
+same build indexes cbm_tasklet[] and g_cbm_resched_cnt[] out of bounds
+from hard interrupt and softirq context.
+
+Declare all three with CPU_DQM_PORT_NUM, which is the constant the range
+guard already uses, so the arrays match the index domain regardless of
+NR_CPUS. No functional change for NR_CPUS >= 4 builds.
+
+While here, correct the "per-cpu" wording in the surrounding comments,
+and the stale claim that only cbm_tasklet[0] is initialised - all four
+have been armed since the per-LS-port tasklet split.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+index 0c92fd226cb3..b07476ffbc06 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+@@ -83,13 +83,13 @@ irqreturn_t cbm_isr_7(int irq, void *dev_id);
+  */
+ #define CBM_PMAC_RX_HDR_LEN 8
+ 
+-static struct cbm_desc g_cbm_dlist[NR_CPUS][64];
++static struct cbm_desc g_cbm_dlist[CPU_DQM_PORT_NUM][64];
+ static unsigned long g_cpu_port_alloc;
+-static struct tasklet_struct cbm_tasklet[NR_CPUS];
++static struct tasklet_struct cbm_tasklet[CPU_DQM_PORT_NUM];
+ static struct net_device *g_cbm_rx_netdev;
+ 
+ #define CBM_RX_RESCHED_CAP 1000
+-static u32 g_cbm_resched_cnt[NR_CPUS];
++static u32 g_cbm_resched_cnt[CPU_DQM_PORT_NUM];
+ 
+ /* Sub-handlers */
+ 

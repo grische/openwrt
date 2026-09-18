@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 09:54:16 +0000
+Subject: net: ethernet: lantiq: release the DMA channel when hdma_port_enable
+ fails
+
+hdma_port_enable() had no rollback. Every failure exit after
+ltq_request_dma() had already succeeded returned with the channel still
+marked CHAN_IN_USE and the per-port armed bit still clear, so the retry
+the CBM probe tail promises - "ndo_open will retry" - was impossible:
+ndo_open step 1 calls in again, ltq_request_dma returns -EBUSY, and
+ndo_open's unwind runs only the TMU undo for a step-1 failure, never
+hdma_port_disable. The port could not come up again for the rest of the
+boot.
+
+This was inert while only dequeue port 10 was served and its probe-time
+open had always succeeded. Now that all four LAN ports are armed at the
+CBM probe tail it is four times the exposure, and the failure mode - one
+silently dead LAN port, with only a dev_warn at probe to show for it -
+is exactly the kind that costs a hardware iteration to diagnose.
+
+Route the six post-request failure exits through an err_release label that
+closes, frees the descriptor slot and releases every channel the call
+acquired, so a failure leaves the port as it was found. Releasing only
+entries [0, i] is deliberate: later table entries were never requested.
+Both ltq_free_dma() (clears CHAN_IN_USE) and ltq_dma_chan_desc_free()
+(idempotent with no ring) are safe on a channel that got no further than
+ltq_request_dma, and dma_chan_close() on a never-opened channel just clears
+an already-clear ON bit.
+
+Also correct hdma_port_disable's claim that its unarmed-port path is the
+ndo_open rollback. It is belt-and-braces, not load-bearing: enable now
+cleans up after itself, and ndo_open does not call disable for a step-1
+failure in any case.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/dma/hdma.c b/drivers/net/ethernet/lantiq/dma/hdma.c
+index f45b9fd476d2..ed19a318ae5c 100644
+--- a/drivers/net/ethernet/lantiq/dma/hdma.c
++++ b/drivers/net/ethernet/lantiq/dma/hdma.c
+@@ -2333,7 +2333,7 @@ int hdma_port_enable(int port_id)
+ 			if (ret) {
+ 				pr_err("hdma_port_enable(%d): init_cbm_dqm_dma_port(%d) failed: %d\n",
+ 				       port_id, e->cbm_deq, ret);
+-				return ret;
++				goto err_release;
+ 			}
+ 
+ 			ret = ltq_dma_chan_desc_cfg(chan,
+@@ -2342,7 +2342,7 @@ int hdma_port_enable(int port_id)
+ 			if (ret) {
+ 				pr_err("hdma_port_enable(%d): ltq_dma_chan_desc_cfg(%s, DQM-window) failed: %d\n",
+ 				       port_id, e->label, ret);
+-				return ret;
++				goto err_release;
+ 			}
+ 			pr_info("hdma_port_enable(%d): %s CBM-managed, desc@phys 0x%08x x%u\n",
+ 				port_id, e->label,
+@@ -2355,20 +2355,21 @@ int hdma_port_enable(int port_id)
+ 		if (ret) {
+ 			pr_err("hdma_port_enable(%d): ltq_dma_chan_desc_alloc(%s) failed: %d\n",
+ 			       port_id, e->label, ret);
+-			return ret;
++			goto err_release;
+ 		}
+ 		pch = dma_chan_l2p(chan);
+ 		if (!pch) {
+ 			pr_err("hdma_port_enable(%d): dma_chan_l2p(%s) returned NULL\n",
+ 			       port_id, e->label);
+-			return -EINVAL;
++			ret = -EINVAL;
++			goto err_release;
+ 		}
+ 		ret = ltq_dma_chan_desc_cfg(chan, pch->desc_phys,
+ 					    HDMA_PORT_DESC_NUM);
+ 		if (ret) {
+ 			pr_err("hdma_port_enable(%d): ltq_dma_chan_desc_cfg(%s) failed: %d\n",
+ 			       port_id, e->label, ret);
+-			return ret;
++			goto err_release;
+ 		}
+ chan_on:
+ 		ltq_dma_chan_irq_disable(chan);
+@@ -2376,7 +2377,7 @@ int hdma_port_enable(int port_id)
+ 		if (ret) {
+ 			pr_err("hdma_port_enable(%d): ltq_dma_chan_open(%s) failed: %d\n",
+ 			       port_id, e->label, ret);
+-			return ret;
++			goto err_release;
+ 		}
+ 		pr_info("hdma_port_enable(%d): opened %s (cid=%u pid=%u nid=%u)\n",
+ 			port_id, e->label, e->cid, e->pid, e->nid);
+@@ -2384,6 +2385,20 @@ int hdma_port_enable(int port_id)
+ 
+ 	hdma_deq_set_armed(port_id);
+ 	return 0;
++
++err_release:
++	while (1) {
++		const struct port7_chan_desc *e = &tbl[i];
++		u32 c = _DMA_C(e->cid, e->pid, e->nid);
++
++		ltq_dma_chan_close(c);
++		ltq_dma_chan_desc_free(c);
++		ltq_free_dma(c);
++		if (i == 0)
++			break;
++		i--;
++	}
++	return ret;
+ }
+ 
+ /*

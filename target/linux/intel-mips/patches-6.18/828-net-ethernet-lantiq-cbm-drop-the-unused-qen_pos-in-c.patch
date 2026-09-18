@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 11 Sep 2026 09:28:34 +0200
+Subject: net: ethernet: lantiq: cbm: drop the unused qen_pos in
+ counter_mode_set
+
+cbm_counter_mode_set() loads qen_pos with the bit position of the
+counter-enable field and never reads it again: QEN is only ever cleared
+and set, which qen_mask alone does. Its sibling msel_pos is genuinely
+read, twice -- MSEL carries a value rather than a state, so extracting
+the current mode and inserting the new one both need the shift. Both
+fields are one bit wide (BIT(4) and BIT(5) in cbm_regs.h); it is what
+the code does with them, not their width, that decides whether the
+position is needed.
+
+W=1 flags the store as -Wunused-but-set-variable, which CONFIG_WERROR
+turns into a build failure. Remove the variable and the two assignments;
+EQM_QEN_POS and DQM_QEN_POS stay in cbm_regs.h next to the masks they
+describe.
+
+No functional change.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_basic.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_basic.c
+index 8192c4cd8158..19aa84b53fb4 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_basic.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_basic.c
+@@ -67,7 +67,7 @@ int cbm_counter_mode_set(int idx, int mode)
+ {
+ 	u32 val;
+ 	u32 curr_mode;
+-	u32 qen_mask, qen_pos, msel_mask, msel_pos;
++	u32 qen_mask, msel_mask, msel_pos;
+ 
+ 	if (!g_cbm_eqm_base || !g_cbm_dqm_base) {
+ 		pr_warn_once("cbm: counter_mode_set(idx=%d) before CBM probe, skipping\n",
+@@ -78,7 +78,6 @@ int cbm_counter_mode_set(int idx, int mode)
+ 	switch (idx) {
+ 	case 0:
+ 		qen_mask  = EQM_QEN_MASK;
+-		qen_pos   = EQM_QEN_POS;
+ 		msel_mask = EQM_MSEL_MASK;
+ 		msel_pos  = EQM_MSEL_POS;
+ 		val = cbm_eqm_r32(CBM_EQM_CTRL);
+@@ -98,7 +97,6 @@ int cbm_counter_mode_set(int idx, int mode)
+ 
+ 	case 1:
+ 		qen_mask  = DQM_QEN_MASK;
+-		qen_pos   = DQM_QEN_POS;
+ 		msel_mask = DQM_MSEL_MASK;
+ 		msel_pos  = DQM_MSEL_POS;
+ 		val = cbm_dqm_r32(CBM_DQM_CTRL);

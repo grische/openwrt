@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 02:18:55 +0200
+Subject: net: lantiq: cbm: widen the dp-port-indexed arrays to the full 0..15
+ space
+
+Two arrays are indexed by datapath port id but sized for the four LAN
+ports only. Both are safe today purely because their callers gate on
+dp_port_id in [2..5]; the moment that gate widens to admit the WAN port
+(dp 15) they go out of bounds, and g_cbm_egress_preconfig[] goes out of
+bounds on a *write* from the probe-time preconfig loop, into .bss, with
+no compiler warning and no runtime check.
+
+Resize them ahead of any gate change so the widening cannot land in the
+wrong order:
+
+  - g_cbm_egress_preconfig[6] -> [CBM_MAX_DP_PORTS] (16).
+  - CBM_RX_SPPID_MAX 5 -> 15, which sizes g_cbm_rx_netdev[] and, more
+    importantly, is the range cbm_rx_set_netdev() enforces. That check
+    rejects rather than mis-files, so an unwidened range would leave a
+    dp-15 netdev unbound and silently account every WAN frame against
+    the default netdev (eth0). g_cbm_rx_mask is already a u32, so
+    BIT(15) needs nothing.
+
+16 is silicon, not head-room: the TX descriptor's DW1 ep field is 4 bits
+wide, so 15 is the largest dp port the hardware can express.
+
+No functional change - the callers' range gates are untouched here, so
+the new slots are unreachable until a later change widens them.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+index c50dcc55d514..ea130e77136d 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+@@ -359,7 +359,7 @@ int cbm_hw_init(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-bool g_cbm_egress_preconfig[6];
++bool g_cbm_egress_preconfig[CBM_MAX_DP_PORTS];
+ 
+ extern int hdma_port_enable(int port_id);
+ extern int hdma_ig192_toe_dma3_reset(void); /* TOE/DMA3 reset parity */
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+index 1f151a4cd11e..d0d24d905863 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+@@ -279,6 +279,16 @@ extern struct cbm_buff g_cbm_buff;
+ #define SBID_START 16
+ #define CBM_NOTFOUND 2
+ #define CBM_PORT_MAX 64
++/*
++ * Datapath port-id space on GSWIP-3.0: 0..15. The bound is silicon, not
++ * convention — the TX descriptor's DW1 "ep" field is 4 bits wide
++ * (datapath_api_gswip30.h), so 15 is the largest representable dp port and
++ * any array indexed by dp_port_id needs exactly this many slots. Mirrors
++ * MAX_DP_PORTS in datapath/datapath.h; duplicated rather than included
++ * because the CQM headers deliberately do not pull in the datapath
++ * internals.
++ */
++#define CBM_MAX_DP_PORTS 16
+ #ifndef CBM_SUCCESS
+ #define CBM_SUCCESS 0
+ #endif
+@@ -393,7 +403,7 @@ int init_cbm_dqm_cpu_port(int idx);
+ void cbm_rx_engine_init(void);
+ void cbm_rx_set_netdev(u32 sppid, struct net_device *dev);
+ int turn_on_DMA_p2p(void);
+-extern bool g_cbm_egress_preconfig[6];
++extern bool g_cbm_egress_preconfig[CBM_MAX_DP_PORTS];
+ int setup_eqm_dma_desc(int pid, int desc_count, u32 flags, u32 buf_offset);
+ u8 get_lookup_qid_via_index(u32 lookup_idx);
+ int cbm_counter_mode_set(int idx, int mode);
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+index 991800bb603e..b3f854eac917 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+@@ -91,7 +91,7 @@ static unsigned long g_cpu_port_alloc;
+ static struct tasklet_struct cbm_tasklet[CPU_DQM_PORT_NUM];
+ 
+ #define CBM_RX_SPPID_MIN	2
+-#define CBM_RX_SPPID_MAX	5
++#define CBM_RX_SPPID_MAX	15
+ #define CBM_RX_SPPID_DEFAULT	5	/* dp5 / eth0 / LAN1 */
+ 
+ static struct net_device *g_cbm_rx_netdev[CBM_RX_SPPID_MAX + 1];

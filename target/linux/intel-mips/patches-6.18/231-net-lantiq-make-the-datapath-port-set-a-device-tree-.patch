@@ -1,0 +1,372 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 02:31:51 +0200
+Subject: net: lantiq: make the datapath port set a device-tree fact
+
+Five separate gates hardcoded "this board has four LAN ports on dp 2..5",
+and they had to move together: relaxing the intel_xrx500 bounds check
+alone would have hit the exact-equality registration check and torn down
+all four working LAN netdevs, so a fifth port failed as hard as a third.
+
+Replace each with the question it was really asking:
+
+  - intel_xrx500 port setup, cbm_dp_port_alloc and cbm_dp_enable now gate
+    on "does the CQM have egress resources for this dp port", asked of the
+    same cbm_dp_egress_res_get() lookup that supplies the numbers. A DT
+    typo is still rejected, but the gate and the numbers can no longer
+    disagree about which ports are admissible.
+
+  - INTEL_XRX500_NUM_PORTS (4) becomes INTEL_XRX500_MAX_PORTS (5), an
+    array bound rather than a board fact, and probe reads the real count
+    from the ethernet node's child count into priv->num_ports. The
+    exact-equality check stays exact - a partial bring-up is a DT/driver
+    disagreement, not a degraded mode - but now compares against what the
+    DT asked for. Four children and five both pass.
+
+  - The CBM probe-time egress preconfig loop walks the dp ports the
+    ethernet node declares instead of a literal 2..5. This one is not
+    optional: the preconfig has to happen before the controllers are
+    enabled, which is long before intel_xrx500 probes, so the CBM
+    cannot be told what ports exist and must read the same DT nodes
+    itself. Ports are sorted ascending so the sequence is unchanged on
+    boards that list their port children in reversed front-panel order.
+
+cbm_dt_dp_ports() falls back to {2,3,4,5} when no ethernet node is
+present, so a DT without one behaves exactly as before.
+
+Checked with the helper extracted verbatim and compiled against DT stubs:
+a 7560-shaped child list (dp 5,4,3,2 in DT order) yields exactly {2,3,4,5},
+the same set in the same order as the hardcoded loop; a 7590-shaped list
+yields {2,3,4,5,15}. Duplicates, a child missing the property, capacity
+clamping and the no-node fallback all behave.
+
+dp 15 is now admissible end to end, but nothing yet asks for it: no board
+DT declares a WAN port, and the WAN class plumbing and its DMA1TX channel
+land separately.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+index de6b1b3e4544..65cfde734bd9 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+@@ -361,6 +361,50 @@ int cbm_hw_init(struct platform_device *pdev)
+ 
+ bool g_cbm_egress_preconfig[CBM_MAX_DP_PORTS];
+ 
++/*
++ * cbm_dt_dp_ports - collect the datapath port ids this board's ethernet node
++ * declares, ascending, into @out (capacity @max).
++ *
++ * If no ethernet node is present, no netdev will exist either; fall back to
++ * the four LAN ports so a DT without an ethernet node behaves exactly as it
++ * did before this became DT-driven.
++ */
++static int cbm_dt_dp_ports(u32 *out, int max)
++{
++	static const u32 lan_only[] = { 2, 3, 4, 5 };
++	struct device_node *eth, *port;
++	int n = 0, i, j;
++
++	eth = of_find_compatible_node(NULL, NULL, "intel,xrx500-net");
++	if (eth) {
++		for_each_available_child_of_node(eth, port) {
++			u32 dp;
++
++			if (n >= max)
++				continue;
++			if (of_property_read_u32(port, "intel,dp-port-id", &dp))
++				continue;
++			/* insertion sort; the lists are 4-5 entries long */
++			for (i = 0; i < n && out[i] < dp; i++)
++				;
++			if (i < n && out[i] == dp)
++				continue;	/* duplicate DT entry */
++			for (j = n; j > i; j--)
++				out[j] = out[j - 1];
++			out[i] = dp;
++			n++;
++		}
++		of_node_put(eth);
++	}
++
++	if (n)
++		return n;
++
++	for (i = 0; i < (int)ARRAY_SIZE(lan_only) && i < max; i++)
++		out[i] = lan_only[i];
++	return i;
++}
++
+ extern int hdma_port_enable(int port_id);
+ extern int hdma_ig192_toe_dma3_reset(void); /* TOE/DMA3 reset parity */
+ 
+@@ -640,16 +684,25 @@ static int cbm_xrx500_probe(struct platform_device *pdev)
+ 	 * rows) rather than the dp+5 / dp+15 arithmetic they used to be
+ 	 * computed with — that arithmetic is a LAN coincidence and does not
+ 	 * extend.
++	 *
++	 * Which ports to walk is a board fact, taken from the ethernet node's
++	 * own port children rather than a literal 2..5: a board with a WAN port
++	 * needs dp 15 preconfigured on the same before-enable side of this
++	 * boundary as its LAN ports, and a board without one must not have
++	 * egress state written for a port it does not have.
+ 	 */
+ 	{
+-		int dp;
++		u32 dp_ports[CBM_MAX_DP_PORTS];
++		int n = cbm_dt_dp_ports(dp_ports, ARRAY_SIZE(dp_ports));
++		int i;
+ 
+-		for (dp = 2; dp <= 5; dp++) {
++		for (i = 0; i < n; i++) {
+ 			struct cbm_dp_egress_res res;
++			u32 dp = dp_ports[i];
+ 			u16 deq, qid, sbid;
+ 
+-			if (cbm_dp_egress_res_get((u32)dp, &res)) {
+-				pr_err("cbm: dp%d has no egress resources; skipping preconfig\n",
++			if (cbm_dp_egress_res_get(dp, &res)) {
++				pr_err("cbm: dp%u has no egress resources; skipping preconfig\n",
+ 				       dp);
+ 				continue;
+ 			}
+@@ -660,7 +713,7 @@ static int cbm_xrx500_probe(struct platform_device *pdev)
+ 			init_cbm_dqm_dma_port((int)deq);
+ 			tmu_create_flat_egress_path(1, deq, sbid, qid, 1);
+ 			g_cbm_egress_preconfig[dp] = true;
+-			pr_info("cbm: dp%d egress preconfigured at probe (deq%u/q%u/sbid%u) before controller enable\n",
++			pr_info("cbm: dp%u egress preconfigured at probe (deq%u/q%u/sbid%u) before controller enable\n",
+ 				dp, deq, qid, sbid);
+ 		}
+ 	}
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
+index 32aa997630a7..82e3936dbfdb 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
+@@ -143,6 +143,8 @@ int cbm_dp_enable(struct module *owner, u32 port_id,
+ 		  struct cbm_dp_en_data *cbm_data,
+ 		  u32 flags, u32 alloc_flags)
+ {
++	struct cbm_dp_egress_res res;
++
+ 	(void)owner;
+ 	(void)alloc_flags;
+ 
+@@ -157,16 +159,8 @@ int cbm_dp_enable(struct module *owner, u32 port_id,
+ 		return 0;
+ 	}
+ 
+-	if (port_id >= 2 && port_id <= 5) {
+-		struct cbm_dp_egress_res res;
+-		u32 base_sbid;
+-
+-		if (cbm_dp_egress_res_get(port_id, &res)) {
+-			pr_err("cbm: cbm_dp_enable: no egress resources for dp port %u\n",
+-			       port_id);
+-			return -EINVAL;
+-		}
+-		base_sbid = res.tmu_queue - SBID_START;
++	if (cbm_dp_egress_res_get(port_id, &res) == 0) {
++		u32 base_sbid = res.tmu_queue - SBID_START;
+ 
+ 		if (!g_cbm_egress_preconfig[port_id]) {
+ 			init_cbm_dqm_dma_port((int)res.deq_port);
+@@ -205,8 +199,8 @@ EXPORT_SYMBOL_GPL(cbm_dp_enable);
+  *
+  * @flags:    caller-supplied DP_F_* mask (unused at minimum port).
+  *
+- * Returns 0 on success, -EINVAL if @data is NULL or @port_id is outside
+- * {2,3,4,5}.
++ * Returns 0 on success, -EINVAL if @data is NULL or @port_id has no CBM
++ * egress resources.
+  */
+ int cbm_dp_port_alloc(struct module *owner, struct net_device *dev,
+ 		      u32 dev_port, s32 port_id,
+@@ -226,14 +220,8 @@ int cbm_dp_port_alloc(struct module *owner, struct net_device *dev,
+ 		return -EINVAL;
+ 	}
+ 
+-	if (port_id < 2 || port_id > 5) {
+-		pr_err("cbm: cbm_dp_port_alloc: unsupported port_id=%d (minimum port serves 2..5 only)\n",
+-		       port_id);
+-		return -EINVAL;
+-	}
+-
+-	if (cbm_dp_egress_res_get((u32)port_id, &res)) {
+-		pr_err("cbm: cbm_dp_port_alloc: no egress resources for port_id=%d\n",
++	if (port_id < 0 || cbm_dp_egress_res_get((u32)port_id, &res)) {
++		pr_err("cbm: cbm_dp_port_alloc: unsupported port_id=%d (no CBM egress resources)\n",
+ 		       port_id);
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/net/ethernet/lantiq/include/intel_xrx500.h b/drivers/net/ethernet/lantiq/include/intel_xrx500.h
+index 17cbe4b4035d..953f948afc2a 100644
+--- a/drivers/net/ethernet/lantiq/include/intel_xrx500.h
++++ b/drivers/net/ethernet/lantiq/include/intel_xrx500.h
+@@ -32,8 +32,17 @@ struct dma_tx_desc;
+  *
+  * Note: the orientation is INVERSE the "natural" silicon counting order (eth0
+  * -> dp_port_id 2 .. eth3 -> dp_port_id 5 would be natural).
++ *
++ * Boards with a WAN port add one more netdev on dp_port_id 15 (GSWIP-R,
++ * PMAC-R). The PMAC<->CPU link is internal and unbacked, so it never gets a
++ * netdev of its own on any board.
++ *
++ * How many ports a board actually has is a device-tree fact, read from the
++ * child count of the ethernet node - see priv->num_ports. The constant below
++ * is only the array bound: four LAN plus one WAN is every port this silicon
++ * exposes to a netdev.
+  */
+-#define INTEL_XRX500_NUM_PORTS  4
++#define INTEL_XRX500_MAX_PORTS  5
+ 
+ /**
+  * struct intel_xrx500_port_stats - per-port traffic counters.
+@@ -145,7 +154,14 @@ struct intel_xrx500_port {
+  *
+  * @dev:     convenience back-pointer for dev_err / dev_info.
+  *
+- * @ports: per-port state pointers; NULL slots are unallocated.
++ * @ports:   per-port state pointers, indexed by the DT "reg" of the port
++ *           child node; NULL slots are unallocated.
++ *
++ * @num_ports: how many port child nodes this board's ethernet node has, read
++ *           from DT at probe. Four on a LAN-only board, five where a WAN port
++ *           is described. Probe requires exactly this many netdevs to come
++ *           up - a partial bring-up is a DT/driver disagreement, not a
++ *           degraded mode.
+  *
+  * @gswl_dev: cached ethsw_api_dev_t pointer for GSW-L (devid=0), recovered
+  * via gsw_get_swcore_ops(0) + container_of at probe time. Carries gswl_base /
+@@ -159,7 +175,8 @@ struct intel_xrx500_port {
+ struct intel_xrx500_priv {
+ 	struct platform_device		*pdev;
+ 	struct device			*dev;
+-	struct intel_xrx500_port	*ports[INTEL_XRX500_NUM_PORTS];
++	struct intel_xrx500_port	*ports[INTEL_XRX500_MAX_PORTS];
++	u32				num_ports;
+ 	void				*gswl_dev;
+ };
+ 
+diff --git a/drivers/net/ethernet/lantiq/intel_xrx500.c b/drivers/net/ethernet/lantiq/intel_xrx500.c
+index f16ad4da049b..6983430c7b47 100644
+--- a/drivers/net/ethernet/lantiq/intel_xrx500.c
++++ b/drivers/net/ethernet/lantiq/intel_xrx500.c
+@@ -592,7 +592,7 @@ static int intel_xrx500_open_step4_tx(struct intel_xrx500_port *port)
+ 		return -EINVAL;
+ 	}
+ 
+-	if (port->port_idx >= INTEL_XRX500_NUM_PORTS) {
++	if (port->port_idx >= INTEL_XRX500_MAX_PORTS) {
+ 		pr_err("intel-xrx500: %s ndo_open step 4 (tx-init): port_idx %u out of table range\n",
+ 		       netdev_name(port->netdev), port->port_idx);
+ 		return -EINVAL;
+@@ -1198,18 +1198,19 @@ static int intel_xrx500_port_setup(struct intel_xrx500_priv *priv,
+ 		return ret;
+ 	}
+ 
+-	/* Bounds-check dp_port_id. */
+-	if (dp_port_id < 2 || dp_port_id > 5) {
+-		dev_err(priv->dev,
+-			"intel-xrx500: port@%u intel,dp-port-id=%u out of range [2..5]\n",
+-			port_idx, dp_port_id);
+-		return -EINVAL;
+-	}
+-
++	/*
++	 * Validate dp_port_id by resolving it, rather than against a literal
++	 * range. The CQM's tables know which datapath ports this silicon has
++	 * egress resources for - LAN ports 2..5 and the WAN port 15 - so a DT
++	 * typo is rejected by the same lookup that produces the numbers, and
++	 * the two can never disagree about which ports are admissible.
++	 *
++	 * Done before anything is allocated, so a rejection costs no cleanup.
++	 */
+ 	ret = cbm_dp_deq_port_get(dp_port_id, &deq_port);
+ 	if (ret) {
+ 		dev_err(priv->dev,
+-			"intel-xrx500: port@%u intel,dp-port-id=%u has no CBM egress resources\n",
++			"intel-xrx500: port@%u intel,dp-port-id=%u is not a datapath Ethernet port\n",
+ 			port_idx, dp_port_id);
+ 		return ret;
+ 	}
+@@ -1405,6 +1406,20 @@ static int intel_xrx500_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, priv);
+ 
++	/*
++	 * How many netdevs this board has is a DT fact, not a build-time
++	 * constant: four on a LAN-only board, five where the ethernet node
++	 * also describes the WAN port. Read it before instantiating anything,
++	 * so the completeness check at the end has something to check against.
++	 */
++	priv->num_ports = of_get_available_child_count(dev->of_node);
++	if (!priv->num_ports || priv->num_ports > INTEL_XRX500_MAX_PORTS) {
++		dev_err(dev,
++			"intel-xrx500: ethernet node has %u port child nodes, want 1..%u\n",
++			priv->num_ports, INTEL_XRX500_MAX_PORTS);
++		return -EINVAL;
++	}
++
+ 	/* Iterate child port@N nodes and instantiate per-port netdevs. */
+ 	for_each_available_child_of_node(dev->of_node, port_node) {
+ 		u32 port_idx;
+@@ -1417,9 +1432,14 @@ static int intel_xrx500_probe(struct platform_device *pdev)
+ 			goto err_rollback;
+ 		}
+ 
+-		if (port_idx >= INTEL_XRX500_NUM_PORTS) {
++		/*
++		 * reg must densely number 0..num_ports-1: the slot array is
++		 * indexed by it, and a hole would let the count check below
++		 * pass while a slot stayed empty.
++		 */
++		if (port_idx >= priv->num_ports) {
+ 			dev_err(dev, "intel-xrx500: port@%u out of range [0..%u]\n",
+-				port_idx, INTEL_XRX500_NUM_PORTS - 1);
++				port_idx, priv->num_ports - 1);
+ 			of_node_put(port_node);
+ 			ret = -EINVAL;
+ 			goto err_rollback;
+@@ -1440,16 +1460,16 @@ static int intel_xrx500_probe(struct platform_device *pdev)
+ 		registered++;
+ 	}
+ 
+-	if (registered != INTEL_XRX500_NUM_PORTS) {
++	if (registered != priv->num_ports) {
+ 		dev_err(dev,
+-			"intel-xrx500: expected %d port child nodes, found %d\n",
+-			INTEL_XRX500_NUM_PORTS, registered);
++			"intel-xrx500: expected %u port child nodes, found %d\n",
++			priv->num_ports, registered);
+ 		ret = -EINVAL;
+ 		goto err_rollback;
+ 	}
+ 
+-	pr_info("intel-xrx500: %d LAN netdevs registered (eth0..eth%d); PMAC<->CPU link up (internal, no netdev)\n",
+-		INTEL_XRX500_NUM_PORTS, INTEL_XRX500_NUM_PORTS - 1);
++	pr_info("intel-xrx500: %u netdevs registered (eth0..eth%u); PMAC<->CPU link up (internal, no netdev)\n",
++		priv->num_ports, priv->num_ports - 1);
+ 
+ 	return 0;
+ 
+@@ -1459,7 +1479,7 @@ static int intel_xrx500_probe(struct platform_device *pdev)
+ 	 * Each slot may be either NULL (never set up) or fully wired -
+ 	 * intel_xrx500_port_destroy handles both cases.
+ 	 */
+-	for (i = INTEL_XRX500_NUM_PORTS - 1; i >= 0; i--)
++	for (i = INTEL_XRX500_MAX_PORTS - 1; i >= 0; i--)
+ 		intel_xrx500_port_destroy(priv, i);
+ 
+ 	return ret;
+@@ -1473,7 +1493,7 @@ static void intel_xrx500_remove(struct platform_device *pdev)
+ 	if (!priv)
+ 		return;
+ 
+-	for (i = INTEL_XRX500_NUM_PORTS - 1; i >= 0; i--)
++	for (i = INTEL_XRX500_MAX_PORTS - 1; i >= 0; i--)
+ 		intel_xrx500_port_destroy(priv, i);
+ }
+ 

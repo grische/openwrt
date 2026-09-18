@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 09:30:32 +0000
+Subject: net: ethernet: lantiq: correct the ltq_dma_chan_desc_free ownership
+ comment
+
+The comment on the "channel does not own the ring" branch listed the
+CBM-managed egress channels as one of the two ways to reach it. They
+cannot: they never allocate a ring, and ltq_dma_chan_desc_cfg() - which
+is what points them at the CBM DQM MMIO descriptor window - assigns its
+dma_addr_t argument to pch->desc_phys and never touches pch->desc_base.
+desc_base therefore stays 0 for those channels and the idempotent
+!desc_base guard above returns first.
+
+The one real way in is dma_p2p_cfg(), which copies an RX channel's
+desc_base/desc_phys/desc_len onto the TX channel of a peripheral-to-
+peripheral pair without an allocation of its own; freeing there would
+double-free the RX channel's ring. Say only that.
+
+Comment only, no code change.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/dma/hdma.c b/drivers/net/ethernet/lantiq/dma/hdma.c
+index dc9d104e8ef4..f45b9fd476d2 100644
+--- a/drivers/net/ethernet/lantiq/dma/hdma.c
++++ b/drivers/net/ethernet/lantiq/dma/hdma.c
+@@ -1701,10 +1701,16 @@ int ltq_dma_chan_desc_free(u32 chan)
+ 
+ 	/*
+ 	 * desc_alloc_va NULL with desc_base set means this channel does not OWN
+-	 * the ring: either the CBM-managed path pointed desc_base at the DQM
+-	 * MMIO window, or dma_p2p_cfg copied the RX channel's ring onto this TX
+-	 * channel (hdma.c dma_p2p_cfg). Releasing it here would free MMIO or
+-	 * double-free the RX ring — drop the slot without freeing.
++	 * the ring, and there is exactly one way to get there: dma_p2p_cfg()
++	 * copies the RX channel's desc_base/desc_phys/desc_len onto the TX
++	 * channel of a peripheral-to-peripheral pair, without an allocation of
++	 * its own. Freeing here would double-free the RX channel's ring, so drop
++	 * the slot without freeing.
++	 *
++	 * The CBM-managed egress channels do NOT reach this branch: they never
++	 * allocate a ring, and ltq_dma_chan_desc_cfg() (which points them at the
++	 * DQM MMIO window) writes desc_phys, not desc_base, so desc_base stays 0
++	 * and the idempotent guard above returns first.
+ 	 */
+ 	if (!pch->desc_alloc_va) {
+ 		pch->desc_base = 0;

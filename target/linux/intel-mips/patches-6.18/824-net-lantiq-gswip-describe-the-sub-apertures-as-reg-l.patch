@@ -1,0 +1,437 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 1 Sep 2026 22:31:25 +0200
+Subject: net: lantiq: gswip: describe the sub-apertures as reg-less children
+
+The device tree described one register block as three devices. gswl:
+gswip@1c000000 claims <0x1c000000 0x4000> and its driver takes that
+window with devm_platform_ioremap_resource(), which does
+request_mem_region(); the GPHY firmware loader and the MDIO bus then sat
+at root scope with reg ranges *inside* it, 0x1c003c00 + 0x280 and
+0x1c003c10 + 0x20, the second also inside the first. Their drivers used
+bare devm_ioremap() precisely to dodge the -EBUSY a resource claim would
+have produced, and one of them said so in a comment. GSW-R had the same
+shape at 0x1a003c10, plus an MDIO controller at root scope with no bus
+above it.
+
+Mainline already models this exact problem for the previous generation
+of the same switch and solves it the other way:
+Documentation/devicetree/bindings/net/dsa/lantiq,gswip.yaml puts mdio
+and gphy-fw as children of the switch node with no reg of their own, and
+drivers/net/dsa/lantiq/lantiq_gswip.c finds them by name. The vendor
+device tree for this SoC gives its MDIO node no reg either. So the two
+nodes become reg-less children named gphy-fw and mdio, and each driver
+derives its window from the parent switch node's reg plus its offset
+into the IP block -- 0x3c00 for the base-address registers, 0x3c10 for
+the bus. Those offsets are block-relative, so they are identical on both
+instances and the GSW-R bus needs nothing the GSW-L one does not have.
+One reg claim remains, and it is the switch's.
+
+The switch probe creates the children with devm_of_platform_populate()
+rather than registering the bus and loading the firmware itself the way
+lantiq_gswip.c does, because the two halves cannot share a module here:
+the GPHY firmware is proprietary and comes from the rootfs, so the
+loader and the bus build as intel-xrx500-mdio.ko while the switch core
+is built in. Folding their work into the switch probe would put
+request_firmware() in an initcall, long before there is a filesystem to
+read it from. Keeping them as platform devices with their own drivers
+also keeps the deferred probe that waits for the firmware, and
+populating with a NULL match table stops the recursion at the children,
+so the ethernet-phy@N grandchildren stay MDIO devices. Each child
+carries the lantiq,gswip-instance value of its parent, which is what
+selects the GSW-L switch-core re-init.
+
+The DT half has to move in the same commit. The blob ships with the
+kernel image, and neither half degrades: reg-less nodes under the old
+drivers fail probe for want of a resource, and the new drivers under the
+old device tree look for a parent reg that the root-scope nodes do not
+have. Either way the board comes up with no MDIO bus and no GPHY
+firmware, which is a board with no network.
+
+Comments that only described the old arrangement go with it: the
+paragraph arguing that the overlapping root-scope reg claims were by
+design, and the one naming both a reg value and a file
+(seale_avm_fritz7560.dtsi) that no longer exist. The claim that the
+firmware has to be built in goes too -- it is loaded from the rootfs,
+which is why its driver is a module.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
+index 4f99e42af75b..3fd7be6ff80b 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
+@@ -36,42 +36,38 @@ nand0: nand@0 {
+ 	};
+ };
+ 
+-/* Both GSWIP-3.0 instances; on-die blocks with no board wiring. */
++/*
++ * Both GSWIP-3.0 instances; on-die blocks with no board wiring.
++ *
++ * The GPHY firmware loader and the MDIO bus are not devices of their own:
++ * their registers are sub-apertures of the switch register window this node
++ * already claims. They are therefore reg-less children, and each driver
++ * derives its window from this node's reg plus a fixed offset into the IP
++ * block. The switch driver creates the platform devices for them.
++ */
+ &gswl {
+ 	status = "okay";
+-};
+-
+-&gswr {
+-	status = "okay";
+-};
+ 
+-/ {
+ 	/*
+-	 * GPHY firmware loader. The 0x280 window must cover the per-GPHY
+-	 * LBADR/MBADR pairs at offsets 0x228..0x26f. The firmware must be
+-	 * built in: this driver probes long before any rootfs is mounted.
++	 * GPHY firmware loader, at switch base + 0x3c00. Its window must
++	 * cover the per-GPHY LBADR/MBADR pairs at 0x228..0x26f within it.
+ 	 */
+-	gphy_fw: phy-xrx500@1c003c00 {
++	gphy_fw: gphy-fw {
+ 		compatible = "lantiq,phy-xrx500";
+-		reg = <0x1c003c00 0x280>;
+ 		firmware-name = "lantiq/xrx500-phy-fw.bin";
+ 		status = "okay";
+ 	};
+ 
+ 	/*
+-	 * GSWIP-3.0 MDIO bus on the GSW-L instance. The aperture is the
+-	 * switch base plus (MDCTRL dword 0x004 + GSW30_TOP_OFFSET 0xf00) * 4,
+-	 * a 0x20 span covering MDCTRL, MDREAD, MDWRITE and the two MDCCFG
+-	 * registers. It overlaps the switch node's own reg claim on purpose,
+-	 * which is why the driver maps it with devm_ioremap() rather than
+-	 * requesting the region.
++	 * MDIO bus, at switch base + (MDCTRL dword 0x004 + GSW30_TOP_OFFSET
++	 * 0xf00) * 4 = 0x3c10, a 0x20 span covering MDCTRL, MDREAD, MDWRITE
++	 * and the two MDCCFG registers.
+ 	 *
+ 	 * The bus defers probing until the GPHY firmware loader has run: a
+ 	 * PHY without firmware never answers MDIO.
+ 	 */
+-	gswip_mdio: gswip-mdio@1c003c10 {
++	gswip_mdio: mdio {
+ 		compatible = "lantiq,gswip-mdio";
+-		reg = <0x1c003c10 0x20>;
+ 		lantiq,gswip-instance = <0>;
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+@@ -112,7 +108,13 @@ gphy_lan4: ethernet-phy@2 {
+ 			reg = <0x02>;
+ 		};
+ 	};
++};
+ 
++&gswr {
++	status = "okay";
++};
++
++/ {
+ 	/*
+ 	 * Datapath netdev parent. Each child names one front-panel port and
+ 	 * its datapath port id; the driver allocates one netdev per child.
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
+index a2ec4dac78a5..10b3fa80aa9c 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
+@@ -28,33 +28,6 @@ usb_vbus: regulator-usb-vbus {
+ 		enable-active-high;
+ 	};
+ 
+-	/*
+-	 * The second MDIO bus, on the GSW-R instance, carrying the WAN PHY.
+-	 * The aperture is the GSW-L arithmetic in seale_avm.dtsi applied to
+-	 * the GSW-R base. The vendor device tree gives its equivalent node no
+-	 * reg, hanging the bus off the switch node instead, so there is no
+-	 * vendor counterpart to check this address against; if the arithmetic
+-	 * is wrong the symptom is specific, reads return 0xffff and the WAN
+-	 * PHY never enumerates.
+-	 *
+-	 * lantiq,gswip-instance = <1> keeps the GSW-L switch-core re-init off
+-	 * this bus. The PHY is at MDIO address 1.
+-	 */
+-	gswr_mdio: gswip-mdio@1a003c10 {
+-		compatible = "lantiq,gswip-mdio";
+-		reg = <0x1a003c10 0x20>;
+-		lantiq,gswip-instance = <1>;
+-		#address-cells = <1>;
+-		#size-cells = <0>;
+-		status = "okay";
+-
+-		gphy_wan: ethernet-phy@1 {
+-			compatible = "ethernet-phy-idd565.a409",
+-				     "ethernet-phy-ieee802.3-c22";
+-			reg = <0x01>;
+-		};
+-	};
+-
+ 	/*
+ 	 * The blink generator's slow clock source: a fixed 8 kHz input the
+ 	 * driver divides for its blink table.
+@@ -98,6 +71,31 @@ ssogpio: ssogpio@16d00000 {
+ 	};
+ };
+ 
++/*
++ * The second MDIO bus, on the GSW-R instance, carrying the WAN PHY. Same
++ * sub-aperture of the same IP block as the GSW-L bus in seale_avm.dtsi, so
++ * the driver reaches it through the identical offset from this switch node's
++ * own base.
++ *
++ * lantiq,gswip-instance = <1> keeps the GSW-L switch-core re-init off this
++ * bus. The PHY is at MDIO address 1.
++ */
++&gswr {
++	gswr_mdio: mdio {
++		compatible = "lantiq,gswip-mdio";
++		lantiq,gswip-instance = <1>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "okay";
++
++		gphy_wan: ethernet-phy@1 {
++			compatible = "ethernet-phy-idd565.a409",
++				     "ethernet-phy-ieee802.3-c22";
++			reg = <0x01>;
++		};
++	};
++};
++
+ /*
+  * All five GPHYs. The reset bit list is not contiguous, so every entry is
+  * spelled out; on this die bit 31 is the fifth PHY's own reset line and not a
+diff --git a/drivers/net/ethernet/lantiq/switch-api/gsw_init.c b/drivers/net/ethernet/lantiq/switch-api/gsw_init.c
+index 007be2459beb..db4485246790 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/gsw_init.c
++++ b/drivers/net/ethernet/lantiq/switch-api/gsw_init.c
+@@ -19,6 +19,7 @@
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/spinlock.h>
+ #include <linux/types.h>
+@@ -158,6 +159,21 @@ static int intel_xrx500_gswip_probe(struct platform_device *pdev)
+ 				"gsw_init: dp_init_module failed=%d\n", dp_ret);
+ 	}
+ 
++	/*
++	 * The GPHY firmware loader and the MDIO bus are sub-apertures of the
++	 * window mapped above, described as reg-less children of this node, so
++	 * nothing else instantiates them. Their drivers live in a module of
++	 * their own - the GPHY firmware comes from the rootfs, so they must not
++	 * be pulled into this initcall - and bind to these devices when that
++	 * module loads.
++	 */
++	ret = devm_of_platform_populate(dev);
++	if (ret) {
++		dev_err(dev, "failed to create switch sub-nodes: %d\n", ret);
++		gsw_devs_unregister(devid);
++		return ret;
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c b/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
+index 3f83ebea22f8..5c30d398f676 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
+@@ -3,9 +3,11 @@
+  * Copyright (C) 2026 Grische <github@grische.xyz>
+  *
+  * MDIO bus on a GSWIP-3.0 instance. The bus is a sub-aperture of the switch
+- * register window, so the region is claimed by the parent and mapped without
+- * claiming it again, and the block is accessed natively on this big-endian
+- * SoC.
++ * register window rather than a block of its own, so this device is a reg-less
++ * child of the switch node: the window is derived from the parent's base plus
++ * a fixed offset into the IP block, and mapped without claiming a region the
++ * switch driver already owns. The block is accessed natively on this
++ * big-endian SoC.
+  */
+ 
+ #include <linux/bits.h>
+@@ -19,6 +21,7 @@
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/of_mdio.h>
+ #include <linux/phy.h>
+ #include <linux/platform_device.h>
+@@ -30,9 +33,15 @@
+ #include "gsw30_reg_top.h"
+ #include "../include/xrx500_phy_fw.h"
+ 
++/*
++ * Where the bus registers sit inside the switch register window, and how much
++ * of it they span. The byte base works out to 0x3c10 on either instance, which
++ * is why both buses need only the parent's base to find their own.
++ */
+ #define LTQ_GSWIP_MDIO_SUBAP_DWORD_BASE \
+ 	(GSWT_MDCTRL_MBUSY_OFFSET + GSW30_TOP_OFFSET)
+ #define LTQ_GSWIP_MDIO_SUBAP_BYTE_BASE    (LTQ_GSWIP_MDIO_SUBAP_DWORD_BASE * 4)
++#define LTQ_GSWIP_MDIO_SUBAP_SIZE         0x20
+ 
+ /*
+  * Byte offsets WITHIN the sub-aperture for the three registers the
+@@ -123,7 +132,7 @@
+  * struct ltq_gswip_mdio_priv - per-bus state.
+  *
+  * @base:  ioremap'd sub-aperture covering MDIO_CTRL / MDIO_READ /
+- *         MDIO_WRITE (DT reg = <0x1c003c10 0x20> on GSW-L).
++ *         MDIO_WRITE, derived from the parent switch node's reg.
+  *
+  * @dev:   probing device, retained for dev_err / dev_info.
+  *
+@@ -538,8 +547,9 @@ static void ltq_gswip_mdio_log_scanned_phys(struct platform_device *pdev,
+ static int ltq_gswip_mdio_probe(struct platform_device *pdev)
+ {
+ 	struct ltq_gswip_mdio_priv *priv;
++	struct device_node *parent;
+ 	struct mii_bus *bus;
+-	struct resource *res;
++	struct resource res;
+ 	u32 mdc_cfg_1;
+ 	int ret;
+ 
+@@ -576,15 +586,28 @@ static int ltq_gswip_mdio_probe(struct platform_device *pdev)
+ 	 */
+ 	ltq_gswip_mdio_scan_dt_phys(priv, pdev->dev.of_node);
+ 
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	if (!res) {
+-		dev_err(&pdev->dev, "no MDIO sub-aperture resource in DT\n");
+-		return -ENODEV;
++	/*
++	 * This node carries no reg: the bus registers are inside the parent
++	 * switch's window, at a fixed offset that is the same on both
++	 * instances. Map without a resource claim, because the switch driver
++	 * has already claimed the whole window.
++	 */
++	parent = of_get_parent(pdev->dev.of_node);
++	ret = of_address_to_resource(parent, 0, &res);
++	of_node_put(parent);
++	if (ret) {
++		dev_err(&pdev->dev,
++			"no reg on the parent switch node: %d\n", ret);
++		return ret;
+ 	}
+-	priv->base = devm_ioremap(&pdev->dev, res->start, resource_size(res));
++
++	priv->base = devm_ioremap(&pdev->dev,
++				  res.start + LTQ_GSWIP_MDIO_SUBAP_BYTE_BASE,
++				  LTQ_GSWIP_MDIO_SUBAP_SIZE);
+ 	if (!priv->base) {
+ 		dev_err(&pdev->dev,
+-			"devm_ioremap(MDIO sub-aperture %pR) failed\n", res);
++			"devm_ioremap(MDIO sub-aperture at %pa + 0x%x) failed\n",
++			&res.start, LTQ_GSWIP_MDIO_SUBAP_BYTE_BASE);
+ 		return -ENOMEM;
+ 	}
+ 
+diff --git a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+index cf9e55b91acb..2fed2deb3c73 100644
+--- a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
++++ b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+@@ -23,6 +23,7 @@
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/printk.h>
+@@ -40,17 +41,17 @@
+ #define XRX200_GPHY_FW_ALIGN (16 * 1024)
+ 
+ /*
+- * Per-GPHY base-address register offsets (AVM 4.9 xrx500_phy_fw.c:23-32).
+- *
+- * These offsets are relative to the GSW-L "top" register window which
+- * starts at physical 0x1C003C00 (gswl_base + GSW30_TOP_OFFSET, where
+- * GSW30_TOP_OFFSET = 0xF00 DWORDs = 0x3C00 bytes per gsw30_reg_top.h).
+- *
+- * Note that the GSW-L gswip@1c000000 node retains its <0x1c000000 0x4000> reg
+- * claim at SoC scope (xrx500.dtsi); this sub-aperture lives inside that
+- * range. The overlap is by design - dtc tolerates sibling-node reg overlaps
+- * at root scope; the kernel's resource subsystem honours per-node ioremap
+- * regardless. Only the actual register WRITES target this sub-aperture.
++ * The base-address registers are a sub-aperture of the GSW-L switch register
++ * window: they live in that block's "top" section, which starts
++ * GSW30_TOP_OFFSET (0xf00 DWORDs) into it per gsw30_reg_top.h. The span has
++ * to cover the LBADR/MBADR pairs at 0x228..0x26f below.
++ */
++#define XRX500_GPHY_SUBAP_OFFSET 0x3c00
++#define XRX500_GPHY_SUBAP_SIZE   0x280
++
++/*
++ * Per-GPHY base-address register offsets (AVM 4.9 xrx500_phy_fw.c:23-32),
++ * relative to the sub-aperture above.
+  */
+ #define GPHY2_LBADR_XRX500 0x0228
+ #define GPHY2_MBADR_XRX500 0x022C
+@@ -358,32 +359,37 @@ static int xway_phy_fw_probe(struct platform_device *pdev)
+ 	pdev->dev.dma_coherent = false;
+ 
+ 	/*
+-	 * ioremap the GSW-L GPHY sub-aperture (reg = <0x1c003c00 0x280> in
+-	 * seale_avm_fritz7560.dtsi). The 0x40000 GSW-L window at 0x1c000000
+-	 * is exclusively reserved by the intel-xrx500-gswip platform_driver,
+-	 * so devm_platform_ioremap_resource() returns -EBUSY here. Use
+-	 * devm_ioremap() (no request_mem_region) since GSW-L doesn't touch
+-	 * the GPHY*_LBADR/MBADR sub-aperture (0x228..0x26C) — this is the
+-	 * standard kernel pattern for sharing a sub-region of another
+-	 * driver's exclusive window. devm-owned so the mapping is released on
+-	 * probe failure or unbind.
++	 * This node carries no reg: the registers are inside the GSW-L switch
++	 * window, so the aperture is that node's base plus the block-relative
++	 * offset. The whole window is claimed by the intel-xrx500-gswip
++	 * platform_driver, so map it with devm_ioremap() and no
++	 * request_mem_region() — GSW-L never touches the GPHY*_LBADR/MBADR
++	 * registers, and this is the standard pattern for sharing a sub-region
++	 * of another driver's exclusive window. devm-owned so the mapping is
++	 * released on probe failure or unbind.
+ 	 */
+ 	{
+-		struct resource *res;
++		struct device_node *parent;
++		struct resource res;
+ 
+-		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-		if (!res) {
++		parent = of_get_parent(pdev->dev.of_node);
++		ret = of_address_to_resource(parent, 0, &res);
++		of_node_put(parent);
++		if (ret) {
+ 			dev_err(&pdev->dev,
+-				"xrx500-phy-fw: missing reg resource\n");
+-			return -ENODEV;
++				"xrx500-phy-fw: no reg on the parent switch node: %d\n",
++				ret);
++			return ret;
+ 		}
+-		gsw_l_phy_base = devm_ioremap(&pdev->dev, res->start,
+-					      resource_size(res));
++
++		gsw_l_phy_base = devm_ioremap(&pdev->dev,
++					      res.start + XRX500_GPHY_SUBAP_OFFSET,
++					      XRX500_GPHY_SUBAP_SIZE);
+ 		if (!gsw_l_phy_base) {
+ 			dev_err(&pdev->dev,
+-				"xrx500-phy-fw: devm_ioremap failed at 0x%llx size 0x%llx\n",
+-				(unsigned long long)res->start,
+-				(unsigned long long)resource_size(res));
++				"xrx500-phy-fw: devm_ioremap failed at %pa + 0x%x size 0x%x\n",
++				&res.start, XRX500_GPHY_SUBAP_OFFSET,
++				XRX500_GPHY_SUBAP_SIZE);
+ 			return -ENOMEM;
+ 		}
+ 	}

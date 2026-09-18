@@ -1,0 +1,369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 09:28:16 +0000
+Subject: net: ethernet: lantiq: demux CBM RX per source port and fix RX
+ accounting
+
+The CBM load-spreader RX engine delivered every frame to one netdev and
+counted it where nothing could read it. Both fall out of the same place in
+do_cbm_tasklet(), and both become visible the moment more than one LAN
+port is up.
+
+Delivery first. cbm_rx_set_netdev() stored a single global that every
+ndo_open overwrote, so the last port to open received all traffic. Key the
+delivery on the sppid field of the 8-byte PMAC RX header instead, with a
+table indexed by source port over the four LAN ports 2..5. For a LAN frame
+sppid is the GSWIP-L physical source port, which on this board is exactly
+the port's dp_port_id, so ndo_open/ndo_stop register and unregister with
+that. This is how the vendor datapath demuxes too: dp_rx_one_skb() takes
+ep from the descriptor, and when ep is the CPU port update_port_vap()
+replaces it with pmac->sppid before indexing
+dp_port_info[][ep].subif_info[vap].netif. Reading the field through the
+ported struct pmac_rx_hdr, rather than hand-masking a byte, lets the
+header's own endian conditional place it - worth doing because it is easy
+to get backwards: on this big-endian build byte 2 is declared `sppid:4`
+then `class:4` and a big-endian compiler puts the first-declared bitfield
+in the MOST significant bits, so sppid is the HIGH nibble; the LE variant
+declares the two fields in the opposite order and describes the same wire
+layout. Verified in the emitted code: `lbu v0,2(a0); ext v0,v0,0x4,0x4`.
+
+The demux is deliberately defensive, because unlike the vendor driver our
+host RX does not come straight out of GSW-L - it arrives over the
+DMA1TX->DMA2RX peripheral-to-peripheral bridge out of GSW-R. So
+"sppid == GSWIP-L source port" is an inference from the vendor's direct
+path, not something this port has yet observed. A frame whose sppid has no
+registered netdev is therefore delivered to a default netdev (the dp5/eth0
+registration, the only datapath proven to pass traffic) with a ratelimited
+warning naming the sppid, so a wrong assumption costs attribution accuracy
+rather than RX. And the first frame's entire PMAC header is dumped once, in
+hex, next to the descriptor words - so one boot log confirms or refutes the
+assumption outright. desc0/desc1 were already staged by cbm_ls_deq_list()
+but never read here; they join that dump, desc1 carrying the descriptor's
+own ep field at DW1[11:8] and desc0 the dest_sub_if_id.
+
+One ordering consequence: the dma_cache_inv() through the memremap VA
+now has to precede the header parse, not just the memcpy.
+Reading sppid out of a stale cache line would demux on garbage - the same
+trap that once shipped all-zero frames up the stack. The per-frame pool
+walk is also gated on "any netdev bound at all" rather than on the old
+global, so nothing changes before the first ndo_open.
+
+Accounting second. The RX path incremented ndev->stats.rx_packets/rx_bytes,
+the generic net_device counters, but intel_xrx500_ndo_get_stats64 reads
+ONLY the private per-port struct - and when ndo_get_stats64 exists the core
+memsets the storage and calls it, never consulting dev->stats. So every RX
+frame was counted into a bucket nothing read, and `ip -s link show eth0`
+reported RX 0 forever while br-lan, an ordinary bridge netdev on the core's
+per-CPU tstats path, accumulated all of it. That is the whole of "RX is
+only ever visible on br-lan": eth0 RX 0 against br-lan RX 5814 across a
+working 5/5 ping. port->stats.rx_packets / rx_bytes / rx_dropped had in
+fact never been incremented anywhere in the suite.
+
+Add intel_xrx500_rx_account() and intel_xrx500_rx_drop_account() next to
+the TX writer that shares their seqcount, and call them from the RX engine.
+Putting them in the netdev driver rather than reaching through
+netdev_priv() from the CBM TU keeps the struct layout and the writer
+discipline in the TU that owns both; the two objects live in the same
+composite module, so this resolves at link time exactly as
+cbm_rx_set_netdev does in the other direction. rx_bytes now comes from
+skb->len after the pull, which drops the 8-byte-per-frame over-count the
+old `+= data_len` carried, and the update happens BEFORE
+netif_receive_skb: the skb is not ours once it is handed up, and it keeps
+this writer off the syncp while the stack may re-enter the driver's own TX
+path via bridge forwarding on this CPU. The RX writer runs in softirq with
+interrupts enabled while the TX writer holds port->tx_lock with them
+disabled, so the RX side takes u64_stats_update_begin_irqsave() - on 32-bit
+MIPS the fallback is a seqcount that WARNs on concurrent writers - without
+making the TX fast path pay for it.
+
+dp_register_dev stays stubbed. The vendor demux table is
+dp_port_info[][sppid].subif_info[vap].netif, populated by dp_register_subif
+and dispatched through the per-port cb.rx_fn that dp_register_dev installs;
+we deliver from the CBM tasklet directly and never go through dp_rx, so a
+local table is the minimal form and does not need it.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+index 157d5eb2828a..1f151a4cd11e 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+@@ -391,7 +391,7 @@ int init_cbm_eqm_cpu_port(int idx);
+ int init_cbm_dqm_dma_port(int dqp);
+ int init_cbm_dqm_cpu_port(int idx);
+ void cbm_rx_engine_init(void);
+-void cbm_rx_set_netdev(struct net_device *dev);
++void cbm_rx_set_netdev(u32 sppid, struct net_device *dev);
+ int turn_on_DMA_p2p(void);
+ extern bool g_cbm_egress_preconfig[6];
+ int setup_eqm_dma_desc(int pid, int desc_count, u32 flags, u32 buf_offset);
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+index 8b9b6da735d5..1875c620d164 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+@@ -23,6 +23,10 @@
+ 
+ #include "cbm.h"
+ #include "cbm_regs.h"
++#include "../../datapath/datapath_api_gswip30.h"
++
++void intel_xrx500_rx_account(struct net_device *dev, unsigned int len);
++void intel_xrx500_rx_drop_account(struct net_device *dev);
+ 
+ /* FSQM_IRNCR - local register-offset literal. */
+ #define FSQM_IRNCR 0x10
+@@ -86,13 +90,58 @@ irqreturn_t cbm_isr_7(int irq, void *dev_id);
+ static struct cbm_desc g_cbm_dlist[CPU_DQM_PORT_NUM][64];
+ static unsigned long g_cpu_port_alloc;
+ static struct tasklet_struct cbm_tasklet[CPU_DQM_PORT_NUM];
+-static struct net_device *g_cbm_rx_netdev;
++
++#define CBM_RX_SPPID_MIN	2
++#define CBM_RX_SPPID_MAX	5
++#define CBM_RX_SPPID_DEFAULT	5	/* dp5 / eth0 / LAN1 */
++
++static struct net_device *g_cbm_rx_netdev[CBM_RX_SPPID_MAX + 1];
++static struct net_device *g_cbm_rx_netdev_default;
++static u32 g_cbm_rx_mask;
+ 
+ #define CBM_RX_RESCHED_CAP 1000
+ static u32 g_cbm_resched_cnt[CPU_DQM_PORT_NUM];
+ 
+ static DEFINE_RAW_SPINLOCK(g_cbm_irnen_ls_lock);
+ 
++static u32 cbm_rx_pmac_sppid(const void *hdr)
++{
++	const struct pmac_rx_hdr *pmac = hdr;
++
++	return pmac->sppid;
++}
++
++/* Any netdev bound at all? One test to skip the whole delivery path. */
++static bool cbm_rx_netdev_bound(void)
++{
++	return g_cbm_rx_mask != 0;
++}
++
++/*
++ * Resolve the delivery netdev for @sppid, falling back to the default netdev
++ * (the dp5/eth0 registration) with a ratelimited warning when the source port
++ * is out of range or has nothing registered. Returning the fallback rather
++ * than NULL is the point: a wrong sppid assumption must cost attribution
++ * accuracy, not RX.
++ */
++static struct net_device *cbm_rx_resolve_netdev(u32 sppid)
++{
++	struct net_device *ndev = NULL;
++
++	if (sppid >= CBM_RX_SPPID_MIN && sppid <= CBM_RX_SPPID_MAX)
++		ndev = g_cbm_rx_netdev[sppid];
++
++	if (ndev)
++		return ndev;
++
++	if (g_cbm_rx_netdev_default)
++		pr_warn_ratelimited("cbm: RX sppid=%u has no registered netdev; delivering to %s (mask=0x%x)\n",
++				    sppid,
++				    netdev_name(g_cbm_rx_netdev_default),
++				    g_cbm_rx_mask);
++	return g_cbm_rx_netdev_default;
++}
++
+ static void cbm_irnen_ls_rmw(u32 pid, bool enable)
+ {
+ 	u32 mask = (u32)(3UL << (pid * 2 + 16));
+@@ -631,11 +680,13 @@ static void do_cbm_tasklet(unsigned long cpu)
+ 
+ 		/* Walk staged descriptors to the desc2 == 0 sentinel. */
+ 		while (desc_list->desc2) {
++			u32 desc0 = desc_list->desc0;
++			u32 desc1 = desc_list->desc1;
+ 			u32 desc2_phys = desc_list->desc2;
+ 			u32 desc3 = desc_list->desc3;
+ 			int data_len = (int)(desc3 & 0x0000FFFFu);
+ 			int data_offset = (int)((desc3 & 0x03800000u) >> 23);
+-			struct net_device *ndev = g_cbm_rx_netdev;
++			struct net_device *ndev = NULL;
+ 			void *buf_virt = NULL;
+ 			u32 seg_off;
+ 
+@@ -650,15 +701,28 @@ static void do_cbm_tasklet(unsigned long cpu)
+ 				continue;
+ 			}
+ 
+-			if (ndev)
++			if (cbm_rx_netdev_bound())
+ 				buf_virt = cbm_buf_phys_to_virt(desc2_phys);
+ 
+-			if (ndev && buf_virt) {
+-				struct sk_buff *skb;
++			if (buf_virt) {
++				const u8 *pmac = (const u8 *)buf_virt + data_offset;
+ 
+ 				dma_cache_inv((unsigned long)buf_virt,
+ 					      (unsigned long)(data_offset + data_len));
+ 
++				pr_info_once("cbm: first RX frame: pmac=%02x %02x %02x %02x %02x %02x %02x %02x (sppid=%u) desc0=0x%08x desc1=0x%08x (ep=%u) len=%d off=%d\n",
++					     pmac[0], pmac[1], pmac[2], pmac[3],
++					     pmac[4], pmac[5], pmac[6], pmac[7],
++					     cbm_rx_pmac_sppid(pmac),
++					     desc0, desc1, (desc1 >> 8) & 0xFu,
++					     data_len, data_offset);
++
++				ndev = cbm_rx_resolve_netdev(cbm_rx_pmac_sppid(pmac));
++			}
++
++			if (ndev) {
++				struct sk_buff *skb;
++
+ 				skb = netdev_alloc_skb_ip_align(ndev, data_len);
+ 				if (skb) {
+ 					memcpy(skb_put(skb, data_len),
+@@ -668,11 +732,11 @@ static void do_cbm_tasklet(unsigned long cpu)
+ 					skb_pull(skb, CBM_PMAC_RX_HDR_LEN);
+ 					skb->dev = ndev;
+ 					skb->protocol = eth_type_trans(skb, ndev);
++					intel_xrx500_rx_account(ndev, skb->len);
+ 					netif_receive_skb(skb);
+-					ndev->stats.rx_packets++;
+-					ndev->stats.rx_bytes += data_len;
+ 				} else {
+ 					pr_err_ratelimited("cbm: do_cbm_tasklet: skb alloc failed; dropping frame (segment recycled)\n");
++					intel_xrx500_rx_drop_account(ndev);
+ 				}
+ 			}
+ 
+@@ -732,14 +796,41 @@ static void do_cbm_tasklet(unsigned long cpu)
+ }
+ 
+ /*
+- * cbm_rx_set_netdev — bind (or, with NULL, unbind) the single netdev the RX
+- * engine delivers to. Accepts NULL: do_cbm_tasklet then drops and recycles
+- * each frame, so an unbind racing an in-flight tasklet is safe (no leak, no
+- * oops).
++ * cbm_rx_set_netdev - bind (@dev) or unbind (NULL) the netdev the RX engine
++ * delivers frames whose PMAC sppid is @sppid to.
+  */
+-void cbm_rx_set_netdev(struct net_device *dev)
++void cbm_rx_set_netdev(u32 sppid, struct net_device *dev)
+ {
+-	g_cbm_rx_netdev = dev;
++	u32 i;
++
++	if (sppid < CBM_RX_SPPID_MIN || sppid > CBM_RX_SPPID_MAX) {
++		pr_err("cbm: cbm_rx_set_netdev: sppid %u out of range %u..%u\n",
++		       sppid, CBM_RX_SPPID_MIN, CBM_RX_SPPID_MAX);
++		return;
++	}
++
++	g_cbm_rx_netdev[sppid] = dev;
++	if (dev)
++		g_cbm_rx_mask |= BIT(sppid);
++	else
++		g_cbm_rx_mask &= ~BIT(sppid);
++
++	/*
++	 * Recompute the fallback target for an sppid with nothing registered:
++	 * prefer the designated default port (dp5/eth0, whose datapath is the
++	 * proven one), else the lowest bound port, else none. Recomputing beats
++	 * patching it in place — an unbind of the default must not leave a
++	 * dangling pointer, and a rebind must resurrect it.
++	 */
++	g_cbm_rx_netdev_default = g_cbm_rx_netdev[CBM_RX_SPPID_DEFAULT];
++	for (i = CBM_RX_SPPID_MIN;
++	     !g_cbm_rx_netdev_default && i <= CBM_RX_SPPID_MAX; i++)
++		g_cbm_rx_netdev_default = g_cbm_rx_netdev[i];
++
++	pr_info("cbm: RX demux: sppid %u -> %s (mask=0x%x, default=%s)\n",
++		sppid, dev ? netdev_name(dev) : "(unbound)", g_cbm_rx_mask,
++		g_cbm_rx_netdev_default ?
++			netdev_name(g_cbm_rx_netdev_default) : "(none)");
+ }
+ 
+ /* cbm_rx_engine_init — one-time RX engine arm. */
+diff --git a/drivers/net/ethernet/lantiq/intel_xrx500.c b/drivers/net/ethernet/lantiq/intel_xrx500.c
+index eb6667685295..5a2505a11d6f 100644
+--- a/drivers/net/ethernet/lantiq/intel_xrx500.c
++++ b/drivers/net/ethernet/lantiq/intel_xrx500.c
+@@ -206,7 +206,7 @@ int cbm_cpu_enqueue_hw(int pid, u32 dw0, u32 dw1, u32 data_phys, u32 dw3);
+ 
+ int turn_on_DMA_p2p(void);
+ 
+-void cbm_rx_set_netdev(struct net_device *dev);
++void cbm_rx_set_netdev(u32 sppid, struct net_device *dev);
+ 
+ #define XRX500_CBM_TX_DATA_OFFSET (128u + NET_IP_ALIGN + NET_SKB_PAD)
+ 
+@@ -657,7 +657,7 @@ static int intel_xrx500_ndo_open(struct net_device *dev)
+ 
+ 	phylink_start(port->phylink);
+ 
+-	cbm_rx_set_netdev(dev);
++	cbm_rx_set_netdev(port->dp_port_id, dev);
+ 
+ 	port->state_open = true;
+ 	return 0;
+@@ -722,7 +722,7 @@ static int intel_xrx500_ndo_stop(struct net_device *dev)
+ 			first_err = ret;
+ 	}
+ 
+-	cbm_rx_set_netdev(NULL);
++	cbm_rx_set_netdev(port->dp_port_id, NULL);
+ 
+ 	port->state_open = false;
+ 	return first_err;
+@@ -945,6 +945,53 @@ static netdev_tx_t intel_xrx500_ndo_start_xmit(struct sk_buff *skb,
+ 	return NETDEV_TX_OK;
+ }
+ 
++/**
++ * intel_xrx500_rx_account() - count one delivered RX frame on @dev.
++ *
++ * @dev: one of this driver's netdevs (never another driver's).
++ *
++ * @len: the frame length to charge, POST PMAC-header strip.
++ *
++ * The CBM LS-tasklet RX engine (cqm/grx500/cbm_intr.c) calls this immediately
++ * before netif_receive_skb. It lives here, rather than the RX engine reaching
++ * through netdev_priv() itself, because these are the counters
++ * ndo_get_stats64 reports and this TU owns their layout and their writer
++ * discipline.
++ *
++ * Two things were wrong before. The RX path incremented ndev->stats.*, the
++ * generic net_device counters, but intel_xrx500_ndo_get_stats64 reads ONLY the
++ * private struct — and when ndo_get_stats64 exists the core memsets the storage
++ * and calls it, never consulting dev->stats. So every RX frame was counted into
++ * a bucket nothing read: `ip -s link show eth0` reported RX 0 forever while
++ * br-lan, an ordinary bridge netdev on the core's per-CPU tstats path,
++ * accumulated all of it. That is the whole of "RX only ever visible on br-lan"
++ * (eth0 RX 0 against br-lan RX 5814 across a working ping). Second, it charged
++ * the pre-skb_pull length, over-counting every frame by the 8 PMAC header
++ * bytes; callers now pass skb->len after the pull.
++ */
++void intel_xrx500_rx_account(struct net_device *dev, unsigned int len)
++{
++	struct intel_xrx500_port *port = netdev_priv(dev);
++	unsigned long flags;
++
++	flags = u64_stats_update_begin_irqsave(&port->stats.syncp);
++	u64_stats_inc(&port->stats.rx_packets);
++	u64_stats_add(&port->stats.rx_bytes, len);
++	u64_stats_update_end_irqrestore(&port->stats.syncp, flags);
++}
++
++/**
++ * intel_xrx500_rx_drop_account() - count one dropped RX frame on @dev.
++ *
++ * @dev: one of this driver's netdevs.
++ */
++void intel_xrx500_rx_drop_account(struct net_device *dev)
++{
++	struct intel_xrx500_port *port = netdev_priv(dev);
++
++	atomic_long_inc(&port->stats.rx_dropped);
++}
++
+ /**
+  * intel_xrx500_ndo_change_mtu() - MTU change handler.
+  *

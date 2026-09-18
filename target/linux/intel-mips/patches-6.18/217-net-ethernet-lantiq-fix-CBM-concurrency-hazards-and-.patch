@@ -1,0 +1,319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 12 Aug 2026 20:36:31 +0200
+Subject: net: ethernet: lantiq: fix CBM concurrency hazards and a TX drop-path
+ UAF
+
+Four latent defects in the GRX500 CBM code and the xRX500 TX path, all
+inert on the configuration this platform currently ships but each one a
+real bug the moment its precondition holds.
+
+IRNEN_LS read-modify-write is unserialized. The register (0x918, in the
+load-spreader window) holds two interrupt enable bits per LS port at
+3 << (pid * 2 + 16). Five sites update it and every one must preserve
+the other three ports' bits, so all five are read-modify-write on a
+register shared between hard interrupt and softirq context: each of
+cbm_isr_4/5/6/7 clears its own port's bits on entry, and
+do_cbm_tasklet() sets them again on the drained re-arm path. On UP a
+lost SET cannot occur, because genirq runs handlers with local
+interrupts disabled and a hard interrupt can therefore only interrupt
+the softirq, never the reverse; and a lost CLEAR is contained, because
+every handler also writes a full word 0 to its own per-line cbm_irnen
+gate, which keeps the level source off the GIC until the tasklet drains
+and re-arms idempotently. Under SMP the dangerous direction opens up:
+two CPUs read the same word, and the second write clobbers the enable
+bits the first CPU had just set back to zero. That leaves one LS port
+permanently masked while its per-line gate is re-armed, so the line
+never fires again and nothing re-arms it - a silent, unrecoverable RX
+stall with no error, no counter and no log. Introduce a raw spinlock and
+route all five sites through cbm_irnen_ls_rmw().
+
+cbm_fsqm_buf_alloc() and cbm_fsqm_buf_free() lost the vendor driver's
+local_irq_save. The alloc side reads a BUFREQ register, which is
+destructive - it hands out a segment - so an interrupt landing inside
+the bounded retry loop that also pops from this port's free list can
+make the loop burn its budget against a competing consumer and report
+the pool empty while segments remain. The free side writes ptr_rtn. Note
+that cbm_cpu_enqueue_hw() drops the same wrap but is covered by its
+caller, which holds port->tx_lock with interrupts disabled, whereas the
+RX-tasklet callers of cbm_fsqm_buf_free() run in softirq with interrupts
+enabled and have no outer coverage. Restore the wraps.
+
+The two probe-time BUFREQ pops selected their EQM CPU port with
+smp_processor_id(). The vendor driver does this because its four VPEs
+each own one of the four ports, but neither of our call sites has any
+per-CPU semantics to preserve: the segments being staged belong to a DMA
+ingress port, not to the running CPU, so which port they are drawn from
+is an arbitrary consequence of where probe happened to be scheduled. In
+the 32-iteration init_cbm_eqm_ldma_port() loop the CPU can even change
+mid-loop and spread the pops across a mix of ports. Both sites also run
+in preemptible process context, which is exactly what CONFIG_DEBUG_PREEMPT
+exists to catch. Pin them to a documented CBM_EQM_BUFREQ_PORT instead.
+All four ports are armed for BUFREQ service, so this is a choice among
+equals. ndo_start_xmit() keeps raw_smp_processor_id(): that site runs
+under port->tx_lock with interrupts disabled and does want the running
+CPU's port.
+
+Finally, a genuine use-after-free in the TX path: skb_padto() consumes
+the skb on failure. It is skb_pad(skb, pad) -> __skb_pad(skb, pad, true),
+whose error path runs kfree_skb(skb) for free_on_error. Routing that
+failure through intel_xrx500_tx_drop_skb_locked(), which then calls
+dev_kfree_skb_any() on the same skb, is a double free. Split the helper
+so the accounting, lock release and diagnostic are reusable without the
+free, and take that variant on the padto path. skb_linearize() above
+does not free on error, so that guard was correct as written.
+
+No functional change on the shipped nosmp/UP configuration. The lock
+changes no register value and no MMIO sequence on UP - the dummy
+read-back each call site performs to flush the posted write is
+deliberately left in place, outside the lock, so the five sequences stay
+byte-identical; smp_processor_id() is always 0 there, which is the
+constant now being used; no interrupt handler on this board pops or
+returns CBM buffers; and the padto guard cannot currently fire, since it
+needs an allocation failure.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dma.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dma.c
+index bab4217ade16..65aa9e54f399 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dma.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dma.c
+@@ -17,7 +17,7 @@
+ #include <linux/dev_printk.h>
+ #include <linux/ratelimit.h>
+ #include <linux/errno.h>
+-#include <linux/smp.h>
++#include <linux/irqflags.h>
+ #include <asm/io.h>
+ #include <asm/barrier.h>
+ 
+@@ -32,6 +32,15 @@
+ #define CBM_PORT_F_JUMBO_BUF     0x2U
+ #define CBM_DMA_DESC_OWN         1U
+ 
++/*
++ * init_cbm_eqm_ldma_port() - arm the EQM DMA ingress port the DSL companion
++ * feeds.
++ *
++ * The vendor runs this sequence unconditionally at boot, with no driver gate,
++ * so arming the port with no consumer attached is its own steady state.
++ */
++#define CBM_EQM_BUFREQ_PORT      0
++
+ /*
+  * Build-time guard for the DMA data offset: CBM_FIXED_RX_OFFSET is
+  * CBM_GRX550_DMA_DATA_OFFSET plus NET_IP_ALIGN plus NET_SKB_PAD, and must
+@@ -103,7 +112,7 @@ int setup_eqm_dma_desc(int pid, int desc_count, u32 flags, u32 buf_offset)
+ 			frm_size = g_cbm_buff.jbo_frm_size;
+ 
+ 		{
+-			int cpu_pid = smp_processor_id();
++			int cpu_pid = CBM_EQM_BUFREQ_PORT;
+ 			u32 popped_phys = 0;
+ 			void *va = cbm_fsqm_buf_alloc(cpu_pid, flags, &popped_phys);
+ 
+@@ -199,7 +208,7 @@ int init_cbm_eqm_ldma_port(void)
+ 	for (i = 0; i < 32; i++) {
+ 		void __iomem *desc = g_cbm_eqm_base + SDESC0_0_IGP_15 + i * 8;
+ 		u32 buf_phys = 0;
+-		void *va = cbm_fsqm_buf_alloc(smp_processor_id(),
++		void *va = cbm_fsqm_buf_alloc(CBM_EQM_BUFREQ_PORT,
+ 					      CBM_PORT_F_STANDARD_BUF,
+ 					      &buf_phys);
+ 
+@@ -256,6 +265,7 @@ void *cbm_fsqm_buf_alloc(int pid, u32 flags, u32 *buf_phys)
+ 	u32 buf_addr = CBM_FSQM_BUF_EMPTY;
+ 	unsigned int i = 0;
+ 	bool jumbo = !(flags & CBM_PORT_F_STANDARD_BUF);
++	unsigned long irqflags;
+ 	void *va;
+ 
+ 	if (!g_cbm_eqm_base) {
+@@ -270,10 +280,12 @@ void *cbm_fsqm_buf_alloc(int pid, u32 flags, u32 *buf_phys)
+ 
+ 	reg = jumbo ? CBM_EQM_CPU_PORT(pid, new_jptr)
+ 		    : CBM_EQM_CPU_PORT(pid, new_sptr);
++	local_irq_save(irqflags);
+ 	do {
+ 		buf_addr = cbm_eqm_r32(reg);
+ 	} while ((buf_addr & CBM_FSQM_BUF_EMPTY) == CBM_FSQM_BUF_EMPTY &&
+ 		 i++ < CBM_FSQM_BUF_WAIT_CYCLES);
++	local_irq_restore(irqflags);
+ 
+ 	if ((buf_addr & CBM_FSQM_BUF_EMPTY) == CBM_FSQM_BUF_EMPTY) {
+ 		pr_err_ratelimited("cbm: cbm_fsqm_buf_alloc(pid=%d): FSQM %s pool empty\n",
+@@ -307,6 +319,8 @@ EXPORT_SYMBOL_GPL(cbm_fsqm_buf_alloc);
+  */
+ int cbm_fsqm_buf_free(int pid, u32 buf_phys)
+ {
++	unsigned long irqflags;
++
+ 	if (!g_cbm_dqm_base) {
+ 		pr_err_ratelimited("cbm: cbm_fsqm_buf_free: g_cbm_dqm_base not mapped\n");
+ 		return -ENODEV;
+@@ -314,9 +328,11 @@ int cbm_fsqm_buf_free(int pid, u32 buf_phys)
+ 	if (pid < 0 || pid >= 4)
+ 		return -EINVAL;
+ 
++	local_irq_save(irqflags);
+ 	cbm_dqm_w32(CBM_DQM_CPU_PORT(pid, ptr_rtn),
+ 		    buf_phys & CBM_FSQM_BUF_EMPTY);
+ 	wmb();
++	local_irq_restore(irqflags);
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(cbm_fsqm_buf_free);
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+index b07476ffbc06..8b9b6da735d5 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+@@ -91,6 +91,24 @@ static struct net_device *g_cbm_rx_netdev;
+ #define CBM_RX_RESCHED_CAP 1000
+ static u32 g_cbm_resched_cnt[CPU_DQM_PORT_NUM];
+ 
++static DEFINE_RAW_SPINLOCK(g_cbm_irnen_ls_lock);
++
++static void cbm_irnen_ls_rmw(u32 pid, bool enable)
++{
++	u32 mask = (u32)(3UL << (pid * 2 + 16));
++	unsigned long flags;
++	u32 val;
++
++	raw_spin_lock_irqsave(&g_cbm_irnen_ls_lock, flags);
++	val = __raw_readl(g_cbm_ls_base + IRNEN_LS);
++	if (enable)
++		val |= mask;
++	else
++		val &= ~mask;
++	__raw_writel(val, g_cbm_ls_base + IRNEN_LS);
++	raw_spin_unlock_irqrestore(&g_cbm_irnen_ls_lock, flags);
++}
++
+ /* Sub-handlers */
+ 
+ /*
+@@ -353,9 +371,7 @@ irqreturn_t cbm_isr_4(int irq, void *dev_id)
+ 		 * AVM 2684 — mask the LS IRQ enable: clear bits 3 << (0*2 +
+ 		 * 16) at g_cbm_ls_base + IRNEN_LS (0x918).
+ 		 */
+-		__raw_writel(__raw_readl(g_cbm_ls_base + IRNEN_LS) &
+-				     ~(u32)(3UL << (0 * 2 + 16)),
+-			     g_cbm_ls_base + IRNEN_LS);
++		cbm_irnen_ls_rmw(0, false);
+ 		/* AVM 2685 — dummy read-back to flush the mask write. */
+ 		__raw_readl(g_cbm_ls_base + IRNEN_LS);
+ 		pr_debug("cbm: isr4: load spreader interrupt on pid 0; schedule tasklet\n");
+@@ -399,9 +415,7 @@ irqreturn_t cbm_isr_5(int irq, void *dev_id)
+ 	if (cbm_irncr & 0x0200) {
+ 		__raw_writel(0, g_cbm_base + CBM_INT_LINE(5, cbm_irnen));
+ 		__raw_readl(g_cbm_base + CBM_INT_LINE(5, cbm_irnen));
+-		__raw_writel(__raw_readl(g_cbm_ls_base + IRNEN_LS) &
+-				     ~(u32)(3UL << (1 * 2 + 16)),
+-			     g_cbm_ls_base + IRNEN_LS);
++		cbm_irnen_ls_rmw(1, false);
+ 		__raw_readl(g_cbm_ls_base + IRNEN_LS);
+ 		tasklet_schedule(&cbm_tasklet[1]);
+ 		return IRQ_HANDLED;
+@@ -447,9 +461,7 @@ irqreturn_t cbm_isr_6(int irq, void *dev_id)
+ 	if (cbm_irncr & 0x0400) {
+ 		__raw_writel(0, g_cbm_base + CBM_INT_LINE(6, cbm_irnen));
+ 		__raw_readl(g_cbm_base + CBM_INT_LINE(6, cbm_irnen));
+-		__raw_writel(__raw_readl(g_cbm_ls_base + IRNEN_LS) &
+-				     ~(u32)(3UL << (2 * 2 + 16)),
+-			     g_cbm_ls_base + IRNEN_LS);
++		cbm_irnen_ls_rmw(2, false);
+ 		__raw_readl(g_cbm_ls_base + IRNEN_LS);
+ 		tasklet_schedule(&cbm_tasklet[2]);
+ 		return IRQ_HANDLED;
+@@ -490,9 +502,7 @@ irqreturn_t cbm_isr_7(int irq, void *dev_id)
+ 	if (cbm_irncr & 0x0800) {
+ 		__raw_writel(0, g_cbm_base + CBM_INT_LINE(7, cbm_irnen));
+ 		__raw_readl(g_cbm_base + CBM_INT_LINE(7, cbm_irnen));
+-		__raw_writel(__raw_readl(g_cbm_ls_base + IRNEN_LS) &
+-				     ~(u32)(3UL << (3 * 2 + 16)),
+-			     g_cbm_ls_base + IRNEN_LS);
++		cbm_irnen_ls_rmw(3, false);
+ 		__raw_readl(g_cbm_ls_base + IRNEN_LS);
+ 		tasklet_schedule(&cbm_tasklet[3]);
+ 		return IRQ_HANDLED;
+@@ -715,9 +725,7 @@ static void do_cbm_tasklet(unsigned long cpu)
+ 		__raw_readl(g_cbm_base + CBM_INT_LINE(4 + (int)cpu, cbm_irnicr)); /* dummy read */
+ 		__raw_readl(g_cbm_base + CBM_INT_LINE(4 + (int)cpu, cbm_irncr));  /* flush */
+ 		rmb();
+-		__raw_writel(__raw_readl(g_cbm_ls_base + IRNEN_LS) |
+-				     (u32)(3UL << (cpu * 2 + 16)),
+-			     g_cbm_ls_base + IRNEN_LS);
++		cbm_irnen_ls_rmw((u32)cpu, true);
+ 		__raw_writel((u32)((1UL << cpu) << 8),
+ 			     g_cbm_base + CBM_INT_LINE(4 + (int)cpu, cbm_irnen));
+ 	}
+diff --git a/drivers/net/ethernet/lantiq/intel_xrx500.c b/drivers/net/ethernet/lantiq/intel_xrx500.c
+index 5215b7836ced..eb6667685295 100644
+--- a/drivers/net/ethernet/lantiq/intel_xrx500.c
++++ b/drivers/net/ethernet/lantiq/intel_xrx500.c
+@@ -729,22 +729,23 @@ static int intel_xrx500_ndo_stop(struct net_device *dev)
+ }
+ 
+ /**
+- * intel_xrx500_tx_drop_skb_locked() - common tx-drop fastpath.
++ * intel_xrx500_tx_drop_locked() - common tx-drop fastpath, skb NOT freed.
+  *
+  * @port:    the per-port state.
+  *
+- * @skb:     the frame to drop (consumed via dev_kfree_skb_any).
+- *
+  * @flags:   the irqsave flags captured at spin_lock_irqsave entry.
+  *
+  * @reason:  free-text string included in the pr_err_ratelimited line
+  *           so post-mortems can disambiguate the failure mode.
++ *
++ * Use this variant only where the skb has ALREADY been freed by the failing
++ * call; every other drop path wants intel_xrx500_tx_drop_skb_locked() below,
++ * which adds the dev_kfree_skb_any.
+  */
+ static netdev_tx_t
+-intel_xrx500_tx_drop_skb_locked(struct intel_xrx500_port *port,
+-				struct sk_buff *skb,
+-				unsigned long flags,
+-				const char *reason)
++intel_xrx500_tx_drop_locked(struct intel_xrx500_port *port,
++			    unsigned long flags,
++			    const char *reason)
+ {
+ 	atomic_long_inc(&port->stats.tx_dropped);
+ 
+@@ -753,10 +754,21 @@ intel_xrx500_tx_drop_skb_locked(struct intel_xrx500_port *port,
+ 	pr_err_ratelimited("intel-xrx500: %s tx drop: %s\n",
+ 			   netdev_name(port->netdev), reason);
+ 
+-	dev_kfree_skb_any(skb);
+ 	return NETDEV_TX_OK;
+ }
+ 
++static netdev_tx_t
++intel_xrx500_tx_drop_skb_locked(struct intel_xrx500_port *port,
++				struct sk_buff *skb,
++				unsigned long flags,
++				const char *reason)
++{
++	netdev_tx_t ret = intel_xrx500_tx_drop_locked(port, flags, reason);
++
++	dev_kfree_skb_any(skb);
++	return ret;
++}
++
+ /**
+  * intel_xrx500_ndo_start_xmit() - polled-DMA TX path.
+  *
+@@ -819,8 +831,8 @@ static netdev_tx_t intel_xrx500_ndo_start_xmit(struct sk_buff *skb,
+ 	 */
+ 	if (skb->len < ETH_ZLEN) {
+ 		if (skb_padto(skb, ETH_ZLEN))
+-			return intel_xrx500_tx_drop_skb_locked(port, skb, flags,
+-							      "skb_padto failed");
++			return intel_xrx500_tx_drop_locked(port, flags,
++							   "skb_padto failed");
+ 		if (skb->len < ETH_ZLEN)
+ 			skb_put(skb, ETH_ZLEN - skb->len);
+ 	}

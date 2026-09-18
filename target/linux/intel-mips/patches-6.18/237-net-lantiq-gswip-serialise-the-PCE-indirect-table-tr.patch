@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 27 Aug 2026 12:45:08 +0200
+Subject: net: lantiq: gswip: serialise the PCE indirect-table transactions
+
+The PCE sub-tables are reached through a single set of indirect
+registers: write PCE_TBL_ADDR and the key/mask/value registers, compose
+PCE_TBL_CTRL with BAS=1, then poll BAS and read the result back out of
+those same registers. It is one shared window, and the four accessors
+here walk it with nothing serialising them. Two of them running at once
+do not produce two transactions; they produce one transaction built from
+both callers' register writes, and both callers read whatever it
+returned.
+
+There are two live callers and they are not obviously exclusive.
+gsw_pmicro_code_init() drives gsw_pce_table_write() row by row at probe.
+gswip30_program_queue_map() (datapath/datapath_misc.c:876) reaches it from
+ndo_open, so bringing two interfaces up at the same time interleaves two
+indirect transactions on purpose-built hardware that has exactly one.
+
+AVM's 08.25 GPL release takes a spinlock across all four (gsw_tbl_rw.c
+lock/unlock pairs at 170/332, 351/484, 507/561, 584/641, 664/709 and
+732/784 in Linux 4.9.337, guarded #ifdef __KERNEL__ because that file
+also builds for a host tool). 07.30 has no lock at all. Take it.
+
+The lock used is gswdev->lock_pce, which ethsw_api_dev_t has declared and
+gsw_init.c has initialised since the switch API landed, and which nothing
+has ever taken -- the name matches the purpose exactly and there is no
+aliasing risk. AVM calls its member lock_pce_tbl. Nothing here needs the
+#ifdef: this file only ever builds in-kernel.
+
+The entry busy-poll deliberately stays outside the lock, matching AVM. That
+poll waits on a transaction somebody else started; holding the lock across
+it turns one slow transaction into a livelock for everyone behind it. The
+tail poll is inside, because that one is waiting on our own transaction and
+the read-back that follows is part of it.
+
+That tail poll needs one deviation from AVM's shape, and it is the
+reason this is not a pure transcription. AVM's poll is an unbounded
+do/while that cannot return early. Ours is CHECK_BUSY, which is bounded
+at MAX_BUSY_RETRY and, with RETURN_FROM_FUNCTION, returns GSW_statusErr
+from inside the macro -- straight out of the locked region, leaking the
+spinlock on every timeout. So the tail polls now pass RETURN_ERROR_CODE
+and unlock explicitly before returning. The function's documented
+contract is unchanged: still GSW_statusErr if BAS fails to clear on
+either poll.
+
+Two comments claimed the opposite of what the code now does and are
+rewritten. gsw_pce_table_write's kernel-doc said the caller was
+responsible for serialising via lock_pce and that the helpers
+deliberately did not touch it "matches AVM convention" -- 08.25 is the
+AVM convention now, and the inverted obligation matters: a caller
+holding lock_pce would deadlock, so it says that instead.
+gsw_pmicro_code_init's note said it does not take lock_pce because probe
+is single-threaded per devid; that is still true of the function, but it
+now calls a helper that does take it, so the note says why it must keep
+not taking it. Nothing else in the tree touches lock_pce, so there is no
+recursion today.
+
+route_table_read/route_table_write, which AVM locks in the same commit,
+exist here only as declarations in gsw_tbl_rw.h. There is no body to lock.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c
+index d75cb1a9951a..942bab17361b 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c
++++ b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_pce.c
+@@ -126,9 +126,11 @@ void gsw_pce_attach_tbl_30(ethsw_api_dev_t *pethdev)
+  * if the BAS busy-bit fails to clear within MAX_BUSY_RETRY iterations on
+  * either the pre-write or post-write poll, GSW_statusOk on success.
+  *
+- * Ported from AVM gsw_tbl_rw.c:465-535. Caller is responsible for serialising
+- * concurrent invocations via pethdev->lock_pce (helpers themselves do not
+- * touch the spinlock - matches AVM convention).
++ * Ported from AVM gsw_tbl_rw.c:465-535. Takes gswdev->lock_pce across the
++ * indirect-table transaction itself, so callers do not have to serialise
++ * (matches AVM 08.25, which calls the same lock lock_pce_tbl). The lock is
++ * NOT held across the entry busy-poll - see the note at the CHECK_BUSY below.
++ * Callers must therefore not hold lock_pce when they call in.
+  */
+ int gsw_pce_table_write(void *cdev, pctbl_prog_t *ptdata)
+ {
+@@ -146,8 +148,16 @@ int gsw_pce_table_write(void *cdev, pctbl_prog_t *ptdata)
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * Entry poll stays outside the lock, as it does in AVM 08.25: waiting
++	 * for a transaction someone else started is not something to do with
++	 * the lock held, or a slow transaction turns into a livelock.
++	 */
+ 	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
+ 		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++
++	spin_lock(&gswdev->lock_pce);
++
+ 	/*
+ 	 * Compose the control word from zero, so every field this sequence
+ 	 * does not set is written as zero rather than inherited from whatever
+@@ -207,11 +217,16 @@ int gsw_pce_table_write(void *cdev, pctbl_prog_t *ptdata)
+ 				PCE_TBL_CTRL_BAS_SIZE, 1);
+ 	gsw_w32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, ctrlval);
+ 
+-	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
+-		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++	if (CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
++		       PCE_TBL_CTRL_BAS_SIZE, RETURN_ERROR_CODE)) {
++		spin_unlock(&gswdev->lock_pce);
++		return GSW_statusErr;
++	}
+ 
+ 	gsw_w32_raw(cdev, PCE_TBL_CTRL_ADDR_OFFSET, 0);
+ 
++	spin_unlock(&gswdev->lock_pce);
++
+ 	return GSW_statusOk;
+ }
+ 
+@@ -241,8 +256,12 @@ int gsw_pce_table_read(void *cdev, pctbl_prog_t *ptdata)
+ 		return -EINVAL;
+ 	}
+ 
++	/* Entry poll outside the lock - see gsw_pce_table_write. */
+ 	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
+ 		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++
++	spin_lock(&gswdev->lock_pce);
++
+ 	/* See gsw_pce_table_write for why the control word starts at zero. */
+ 	ctrlval = 0;
+ 
+@@ -258,8 +277,12 @@ int gsw_pce_table_read(void *cdev, pctbl_prog_t *ptdata)
+ 				PCE_TBL_CTRL_BAS_SIZE, 1);
+ 	gsw_w32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, ctrlval);
+ 
+-	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
+-		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++	/* Tail poll inside the lock - see gsw_pce_table_write. */
++	if (CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
++		       PCE_TBL_CTRL_BAS_SIZE, RETURN_ERROR_CODE)) {
++		spin_unlock(&gswdev->lock_pce);
++		return GSW_statusErr;
++	}
+ 	/*
+ 	 * Re-seed ctrlval after the post-read poll: the AVM do/while left
+ 	 * ctrlval holding the read-back PCE_TBL_CTRL register state, which
+@@ -303,6 +326,8 @@ int gsw_pce_table_read(void *cdev, pctbl_prog_t *ptdata)
+ 				      PCE_TBL_CTRL_GMAP_SIZE);
+ 	gsw_w32_raw(cdev, PCE_TBL_CTRL_ADDR_OFFSET, 0);
+ 
++	spin_unlock(&gswdev->lock_pce);
++
+ 	return GSW_statusOk;
+ }
+ 
+@@ -332,8 +357,12 @@ int gsw_pce_table_key_read(void *cdev, pctbl_prog_t *ptdata)
+ 		return -EINVAL;
+ 	}
+ 
++	/* Entry poll outside the lock - see gsw_pce_table_write. */
+ 	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
+ 		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++
++	spin_lock(&gswdev->lock_pce);
++
+ 	/*KEY REG*/
+ 	j = gswdev->pce_tbl_info[ptdata->table].num_key;
+ 
+@@ -354,8 +383,12 @@ int gsw_pce_table_key_read(void *cdev, pctbl_prog_t *ptdata)
+ 				PCE_TBL_CTRL_BAS_SIZE, 1);
+ 	gsw_w32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, ctrlval);
+ 
+-	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
+-		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++	/* Tail poll inside the lock - see gsw_pce_table_write. */
++	if (CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
++		       PCE_TBL_CTRL_BAS_SIZE, RETURN_ERROR_CODE)) {
++		spin_unlock(&gswdev->lock_pce);
++		return GSW_statusErr;
++	}
+ 	/*
+ 	 * Re-seed ctrlval after the post-read poll: the gsw_field_r32
+ 	 * extractions for ptdata->type / valid / group below depend on the
+@@ -381,6 +414,8 @@ int gsw_pce_table_key_read(void *cdev, pctbl_prog_t *ptdata)
+ 	ptdata->pcindex = value;
+ 	gsw_w32_raw(cdev, PCE_TBL_CTRL_ADDR_OFFSET, 0);
+ 
++	spin_unlock(&gswdev->lock_pce);
++
+ 	return GSW_statusOk;
+ }
+ 
+@@ -409,8 +444,12 @@ int gsw_pce_table_key_write(void *cdev, pctbl_prog_t *ptdata)
+ 		return -EINVAL;
+ 	}
+ 
++	/* Entry poll outside the lock - see gsw_pce_table_write. */
+ 	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
+ 		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++
++	spin_lock(&gswdev->lock_pce);
++
+ 	/* See gsw_pce_table_write for why the control word starts at zero. */
+ 	ctrlval = 0;
+ 
+@@ -453,11 +492,17 @@ int gsw_pce_table_key_write(void *cdev, pctbl_prog_t *ptdata)
+ 				PCE_TBL_CTRL_BAS_SIZE, 1);
+ 	gsw_w32_raw(cdev, PCE_TBL_CTRL_BAS_OFFSET, ctrlval);
+ 
+-	CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
+-		   PCE_TBL_CTRL_BAS_SIZE, RETURN_FROM_FUNCTION);
++	/* Tail poll inside the lock - see gsw_pce_table_write. */
++	if (CHECK_BUSY(PCE_TBL_CTRL_BAS_OFFSET, PCE_TBL_CTRL_BAS_SHIFT,
++		       PCE_TBL_CTRL_BAS_SIZE, RETURN_ERROR_CODE)) {
++		spin_unlock(&gswdev->lock_pce);
++		return GSW_statusErr;
++	}
+ 
+ 	gsw_w32_raw(cdev, PCE_TBL_CTRL_ADDR_OFFSET, 0);
+ 
++	spin_unlock(&gswdev->lock_pce);
++
+ 	return GSW_statusOk;
+ }
+ 

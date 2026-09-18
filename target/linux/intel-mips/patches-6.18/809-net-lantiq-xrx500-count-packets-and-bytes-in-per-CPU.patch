@@ -1,0 +1,215 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 25 Aug 2026 22:02:35 +0000
+Subject: net: lantiq: xrx500: count packets and bytes in per-CPU stats
+
+The four packet and byte counters lived in the per-port private struct
+under one struct u64_stats_sync, and two unrelated contexts wrote it: the
+CBM receive bottom half from softirq, and ndo_start_xmit under the port's
+tx_lock. On 32-bit MIPS u64_stats_sync is a bare seqcount with no lock of
+its own -- u64_stats_update_begin() only disables preemption there -- so
+it requires the caller to serialise its writers, and nothing did. The
+receive side's irqsave variant excluded that CPU's own interrupts and
+nothing else.
+
+That was survivable only while receive ran on one CPU. It no longer does:
+the CBM interrupt lines are pinned one per CPU, so a receive bottom half
+on one CPU and a transmit on another now write the same seqcount at the
+same time. Two concurrent writers can leave the sequence odd, and an odd
+sequence is a reader inside u64_stats_fetch_retry() that never gets a
+consistent sample -- `ip -s link` spinning, not merely miscounting. The
+counts are wrong long before that: an interleaved pair of updates loses
+increments outright.
+
+Move the four counters to the netdev core's per-CPU struct
+pcpu_sw_netstats, which exists for exactly this. Setting
+dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS before register_netdev()
+has the core allocate dev->tstats and free it again on both the
+registration-failure and the unregister path, so the driver has nothing
+to unwind. The writers become dev_sw_netstats_rx_add() and
+dev_sw_netstats_tx_add(), each touching only the running CPU's own
+seqcount, and ndo_get_stats64 sums across CPUs with
+dev_fetch_sw_netstats(). Every seqcount then has exactly one writer by
+construction, which is what makes the reader's retry loop terminate. Same
+shape as am65-cpsw-nuss and r8169.
+
+The two drop counters stay where they are. They are atomic_long_t, so
+they never had a writer-side seqcount to corrupt, and ndo_get_stats64
+goes on reading them outside the aggregation so a drop cannot force a
+re-read of the packet and byte pairs. struct intel_xrx500_port_stats is
+now just those two.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/include/intel_xrx500.h b/drivers/net/ethernet/lantiq/include/intel_xrx500.h
+index a4dd49bdfdf2..d4c66822882b 100644
+--- a/drivers/net/ethernet/lantiq/include/intel_xrx500.h
++++ b/drivers/net/ethernet/lantiq/include/intel_xrx500.h
+@@ -14,7 +14,6 @@
+ #include <linux/phylink.h>
+ #include <linux/spinlock.h>
+ #include <linux/types.h>
+-#include <linux/u64_stats_sync.h>
+ 
+ /*
+  * Forward declarations.
+@@ -53,39 +52,30 @@ struct dma_tx_desc;
+ #define INTEL_XRX500_DP_PORT_WAN  15
+ 
+ /**
+- * struct intel_xrx500_port_stats - per-port traffic counters.
+- *
+- * @rx_packets: frames received and delivered to the stack.
+- *
+- * @rx_bytes:   bytes received (post-CRC strip).
+- *
+- * @tx_packets: frames successfully posted to the egress DMA.
+- *
+- * @tx_bytes:   bytes posted to egress.
+- *
++ * struct intel_xrx500_port_stats - per-port drop counters.
+  * @rx_dropped: receive-path drops (allocation failure, queue full, ...).
+- *
+  * @tx_dropped: transmit-path drops.
+  *
+- * @syncp:      seqcount-based torn-read protection for the u64_stats_t
+- *              fields above.
+- *
+- * The two drop counters use atomic_long_t because they (a) are incremented
+- * from drop fastpaths that have no obligation to advance under the same
+- * seqcount sequence as the packet/byte pair, and (b) atomic_long_t avoids
+- * forcing the caller to acquire u64_stats_update_begin in the drop-only path.
+- * On 64-bit architectures (BITS_PER_LONG == 64) the u64_stats_sync discipline
+- * collapses to a no-op; on 32-bit architectures u64_stats_init must be called
+- * before any update.
++ * The packet and byte counters are NOT here. They live in the netdev core's
++ * per-CPU &struct pcpu_sw_netstats, requested by setting
++ * dev->pcpu_stat_type = %NETDEV_PCPU_STAT_TSTATS before register_netdev();
++ * the writers use dev_sw_netstats_rx_add() / dev_sw_netstats_tx_add() and
++ * ndo_get_stats64 sums them with dev_fetch_sw_netstats(). That is what puts
++ * exactly one writer on each seqcount -- the CPU that owns it -- which a
++ * single per-port u64_stats_sync could not do once the receive bottom half
++ * and ndo_start_xmit ran on different CPUs.
++ *
++ * The two drop counters stay atomic_long_t: they are bumped from drop
++ * fastpaths with no obligation to advance in step with a packet/byte pair,
++ * and an atomic needs no writer-side seqcount at all, so it is immune to the
++ * same hazard. ndo_get_stats64 reads them outside the aggregation.
++ *
++ * Zero-initialised by alloc_etherdev_mq(), which backs the per-port struct
++ * via netdev_priv() -- ATOMIC_LONG_INIT(0) is a zero bit pattern.
+  */
+ struct intel_xrx500_port_stats {
+-	u64_stats_t		rx_packets;
+-	u64_stats_t		rx_bytes;
+-	u64_stats_t		tx_packets;
+-	u64_stats_t		tx_bytes;
+ 	atomic_long_t		rx_dropped;
+ 	atomic_long_t		tx_dropped;
+-	struct u64_stats_sync	syncp;
+ };
+ 
+ /**
+diff --git a/drivers/net/ethernet/lantiq/intel_xrx500.c b/drivers/net/ethernet/lantiq/intel_xrx500.c
+index 9dd73d128f6f..1a0f4abfa79a 100644
+--- a/drivers/net/ethernet/lantiq/intel_xrx500.c
++++ b/drivers/net/ethernet/lantiq/intel_xrx500.c
+@@ -32,7 +32,6 @@
+ #include <linux/spinlock.h>
+ #include <linux/string.h>
+ #include <linux/types.h>
+-#include <linux/u64_stats_sync.h>
+ #include <generated/utsrelease.h>
+ 
+ #include "include/intel_xrx500.h"
+@@ -954,13 +953,13 @@ static netdev_tx_t intel_xrx500_ndo_start_xmit(struct sk_buff *skb,
+ 	 * would mean the recycle is not happening and the segment has to be
+ 	 * returned explicitly with cbm_fsqm_buf_free() after egress.)
+ 	 *
+-	 * Stats under tx_lock — required on 32-bit MIPS where the u64-stats
+-	 * fallback uses write_seqcount_begin and WARNs on concurrent writers.
++	 * Counted into the netdev core's per-CPU tstats, so this touches only
++	 * the running CPU's seqcount and cannot collide with the receive
++	 * bottom half on another CPU. Left inside tx_lock, where interrupts
++	 * are already disabled: that pins this_cpu_ptr() and keeps the update
++	 * ordered against the tx_dropped bump on the drop paths.
+ 	 */
+-	u64_stats_update_begin(&port->stats.syncp);
+-	u64_stats_inc(&port->stats.tx_packets);
+-	u64_stats_add(&port->stats.tx_bytes, frame_len);
+-	u64_stats_update_end(&port->stats.syncp);
++	dev_sw_netstats_tx_add(dev, 1, frame_len);
+ 
+ 	spin_unlock_irqrestore(&port->tx_lock, flags);
+ 
+@@ -992,16 +991,19 @@ static netdev_tx_t intel_xrx500_ndo_start_xmit(struct sk_buff *skb,
+  * (eth0 RX 0 against br-lan RX 5814 across a working ping). Second, it charged
+  * the pre-skb_pull length, over-counting every frame by the 8 PMAC header
+  * bytes; callers now pass skb->len after the pull.
++ *
++ * Writer discipline: the counters are the netdev core's per-CPU tstats, so
++ * this updates only the running CPU's own seqcount. That is what makes it
++ * safe for several load-spreader tasklets to deliver to the same netdev at
++ * once, which they can since the CBM interrupt lines were pinned one per CPU.
++ * The bare update_begin (rather than the irqsave form) is the same call every
++ * NAPI-driven driver makes from softirq — nothing in this driver writes these
++ * counters from hardirq context, so there is no same-CPU re-entry to exclude,
++ * and softirq context keeps this_cpu_ptr() stable.
+  */
+ void intel_xrx500_rx_account(struct net_device *dev, unsigned int len)
+ {
+-	struct intel_xrx500_port *port = netdev_priv(dev);
+-	unsigned long flags;
+-
+-	flags = u64_stats_update_begin_irqsave(&port->stats.syncp);
+-	u64_stats_inc(&port->stats.rx_packets);
+-	u64_stats_add(&port->stats.rx_bytes, len);
+-	u64_stats_update_end_irqrestore(&port->stats.syncp, flags);
++	dev_sw_netstats_rx_add(dev, len);
+ }
+ 
+ /**
+@@ -1041,20 +1043,16 @@ static int intel_xrx500_ndo_change_mtu(struct net_device *dev, int new_mtu)
+  * @dev:     the source netdev.
+  *
+  * @storage: caller-allocated stats sink.
++ *
++ * The drop counters are atomic_long_t and are read outside the aggregation,
++ * so a drop cannot force a re-read of the packet/byte pairs.
+  */
+ static void intel_xrx500_ndo_get_stats64(struct net_device *dev,
+ 					 struct rtnl_link_stats64 *storage)
+ {
+ 	struct intel_xrx500_port *port = netdev_priv(dev);
+-	unsigned int start;
+ 
+-	do {
+-		start = u64_stats_fetch_begin(&port->stats.syncp);
+-		storage->rx_packets = u64_stats_read(&port->stats.rx_packets);
+-		storage->rx_bytes   = u64_stats_read(&port->stats.rx_bytes);
+-		storage->tx_packets = u64_stats_read(&port->stats.tx_packets);
+-		storage->tx_bytes   = u64_stats_read(&port->stats.tx_bytes);
+-	} while (u64_stats_fetch_retry(&port->stats.syncp, start));
++	dev_fetch_sw_netstats(storage, dev->tstats);
+ 
+ 	storage->rx_dropped = (u64)atomic_long_read(&port->stats.rx_dropped);
+ 	storage->tx_dropped = (u64)atomic_long_read(&port->stats.tx_dropped);
+@@ -1292,7 +1290,16 @@ static int intel_xrx500_port_setup(struct intel_xrx500_priv *priv,
+ 	port->port_node = of_node_get(port_node);
+ 	port->phy_node  = of_parse_phandle(port_node, "phy-handle", 0);
+ 
+-	u64_stats_init(&port->stats.syncp);
++	/*
++	 * Ask the netdev core for per-CPU packet/byte counters. It allocates
++	 * dev->tstats inside register_netdevice() and frees it again on both
++	 * the failure and the unregister path, so there is nothing for this
++	 * driver to unwind. Must be set before register_netdev() below --
++	 * same placement as am65-cpsw-nuss and r8169. Only the two
++	 * atomic_long_t drop counters remain in port->stats, and those need
++	 * no initialiser beyond alloc_etherdev_mq's zeroing.
++	 */
++	netdev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
+ 
+ 	/*
+ 	 * The supported_interfaces bitmap MUST be populated BEFORE

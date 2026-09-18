@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 11 Sep 2026 09:28:34 +0200
+Subject: net: lantiq: xrx500_phy_fw: drop the dead ret in xrx500_gphy_boot
+
+xrx500_gphy_boot() declares ret, leaves it uninitialised through every
+early return, assigns 0 to it on the last line of the body and then
+returns the literal 0. The variable has had no reader since the function
+stopped relaying reset-control errnos and started driving the GPHY reset
+through RCU_RST_REQ directly.
+
+The kernel suppresses -Wunused-but-set-variable by default and W=1 lifts
+the suppression, so with CONFIG_WERROR this is a build failure rather
+than a warning. Remove the variable and the store.
+
+No functional change.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+index 2fed2deb3c73..ecc99d59c8a2 100644
+--- a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
++++ b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+@@ -176,7 +176,6 @@ static int xrx500_gphy_boot(struct device *dev, struct reset_control *phy_rst,
+ 			    u32 silicon_id, dma_addr_t dev_addr)
+ {
+ 	int idx;
+-	int ret;
+ 
+ 	if (!of_machine_is_compatible("intel,xrx500"))
+ 		return 0;
+@@ -235,7 +234,6 @@ static int xrx500_gphy_boot(struct device *dev, struct reset_control *phy_rst,
+ 		writel(readl(rcu_rst_base) & ~rd, rcu_rst_base);
+ 		udelay(100);
+ 	}
+-	ret = 0;
+ 
+ 	return 0;
+ }
