@@ -2,10 +2,10 @@
 #
 # Network-detection hook for intel-mips.
 #
-# The intel-xrx500 driver registers one independent net_device per
-# front-panel Ethernet jack rather than exposing a DSA switch, so the
-# ports are named individually below and netifd bridges them in
-# software; there is no switch topology to declare here.
+# The front-panel jacks are DSA user ports. Their names come from the
+# "label" property of each port node in the device tree, so they are stable
+# across probe order and across boards, and the software bridge netifd
+# builds over them is a bridge over switch ports.
 
 . /lib/functions.sh
 . /lib/functions/uci-defaults.sh
@@ -37,21 +37,20 @@ avm,fritz7560)
 	# is moved. LAN1 is the port to recommend, following AVM's own
 	# uplink convention.
 	#
-	# eth0..eth3 are kernel probe-order names, bound to the port@0..3
-	# child nodes in seale_avm.dtsi. The board wires front-panel LAN-N
-	# to GPHY-(6-N) on GSWIP-L port (6-N), and that DT restores chassis
-	# order, so LAN1 -> eth0 ... LAN4 -> eth3. Reordering those port@N
-	# nodes would silently remap the physical jacks without this file
-	# changing at all.
+	# lan1..lan4 are the DSA port labels, not probe-order names. The
+	# board wires front-panel LAN-N to GPHY-(6-N) on switch port (6-N),
+	# and seale_avm.dtsi carries that reversal in the labels, so lan1 is
+	# the socket marked LAN 1 whatever the port numbering says. Nothing
+	# here has to know the mapping.
 	#
-	ucidef_set_interface_lan "eth0 eth1 eth2 eth3"
+	ucidef_set_interface_lan "lan1 lan2 lan3 lan4"
 
 	#
 	# MAC addresses. This unit's addresses live in the AVM TFFS
 	# partition, and nothing in the kernel reads them, so without the
-	# lines below the driver hands every port a fresh random address on
-	# each boot (drivers/net/ethernet/lantiq/intel_xrx500.c calls
-	# eth_hw_addr_random() per port).
+	# lines below every port comes up with a fresh random address on each
+	# boot. DSA derives a user port's address from the conduit's, and the
+	# conduit has no source for one either.
 	#
 	# The invocation details (char device for MEMREADOOB, -o plus the
 	# plain-read fallback, no -b, filtered output) live with
@@ -70,9 +69,9 @@ avm,fritz7560)
 		#
 		# All four ports get maca, which is what the box shipped
 		# with: AVM's own device tree tags every one of the four
-		# LAN nodes with avm,macname = "maca". They are bridged
-		# together here, so sharing one address across them is
-		# also what a switch would have looked like.
+		# LAN nodes with avm,macname = "maca". They are ports of
+		# one switch bridged together here, so sharing one address
+		# across them is also what the hardware looks like.
 		#
 		# Per-device, because board.json's "network_device" table is
 		# netifd's own default-MAC source: config_get_default_macaddr()
@@ -84,10 +83,10 @@ avm,fritz7560)
 		# explicitly configured macaddr. So these four calls dress the
 		# ports and failsafe, not br-lan.
 		#
-		ucidef_set_network_device_mac eth0 "$maca"
-		ucidef_set_network_device_mac eth1 "$maca"
-		ucidef_set_network_device_mac eth2 "$maca"
-		ucidef_set_network_device_mac eth3 "$maca"
+		ucidef_set_network_device_mac lan1 "$maca"
+		ucidef_set_network_device_mac lan2 "$maca"
+		ucidef_set_network_device_mac lan3 "$maca"
+		ucidef_set_network_device_mac lan4 "$maca"
 
 		# ...and per-interface, which is what carries the address into
 		# the /etc/config/network that config_generate() writes: it
@@ -143,31 +142,21 @@ avm,fritz7580|avm,fritz7590)
 	# GRX550 die's fifth port, and everything below follows from that
 	# rather than from either chassis.
 	#
-	# The names are kernel probe order, not anything the DT asks for:
-	# intel_xrx500.c allocates every port with alloc_etherdev_mq(), which
-	# leaves the "eth%d" template for register_netdev() to fill in, and it
-	# walks the port nodes with for_each_available_child_of_node(), i.e.
-	# in DTB sibling order rather than by reg. port@0..3 come from
-	# seale_avm.dtsi and port@4 from seale_avm_grx550.dtsi, the layer both
-	# GRX550 boards include, so the five come out eth0..eth4 in that
-	# order. Reordering the port@N nodes would silently remap the physical
-	# jacks without this file changing at all.
+	# The names are DSA port labels out of the device tree, so they are
+	# the same five names on both boards and on every boot.
 	#
-	# The LAN four are then chassis order left to right, because the dtsi
+	# The LAN four are chassis order left to right, because the dtsi
 	# already undoes the board's reversed wiring: front-panel LAN-N goes
-	# to GPHY-(6-N) on GSWIP-L port (6-N) — LAN1 to phy@5, LAN4 to phy@2 —
-	# and port@0..3 are declared in that descending dp-port-id order.
-	# AVM's own board layer names them in the same order, which is a
-	# useful cross-check but not the reason; ours follows from the node
-	# order.
+	# to GPHY-(6-N) on the LAN macro's port (6-N) — LAN1 to phy@5, LAN4
+	# to phy@2 — and each port node carries the label of the socket it
+	# actually reaches.
 	#
-	# eth4 is the WAN jack: port@4, dp-port-id 15, lantiq,wan, and the
-	# only port whose PHY lives on the GSW-R MDIO bus (addr 1:01). It is
-	# deliberately NOT named "wan" — the vendor gets that name from an
-	# avm,name property we have no equivalent of, and renaming a netdev
-	# from board.d would only confuse the two.
+	# wan is the WAN jack, and it is a port of the second switch macro
+	# rather than the first. That macro is a switch tree of its own with
+	# its own conduit, and wan is the only port whose PHY answers on its
+	# management bus.
 	#
-	ucidef_set_interfaces_lan_wan "eth0 eth1 eth2 eth3" "eth4"
+	ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"
 
 	#
 	# MAC addresses, read out of the AVM TFFS partition through
@@ -191,10 +180,10 @@ avm,fritz7580|avm,fritz7590)
 	# on both.
 	case "$maca" in
 	[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F])
-		ucidef_set_network_device_mac eth0 "$maca"
-		ucidef_set_network_device_mac eth1 "$maca"
-		ucidef_set_network_device_mac eth2 "$maca"
-		ucidef_set_network_device_mac eth3 "$maca"
+		ucidef_set_network_device_mac lan1 "$maca"
+		ucidef_set_network_device_mac lan2 "$maca"
+		ucidef_set_network_device_mac lan3 "$maca"
+		ucidef_set_network_device_mac lan4 "$maca"
 		ucidef_set_interface_macaddr "lan" "$maca"
 		ucidef_set_label_macaddr "$maca"
 		;;
@@ -202,7 +191,7 @@ avm,fritz7580|avm,fritz7590)
 
 	case "$macdsl" in
 	[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F])
-		ucidef_set_network_device_mac eth4 "$macdsl"
+		ucidef_set_network_device_mac wan "$macdsl"
 		ucidef_set_interface_macaddr "wan" "$macdsl"
 		;;
 	esac
