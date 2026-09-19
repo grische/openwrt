@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 10:06:26 +0200
+Subject: net: lantiq: cbm: remove the segment and DMA-port helpers left unused
+
+What the last four changes removed took the last caller of six more
+functions with it: the software allocator over the carved segment pools
+and its free counterpart, the free-segment push, the port-enable wrapper,
+the counter mode selector, and a queue-index lookup that was a stub
+returning zero.
+
+None of them is reachable from the manager's probe, from the network
+device or from anything else that stays. Remove them and their
+declarations.
+
+This also makes the driver build clean under W=1: the counter mode
+selector computed a bit position it never used, which is an error under
+this configuration's warning set and was the one thing standing between
+the directory and a warning-free build.
+
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+index e578bc8cea12..d6753d84257e 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+@@ -51,7 +51,6 @@ extern phys_addr_t cbm_buf_pool_phys_base(int which);
+ 
+ irqreturn_t cbm_isr_0(int irq, void *dev_id);
+ 
+-
+ /*
+  * MMIO base pointers, populated by cbm_xrx500_probe from the named reg
+  * tuples of the DT node.
+@@ -896,10 +895,3 @@ int init_cbm_basic(void)
+ 	pr_info("cbm: init basic CBM successfully (jsel=%d)\n", jsel);
+ 	return 0;
+ }
+-
+-u8 get_lookup_qid_via_index(u32 lookup_idx)
+-{
+-	(void)lookup_idx;
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(get_lookup_qid_via_index);
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+index 09d93c8d7807..d7ef844b7f68 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+@@ -476,14 +476,10 @@ int cbm_intr_mapping_init(void);
+ int cbm_interrupt_init(struct platform_device *pdev, int *irqs);
+ int cbm_hw_init(struct platform_device *pdev);
+ 
+-void *cbm_buf_alloc(u32 size, u32 *pool_phys, u32 flags);
+-int cbm_buf_free(void *buf, u32 size);
+ void *cbm_buf_phys_to_virt(u32 phys);
+ 
+ void *cbm_fsqm_buf_alloc(int pid, u32 flags, u32 *buf_phys); /* flags = pool select */
+-int cbm_fsqm_buf_free(int pid, u32 buf_phys);
+ 
+-int dma_port_enable(u32 idx, int dqm_flag);
+ int init_cbm_eqm_dma_port(int idx, u32 flags); /* flags = std/jumbo buffer type */
+ int init_cbm_eqm_ldma_port(void); /* IGP15 VRX318/LDMA arming */
+ int init_cbm_eqm_cpu_port(int idx);
+@@ -498,8 +494,6 @@ int init_cbm_dqm_dma_port(int dqp);
+ int init_cbm_dqm_cpu_port(int idx);
+ extern bool g_cbm_egress_preconfig[CBM_MAX_DP_PORTS];
+ int setup_eqm_dma_desc(int pid, int desc_count, u32 flags, u32 buf_offset);
+-u8 get_lookup_qid_via_index(u32 lookup_idx);
+-int cbm_counter_mode_set(int idx, int mode);
+ 
+ /* cbm_dw_memset - 32-bit-aligned wordwise memset over MMIO. */
+ void cbm_dw_memset(u32 *base, int val, u32 size);
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_basic.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_basic.c
+index 19aa84b53fb4..7634745f8251 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_basic.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_basic.c
+@@ -63,56 +63,3 @@ EXPORT_SYMBOL_GPL(cbm_set_val);
+  *
+  * @mode: 0 = packet counter, 1 = byte counter.
+  */
+-int cbm_counter_mode_set(int idx, int mode)
+-{
+-	u32 val;
+-	u32 curr_mode;
+-	u32 qen_mask, msel_mask, msel_pos;
+-
+-	if (!g_cbm_eqm_base || !g_cbm_dqm_base) {
+-		pr_warn_once("cbm: counter_mode_set(idx=%d) before CBM probe, skipping\n",
+-			     idx);
+-		return -ENODEV;
+-	}
+-
+-	switch (idx) {
+-	case 0:
+-		qen_mask  = EQM_QEN_MASK;
+-		msel_mask = EQM_MSEL_MASK;
+-		msel_pos  = EQM_MSEL_POS;
+-		val = cbm_eqm_r32(CBM_EQM_CTRL);
+-		curr_mode = (val & msel_mask) >> msel_pos;
+-		if ((u32)mode == curr_mode)
+-			return 0;
+-		/* (1) clear QEN to freeze counter logic */
+-		val &= ~qen_mask;
+-		cbm_eqm_w32(CBM_EQM_CTRL, val);
+-		/* (2) program new MSEL while counter is frozen */
+-		val = (val & ~msel_mask) | (((u32)mode << msel_pos) & msel_mask);
+-		cbm_eqm_w32(CBM_EQM_CTRL, val);
+-		/* (3) restore QEN */
+-		val |= qen_mask;
+-		cbm_eqm_w32(CBM_EQM_CTRL, val);
+-		return 0;
+-
+-	case 1:
+-		qen_mask  = DQM_QEN_MASK;
+-		msel_mask = DQM_MSEL_MASK;
+-		msel_pos  = DQM_MSEL_POS;
+-		val = cbm_dqm_r32(CBM_DQM_CTRL);
+-		curr_mode = (val & msel_mask) >> msel_pos;
+-		if ((u32)mode == curr_mode)
+-			return 0;
+-		val &= ~qen_mask;
+-		cbm_dqm_w32(CBM_DQM_CTRL, val);
+-		val = (val & ~msel_mask) | (((u32)mode << msel_pos) & msel_mask);
+-		cbm_dqm_w32(CBM_DQM_CTRL, val);
+-		val |= qen_mask;
+-		cbm_dqm_w32(CBM_DQM_CTRL, val);
+-		return 0;
+-
+-	default:
+-		return -EINVAL;
+-	}
+-}
+-EXPORT_SYMBOL_GPL(cbm_counter_mode_set);
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_buf.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_buf.c
+index 2e89f0547853..ed3c9fe1a82a 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_buf.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_buf.c
+@@ -344,50 +344,6 @@ EXPORT_SYMBOL_GPL(cbm_buf_pool_phys_base);
+  *             (chunk - pool->virt_base) so callers can populate DMA
+  *             descriptors directly.
+  */
+-void *cbm_buf_alloc(u32 size, u32 *pool_phys, u32 flags)
+-{
+-	struct cbm_pool *pool;
+-	void *chunk;
+-	unsigned long irq_flags;
+-
+-	(void)flags;  /* dispatch is by SIZE, @flags unused. */
+-
+-	if (size <= DEFAULT_STD_FRM_SIZE) {
+-		pool = &g_cbm_pools[CBM_POOL_STD];
+-	} else if (size <= DEFAULT_JBO_FRM_SIZE) {
+-		pool = &g_cbm_pools[CBM_POOL_JBO];
+-	} else {
+-		pr_err("cbm: cbm_buf_alloc(size=%u): exceeds jbo_frm_size cap %u — no pool can service\n",
+-		       size, DEFAULT_JBO_FRM_SIZE);
+-		return NULL;
+-	}
+-
+-	if (!pool->virt_base) {
+-		pr_err("cbm: cbm_buf_alloc(%s): pool not initialised (probe path missed of_reserved_mem_lookup?)\n",
+-		       pool->name);
+-		return NULL;
+-	}
+-
+-	spin_lock_irqsave(&pool->lock, irq_flags);
+-	chunk = pool->free_head;
+-	if (chunk)
+-		pool->free_head = *(void **)chunk;
+-	spin_unlock_irqrestore(&pool->lock, irq_flags);
+-
+-	if (!chunk) {
+-		pr_err_ratelimited("cbm: cbm_buf_alloc(%s): free-list empty (frm_num=%u)\n",
+-				   pool->name, pool->frm_num);
+-		return NULL;
+-	}
+-
+-	if (pool_phys)
+-		*pool_phys = (u32)(pool->phys_base +
+-				   ((phys_addr_t)((u8 *)chunk -
+-						  (u8 *)pool->virt_base)));
+-
+-	return chunk;
+-}
+-EXPORT_SYMBOL_GPL(cbm_buf_alloc);
+ 
+ /*
+  * cbm_buf_phys_to_virt - map a CBM pool PHYSICAL address back to its
+@@ -420,47 +376,3 @@ EXPORT_SYMBOL_GPL(cbm_buf_phys_to_virt);
+  *
+  * @size: byte size originally requested.
+  */
+-int cbm_buf_free(void *buf, u32 size)
+-{
+-	struct cbm_pool *pool;
+-	uintptr_t addr;
+-	uintptr_t lo;
+-	uintptr_t hi;
+-	unsigned long irq_flags;
+-
+-	if (!buf)
+-		return -EINVAL;
+-
+-	/* Pick the pool the same way alloc did. */
+-	if (size <= DEFAULT_STD_FRM_SIZE) {
+-		pool = &g_cbm_pools[CBM_POOL_STD];
+-	} else if (size <= DEFAULT_JBO_FRM_SIZE) {
+-		pool = &g_cbm_pools[CBM_POOL_JBO];
+-	} else {
+-		pr_err("cbm: cbm_buf_free(size=%u): exceeds jbo_frm_size cap %u\n",
+-		       size, DEFAULT_JBO_FRM_SIZE);
+-		return -EINVAL;
+-	}
+-
+-	if (!pool->virt_base)
+-		return -EINVAL;
+-
+-	/* Range check — the buf must point inside the chosen pool. */
+-	addr = (uintptr_t)buf;
+-	lo   = (uintptr_t)pool->virt_base;
+-	hi   = lo + pool->frm_num * pool->frm_size;
+-	if (addr < lo || addr >= hi) {
+-		pr_err_ratelimited("cbm: cbm_buf_free(%s): buf %p outside pool [%p, +0x%zx)\n",
+-				   pool->name, buf, pool->virt_base,
+-				   (size_t)(pool->frm_num * pool->frm_size));
+-		return -EINVAL;
+-	}
+-
+-	spin_lock_irqsave(&pool->lock, irq_flags);
+-	*(void **)buf = pool->free_head;
+-	pool->free_head = buf;
+-	spin_unlock_irqrestore(&pool->lock, irq_flags);
+-
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(cbm_buf_free);
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dma.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dma.c
+index 83d263c762db..92341036270a 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dma.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dma.c
+@@ -367,28 +367,6 @@ EXPORT_SYMBOL_GPL(cbm_fsqm_buf_alloc);
+  * 5759). Callers must be pinned across the read of their CPU id and this call:
+  * softirq context, or IRQs disabled under a lock.
+  */
+-int cbm_fsqm_buf_free(int pid, u32 buf_phys)
+-{
+-	unsigned long irqflags;
+-
+-	if (!g_cbm_dqm_base) {
+-		pr_err_ratelimited("cbm: cbm_fsqm_buf_free: g_cbm_dqm_base not mapped\n");
+-		return -ENODEV;
+-	}
+-	if (pid < 0 || pid >= CPU_DQM_PORT_NUM) {
+-		pr_err_ratelimited("cbm: cbm_fsqm_buf_free: illegal pid %d (0..%d); segment 0x%08x LEAKED\n",
+-				   pid, CPU_DQM_PORT_NUM - 1, buf_phys);
+-		return -EINVAL;
+-	}
+-
+-	local_irq_save(irqflags);
+-	cbm_dqm_w32(CBM_DQM_CPU_PORT(pid, ptr_rtn),
+-		    buf_phys & CBM_FSQM_BUF_EMPTY);
+-	wmb();
+-	local_irq_restore(irqflags);
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(cbm_fsqm_buf_free);
+ 
+ #define CBM_DQM_EGP_CFG_DQREQ   0x1U      /* AVM CFG_DMA_EGP_6_DQREQ  (bit0) */
+ #define CBM_DQM_EGP_CFG_DQPCEN  0x100U    /* AVM CFG_DMA_EGP_6_DQPCEN (bit8) */
+@@ -482,27 +460,6 @@ int init_cbm_dqm_cpu_port(int idx)
+ 	return 0;
+ }
+ 
+-int dma_port_enable(u32 idx, int dqm_flag)
+-{
+-	int ret;
+-
+-	if (dqm_flag) {
+-		dev_warn_ratelimited(NULL,
+-				     "cbm: DQM-side dma_port_enable is not implemented, idx=%u\n",
+-				     idx);
+-		return -ENOSYS;
+-	}
+-
+-	ret = init_cbm_eqm_dma_port((int)idx, CBM_PORT_F_STANDARD_BUF);
+-	if (ret) {
+-		pr_err("cbm: dma_port_enable: init_cbm_eqm_dma_port(idx=%u) failed: %d\n",
+-		       idx, ret);
+-		return ret;
+-	}
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(dma_port_enable);
+-
+ /*
+  * cbm_dequeue - return a buffer to CBM EQM CPU port @pid.
+  *

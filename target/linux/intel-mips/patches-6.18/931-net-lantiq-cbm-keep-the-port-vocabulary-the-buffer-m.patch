@@ -1,0 +1,279 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 06:38:21 +0200
+Subject: net: lantiq: cbm: keep the port vocabulary the buffer manager speaks
+
+The buffer manager reaches into two headers of the datapath registry
+that sits above it: one for the dequeue-resource structures and the
+port-class flags it fills in, one for a bitfield overlay of the header
+the packet MAC prepends to a received frame. Neither is the registry's
+own interface -- the first describes what the manager returns to a
+caller, the second what the hardware writes -- so keeping the manager's
+half of them here lets the registry go.
+
+Of the vocabulary, only what the manager uses is kept. The header
+overlay is not kept at all: the one field read is the source port, the
+high nibble of byte two, and reading that byte directly says so in one
+line where the overlay took eight bitfields to arrive at the same load.
+
+The receive path also counted frames through two helpers of the per-port
+network device driver. One was a call to a generic helper and becomes
+that call; the other incremented a counter in that driver's own private
+statistics, which its own get_stats64 read back, and becomes the
+netdev core's dropped count, which every get_stats64 folds in. Say on
+the binding function that a bound device has to carry per-CPU software
+statistics, which the surviving helper dereferences unchecked.
+
+The resource structure loses its typedef and its userspace-flavoured
+integer types on the way, and its one allocation becomes kmalloc_array().
+
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+index 87fffad956c4..ddf051eec07f 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+@@ -20,11 +20,82 @@
+ #include <linux/bitops.h>
+ 
+ #include "cbm_regs.h"
+-#include "../../datapath/lantiq_cbm_api.h"
+ 
+-struct cbm_dp_en_data;
+ struct net_device;
+-struct cbm_dp_alloc_data;
++
++/*
++ * Port-resource vocabulary, from the AVM FRITZ!Box 7560 GPL release (Linux
++ * 4.9.198), include/net/lantiq_cbm_api.h. It described the interface between
++ * the buffer manager and a datapath registry that no longer exists; what
++ * survives is the part the manager itself speaks, so it lives here.
++ */
++
++/* Which fields of struct cbm_dp_alloc_data the manager filled in. */
++#define CBM_PORT_DP_SET		BIT(0)
++#define CBM_PORT_DQ_SET		BIT(1)
++#define CBM_PORT_DMA_CHAN_SET	BIT(2)
++
++/*
++ * Dequeue-port class. The first four name a processor port; the rest
++ * describe the kind of endpoint a datapath port serves, and select the row
++ * of the dequeue-resource table that port is allocated from.
++ */
++#define DP_F_DEQ_CPU		0x2
++#define DP_F_DEQ_CPU1		0x3
++#define DP_F_DEQ_MPE		0x4
++#define DP_F_DEQ_DL		0x5
++
++#define DP_F_FAST_ETH_LAN	BIT(1)
++#define DP_F_FAST_ETH_WAN	BIT(2)
++#define DP_F_FAST_WLAN		BIT(3)
++#define DP_F_FAST_DSL		BIT(4)
++#define DP_F_DIRECT		BIT(5)
++#define DP_F_LOOPBACK		BIT(6)
++#define DP_F_DIRECTLINK		BIT(7)
++#define DP_F_MPE_ACCEL		BIT(25)
++#define DP_F_CHECKSUM		BIT(26)
++#define DP_F_DIRECTPATH_RX	BIT(27)
++#define DP_F_DONTCARE		BIT(28)
++#define DP_F_LRO		BIT(29)
++#define DP_F_FAST_DSL_DOWNSTREAM BIT(30)
++#define DP_F_PORT_TUNNEL_DECAP	DP_F_LOOPBACK
++
++/* The dequeue resources a datapath port was allocated. */
++struct cbm_dp_alloc_data {
++	int dp_inst;
++	int cbm_inst;
++	u32 flags;
++	u32 dp_port;
++	u32 deq_port_num;
++	u32 deq_port;
++	u32 dma_chan;
++	u32 tx_pkt_credit;
++	u32 tx_b_credit;
++	u32 tx_ring_addr;
++	u32 tx_ring_size;
++	u32 tx_ring_offset;
++	u32 num_dma_chan;
++};
++
++/* The dequeue resources to arm when a datapath port is enabled. */
++struct cbm_dp_en_data {
++	int dp_inst;
++	int cbm_inst;
++	u32 deq_port;
++	u32 dma_chnl_init;
++	u32 num_dma_chan;
++};
++
++/*
++ * One traffic-manager port: its dequeue port, and the scheduler and queue
++ * hung off it. -1 in a field means nothing is allocated there.
++ */
++struct cbm_tmu_res {
++	u32 tmu_port;
++	u32 cbm_deq_port;
++	s32 tmu_sched;
++	s32 tmu_q;
++};
+ 
+ /*
+  * struct cbm_desc — CBM/TMU 16-byte descriptor.
+@@ -402,7 +473,9 @@ int cbm_configure_dqm_cpu_ports(void);
+  */
+ u32 cbm_dqm_port_num_desc(int idx);
+ s32 dp_port_resources_get(u32 *dp_port, u32 *num_tmu_ports,
+-			  cbm_tmu_res_t **res_pp, u32 flags);
++			  struct cbm_tmu_res **res_pp, u32 flags);
++s32 cbm_dp_port_resources_get(u32 *dp_port, u32 *num_tmu_ports,
++			      struct cbm_tmu_res **res_pp, u32 flags);
+ void cbm_program_cpu_qidt(u8 qid_val);
+ 
+ void init_fsqm(int idx);
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
+index 82e3936dbfdb..f9ca5e693a8d 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_dp.c
+@@ -15,7 +15,6 @@
+ #include <linux/errno.h>
+ 
+ #include "cbm.h"
+-#include "../../datapath/lantiq_cbm_api.h"
+ #include "../../dma/lantiq_dmax.h"
+ 
+ #include "../../tmu/drv_tmu_ll.h"
+@@ -304,7 +303,7 @@ EXPORT_SYMBOL_GPL(cbm_dp_port_dealloc);
+  * success the caller must kfree(*res_pp).
+  */
+ s32 cbm_dp_port_resources_get(u32 *dp_port, u32 *num_tmu_ports,
+-			      cbm_tmu_res_t **res_pp, u32 flags)
++			      struct cbm_tmu_res **res_pp, u32 flags)
+ {
+ 	return dp_port_resources_get(dp_port, num_tmu_ports, res_pp, flags);
+ }
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+index 18c1374b4483..100186cb8e69 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+@@ -25,9 +25,6 @@
+ 
+ #include "cbm.h"
+ #include "cbm_regs.h"
+-#include "../../datapath/datapath_api_gswip30.h"
+-
+-#include "../../include/intel_xrx500.h"
+ 
+ /* FSQM_IRNCR - local register-offset literal. */
+ #define FSQM_IRNCR 0x10
+@@ -112,9 +109,8 @@ static u32 cbm_rx_return_port(void)
+ #define CBM_RX_DRAIN_BUDGET 50
+ 
+ /*
+- * datapath_api_gswip30.h:292 — the 8-byte PMAC RX header the GSWIP/PMAC
+- * prepends; skb_pull'd before eth_type_trans so the Ethernet header is at
+- * skb->data.
++ * The 8-byte header the packet MAC prepends to a received frame; skb_pull'd
++ * before eth_type_trans so the Ethernet header is at skb->data.
+  */
+ #define CBM_PMAC_RX_HDR_LEN 8
+ 
+@@ -135,11 +131,14 @@ static u32 g_cbm_resched_cnt[CPU_DQM_PORT_NUM];
+ 
+ static DEFINE_RAW_SPINLOCK(g_cbm_irnen_ls_lock);
+ 
++/*
++ * The source port is the high nibble of byte 2 of the header the packet MAC
++ * prepends to a received frame. Read as a byte rather than through a
++ * bitfield overlay: the header is network data at an arbitrary alignment.
++ */
+ static u32 cbm_rx_pmac_sppid(const void *hdr)
+ {
+-	const struct pmac_rx_hdr *pmac = hdr;
+-
+-	return pmac->sppid;
++	return ((const u8 *)hdr)[2] >> 4;
+ }
+ 
+ /* Any netdev bound at all? One test to skip the whole delivery path. */
+@@ -768,11 +767,11 @@ static void do_cbm_tasklet(unsigned long cpu)
+ 					rx_len = skb->len;
+ 					skb->dev = ndev;
+ 					skb->protocol = eth_type_trans(skb, ndev);
+-					intel_xrx500_rx_account(ndev, rx_len);
++					dev_sw_netstats_rx_add(ndev, rx_len);
+ 					netif_receive_skb(skb);
+ 				} else {
+ 					pr_err_ratelimited("cbm: do_cbm_tasklet: skb alloc failed; dropping frame (segment recycled)\n");
+-					intel_xrx500_rx_drop_account(ndev);
++					dev_core_stats_rx_dropped_inc(ndev);
+ 				}
+ 			}
+ 
+@@ -834,6 +833,9 @@ static void do_cbm_tasklet(unsigned long cpu)
+ /*
+  * cbm_rx_set_netdev - bind (@dev) or unbind (NULL) the netdev the RX engine
+  * delivers frames whose PMAC sppid is @sppid to.
++ *
++ * A bound netdev must have been allocated with NETDEV_PCPU_STAT_TSTATS: the
++ * delivery path counts received frames on its per-CPU software statistics.
+  */
+ void cbm_rx_set_netdev(u32 sppid, struct net_device *dev)
+ {
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
+index bb3a995c18ba..3b8ef3a13999 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
+@@ -20,7 +20,6 @@
+ #include <linux/string.h>
+ 
+ #include "cbm.h"
+-#include "../../datapath/lantiq_cbm_api.h"
+ #include "../../tmu/drv_tmu_ll.h"
+ 
+ /*
+@@ -529,12 +528,12 @@ static u32 __maybe_unused get_matching_pmac_noflags(
+ s32 dp_port_resources_get(
+ 	u32 *dp_port,
+ 	u32 *num_tmu_ports,
+-	cbm_tmu_res_t **res_pp,
++	struct cbm_tmu_res **res_pp,
+ 	u32 flags)
+ {
+ 	int i = 0;
+ 	u32 port_map;
+-	cbm_tmu_res_t *res;
++	struct cbm_tmu_res *res;
+ 	struct cbm_pmac_port_map *local_entry = NULL;
+ 
+ 	pr_debug("cbm: %s: flags 0x%x dp %d\r\n", __func__, flags,
+@@ -549,7 +548,7 @@ s32 dp_port_resources_get(
+ 		*num_tmu_ports = hweight_long(local_entry->egp_port_map);
+ 		if ((*num_tmu_ports > 16) || (*num_tmu_ports == 0))
+ 			return -1;
+-		res = kmalloc(sizeof(cbm_tmu_res_t) * (*num_tmu_ports), GFP_ATOMIC);
++		res = kmalloc_array(*num_tmu_ports, sizeof(*res), GFP_ATOMIC);
+ 		if (res) {
+ 			*res_pp = res;
+ 			port_map = local_entry->egp_port_map;
+@@ -587,9 +586,9 @@ s32 dp_port_resources_get(
+  * dynamic port allocator reads it back at AVM cbm.c:914); no register
+  * writes.
+  */
+-static void reserved_ports_highest(cbm_tmu_res_t *tmu_res, int flag_set)
++static void reserved_ports_highest(struct cbm_tmu_res *tmu_res, int flag_set)
+ {
+-	static cbm_tmu_res_t high_tmu_res = { 0 };
++	static struct cbm_tmu_res high_tmu_res = { 0 };
+ 
+ 	if (flag_set) {
+ 		if (high_tmu_res.tmu_port < tmu_res->tmu_port)
+@@ -623,7 +622,7 @@ static void reserved_ports_highest(cbm_tmu_res_t *tmu_res, int flag_set)
+ static int conf_dqm_cpu_port(const struct dqm_cpu_port *cpu_ptr)
+ {
+ 	u32 tmu_port, flags = 0;
+-	cbm_tmu_res_t tmp_res;
++	struct cbm_tmu_res tmp_res;
+ 	struct cbm_pmac_port_map local_entry = { 0 };
+ 	u32 ep, res;
+ 

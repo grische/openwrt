@@ -1,0 +1,1389 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 06:38:22 +0200
+Subject: net: lantiq: remove the integrated PHY firmware loader and its MDIO
+ bus
+
+Both are the switch driver's work now. It stages the firmware for the
+integrated PHYs out of the device tree node that names it, releases each
+PHY from reset through the reset framework rather than through hardcoded
+bits, and registers the management bus itself, in the order the hardware
+wants and without the second driver that used to wait on the first.
+
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
+index 60061230f5f6..7ef86ecf1aea 100644
+--- a/drivers/net/ethernet/lantiq/Makefile
++++ b/drivers/net/ethernet/lantiq/Makefile
+@@ -18,21 +18,6 @@ intel-xrx500-gswip-y += cqm/grx500/cbm_ports.o
+ intel-xrx500-gswip-y += dma/hdma.o
+ intel-xrx500-gswip-y += tmu/tmu_init.o tmu/drv_tmu_ll.o
+ 
+-#
+-# The GPHY firmware is proprietary and lives in the rootfs, so the loader
+-# is kept out of the kernel image and gets a module of its own.
+-#
+-obj-$(CONFIG_INTEL_XRX500_MDIO) += intel-xrx500-mdio.o
+-
+-intel-xrx500-mdio-y := xrx500_phy_fw.o
+-
+-#
+-# The MDIO bus driver consumes xrx500_gphy_fw_is_loaded(), so it ships in
+-# the same module as xrx500_phy_fw.o and that call stays intra-module.
+-# Without the bus, phylink_of_phy_connect() has no PHY to find.
+-#
+-intel-xrx500-mdio-y += switch-api/mdio_xrx500.o
+-
+ #
+ # The buffer-manager conduit netdev. Built in, never a module: its transmit
+ # path calls MIPS cache maintenance which is not exported to modules.
+diff --git a/drivers/net/ethernet/lantiq/include/xrx500_phy_fw.h b/drivers/net/ethernet/lantiq/include/xrx500_phy_fw.h
+deleted file mode 100644
+index 8abeeecc47e6..000000000000
+--- a/drivers/net/ethernet/lantiq/include/xrx500_phy_fw.h
++++ /dev/null
+@@ -1,36 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0-only */
+-/*
+- * Copyright (C) 2012 John Crispin <blogic@openwrt.org>
+- * Copyright (C) 2016 Intel Corporation
+- *
+- * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
+- * drivers/net/ethernet/lantiq/xrx500_phy_fw.c and xrx500_phy_fw.h.
+- *
+- * Interface between the GPHY firmware loader and the MDIO bus driver,
+- * which ship in one module.
+- */
+-
+-#ifndef _LANTIQ_XRX500_PHY_FW_H_
+-#define _LANTIQ_XRX500_PHY_FW_H_
+-
+-#include <linux/platform_device.h>
+-#include <linux/types.h>
+-
+-/**
+- * xrx500_gphy_fw_is_loaded() - report GPHY firmware load status.
+- *
+- * Returns true once the xrx500_phy_fw platform_driver's probe path has
+- * successfully completed (firmware fetched via request_firmware, copied
+- * into a 16 KiB-aligned dma_alloc_coherent buffer, programmed into the
+- * GSW-L GPHY*_LBADR/MBADR register windows, and all five reset lines
+- * deasserted). Returns false before that point or after a probe failure.
+- */
+-bool xrx500_gphy_fw_is_loaded(void);
+-
+-/*
+- * Registered from the loader's module init, because a module defines
+- * init_module once and both drivers live in this one.
+- */
+-extern struct platform_driver ltq_gswip_mdio_driver;
+-
+-#endif /* _LANTIQ_XRX500_PHY_FW_H_ */
+diff --git a/drivers/net/ethernet/lantiq/switch-api/Kconfig b/drivers/net/ethernet/lantiq/switch-api/Kconfig
+index 540e17969b51..c5b8ec84e5a9 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/Kconfig
++++ b/drivers/net/ethernet/lantiq/switch-api/Kconfig
+@@ -20,22 +20,3 @@ config INTEL_XRX500_GSWIP_API
+ 
+ 	  To compile this driver as a module, choose M here. The module
+ 	  will be called intel-xrx500-gswip.
+-
+-config INTEL_XRX500_MDIO
+-	tristate "Intel xRX500 GPHY firmware loader and MDIO bus"
+-	depends on INTEL_XRX500_GSWIP_API
+-	select FW_LOADER
+-	select OF_MDIO
+-	select PHYLIB
+-	select RESET_CONTROLLER
+-	default n
+-	help
+-	  Firmware loader and MDIO bus driver for the integrated Gigabit
+-	  PHYs. The firmware is proprietary and is not carried in the
+-	  kernel tree, so build this as a module (M) and let it read the
+-	  blob from /lib/firmware; built in, the loader has to reach the
+-	  firmware before any filesystem is mounted. The bus driver rides
+-	  in the same module because it waits on the loader.
+-
+-	  To compile this driver as a module, choose M here. The module
+-	  will be called intel-xrx500-mdio.
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c b/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
+deleted file mode 100644
+index 5c30d398f676..000000000000
+--- a/drivers/net/ethernet/lantiq/switch-api/mdio_xrx500.c
++++ /dev/null
+@@ -1,711 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only
+-/*
+- * Copyright (C) 2026 Grische <github@grische.xyz>
+- *
+- * MDIO bus on a GSWIP-3.0 instance. The bus is a sub-aperture of the switch
+- * register window rather than a block of its own, so this device is a reg-less
+- * child of the switch node: the window is derived from the parent's base plus
+- * a fixed offset into the IP block, and mapped without claiming a region the
+- * switch driver already owns. The block is accessed natively on this
+- * big-endian SoC.
+- */
+-
+-#include <linux/bits.h>
+-#include <linux/delay.h>
+-#include <linux/err.h>
+-#include <linux/io.h>
+-#include <linux/iopoll.h>
+-#include <linux/kernel.h>
+-#include <linux/ktime.h>
+-#include <linux/mii.h>
+-#include <linux/mod_devicetable.h>
+-#include <linux/module.h>
+-#include <linux/of.h>
+-#include <linux/of_address.h>
+-#include <linux/of_mdio.h>
+-#include <linux/phy.h>
+-#include <linux/platform_device.h>
+-#include <linux/printk.h>
+-#include <linux/string.h>
+-#include <linux/types.h>
+-#include <linux/workqueue.h>
+-
+-#include "gsw30_reg_top.h"
+-#include "../include/xrx500_phy_fw.h"
+-
+-/*
+- * Where the bus registers sit inside the switch register window, and how much
+- * of it they span. The byte base works out to 0x3c10 on either instance, which
+- * is why both buses need only the parent's base to find their own.
+- */
+-#define LTQ_GSWIP_MDIO_SUBAP_DWORD_BASE \
+-	(GSWT_MDCTRL_MBUSY_OFFSET + GSW30_TOP_OFFSET)
+-#define LTQ_GSWIP_MDIO_SUBAP_BYTE_BASE    (LTQ_GSWIP_MDIO_SUBAP_DWORD_BASE * 4)
+-#define LTQ_GSWIP_MDIO_SUBAP_SIZE         0x20
+-
+-/*
+- * Byte offsets WITHIN the sub-aperture for the three registers the
+- * bus callbacks touch. Sub-aperture base == MDCTRL, so:
+- *   MDCTRL == 0x000, MDREAD == 0x004, MDWRITE == 0x008.
+- */
+-#define LTQ_GSWIP_MDIO_CTRL_OFF \
+-	(((GSWT_MDCTRL_MBUSY_OFFSET  + GSW30_TOP_OFFSET) * 4) - LTQ_GSWIP_MDIO_SUBAP_BYTE_BASE)
+-#define LTQ_GSWIP_MDIO_READ_OFF \
+-	(((GSWT_MDREAD_RDATA_OFFSET  + GSW30_TOP_OFFSET) * 4) - LTQ_GSWIP_MDIO_SUBAP_BYTE_BASE)
+-#define LTQ_GSWIP_MDIO_WRITE_OFF \
+-	(((GSWT_MDWRITE_WDATA_OFFSET + GSW30_TOP_OFFSET) * 4) - LTQ_GSWIP_MDIO_SUBAP_BYTE_BASE)
+-
+-/* MBUSY single-bit at MDCTRL[12]. */
+-#define LTQ_GSWIP_MDIO_CTRL_MBUSY  BIT(GSWT_MDCTRL_MBUSY_SHIFT)
+-
+-/*
+- * The mainline DSA driver (drivers/net/dsa/lantiq/lantiq_gswip.c:634-637)
+- * programs these at probe time so the MDIO bus has a known good clock rate
+- * before any transactions issue. Without explicit programming, the post-reset
+- * default may leave MCEN clear or FREQ at an unsupported value, which causes
+- * MDIO transactions to silently never complete (MBUSY stays stuck) and the
+- * 10ms readl_poll_timeout cap then surfaces -ETIMEDOUT.
+- *
+- * AVM's mdio_init_gswip3_0() (switch-api/gsw_flow_core.c:2733-2752)
+- * programs MDCCFG_1 on GSWIP-3.0: FREQ=0x9 (2.5 MHz), MCEN=1, RES=1
+- * (MDIO hardware reset). The GSWIP-3.0 register byte offsets are:
+- *
+- *   MDCCFG_0 = (0x007 + 0xF00) * 4 = 0x3C1C  -> aperture offset 0x00C
+- *   MDCCFG_1 = (0x008 + 0xF00) * 4 = 0x3C20  -> aperture offset 0x010
+- *
+- * MDCCFG_1 RES (bit 15) MDIO HW reset, MCEN (bit 8) master-clock enable, FREQ
+- * (bits 7:0) = 0x9 -> 2.5 MHz MDC.
+- */
+-#define LTQ_GSWIP_MDIO_MDC_CFG_0_OFF \
+-	(((GSWT_MDCCFG_0_PEN_ALL_OFFSET + GSW30_TOP_OFFSET) * 4) - LTQ_GSWIP_MDIO_SUBAP_BYTE_BASE)
+-#define LTQ_GSWIP_MDIO_MDC_CFG_1_OFF \
+-	(((GSWT_MDCCFG_1_FREQ_OFFSET    + GSW30_TOP_OFFSET) * 4) - LTQ_GSWIP_MDIO_SUBAP_BYTE_BASE)
+-
+-/* MDCCFG_1 field values (AVM mdio_init_gswip3_0). */
+-#define LTQ_GSWIP_MDIO_MDC_CFG_1_RES   BIT(GSWT_MDCCFG_1_RES_SHIFT)   /* bit 15 */
+-#define LTQ_GSWIP_MDIO_MDC_CFG_1_MCEN  BIT(GSWT_MDCCFG_1_MCEN_SHIFT)  /* bit 8 */
+-#define LTQ_GSWIP_MDIO_MDC_CFG_1_FREQ_DEFAULT  0x09                   /* 2.5 MHz */
+-#define LTQ_GSWIP_MDIO_MDC_CFG_1_INIT  \
+-	(LTQ_GSWIP_MDIO_MDC_CFG_1_RES | LTQ_GSWIP_MDIO_MDC_CFG_1_MCEN | \
+-	 LTQ_GSWIP_MDIO_MDC_CFG_1_FREQ_DEFAULT)
+-
+-/*
+- * OP[1:0] = MDIO_CTRL[11:10] encodes the bus operation.
+- *
+- *   OP = 0b10 -> READ   (datasheet review focus #7; do not swap)
+- *   OP = 0b01 -> WRITE
+- *
+- * AVM packs the control word as ((OP << 10) | (PHYAD << 5) | REGAD)
+- * with OP=0x2 for read, 0x1 for write (gsw_flow_core.c:12016,12071).
+- * Use GSWT_MDCTRL_OP_SHIFT (=10) as the shift base so a future
+- * re-numbering of the field stays single-sourced.
+- */
+-#define LTQ_GSWIP_MDIO_OP_READ   (2u << GSWT_MDCTRL_OP_SHIFT)
+-#define LTQ_GSWIP_MDIO_OP_WRITE  (1u << GSWT_MDCTRL_OP_SHIFT)
+-
+-/* 5-bit PHYAD and REGAD field masks (each is 5 bits wide). */
+-#define LTQ_GSWIP_MDIO_PHYAD_MASK  GENMASK(GSWT_MDCTRL_PHYAD_SIZE - 1, 0)
+-#define LTQ_GSWIP_MDIO_REGAD_MASK  GENMASK(GSWT_MDCTRL_REGAD_SIZE - 1, 0)
+-
+-#define LTQ_GSWIP_MDIO_POLL_INTERVAL_US  1
+-#define LTQ_GSWIP_MDIO_POLL_TIMEOUT_US   10000
+-
+-/*
+- * Delay between issuing a transaction and polling for its completion. The
+- * hardware needs this long to raise MBUSY; sampling earlier reads back the
+- * idle state that preceded the transaction, so the poll returns at once and
+- * MDREAD still holds the previous transaction's data.
+- */
+-#define LTQ_GSWIP_MDIO_ISSUE_DELAY_US    10
+-
+-/*
+- * Budget for the GPHY cores on one bus to finish booting, and the interval
+- * between attempts.
+- */
+-#define LTQ_GSWIP_MDIO_PHY_READY_TIMEOUT_US   2000000
+-#define LTQ_GSWIP_MDIO_PHY_READY_INTERVAL_US  10000
+-
+-/* Most PHY child nodes any one of these buses carries (GSW-L has four). */
+-#define LTQ_GSWIP_MDIO_MAX_PHYS  8
+-
+-/**
+- * struct ltq_gswip_mdio_priv - per-bus state.
+- *
+- * @base:  ioremap'd sub-aperture covering MDIO_CTRL / MDIO_READ /
+- *         MDIO_WRITE, derived from the parent switch node's reg.
+- *
+- * @dev:   probing device, retained for dev_err / dev_info.
+- *
+- * @bus:   the mii_bus this state hangs off, for mdio_lock serialization.
+- *
+- * @pen_mask: MDC_CFG_0 value enabling the hardware polling unit for exactly
+- *         the PHY addresses this bus's DT children declare.
+- *
+- * @is_gswl: true when this bus belongs to GSWIP-L (switch instance 0).
+- *
+- * @phy_addr: PHY addresses read from the DT children, used to calibrate
+- *         before the bus is registered (mdiobus_get_phy is not available yet).
+- *
+- * @n_phys: how many entries of @phy_addr are valid.
+- *
+- * Allocated inline at the tail of devm_mdiobus_alloc_size's mii_bus
+- * via bus->priv — devm-managed, freed automatically on probe failure
+- * or device unbind.
+- */
+-struct ltq_gswip_mdio_priv {
+-	void __iomem *base;
+-	struct device *dev;
+-	struct mii_bus *bus;	/* for mdio_lock serialization */
+-	struct delayed_work gsw_reinit_work;
+-	bool ctrl_mbusy;
+-	u32 pen_mask;
+-	bool is_gswl;
+-	u8 phy_addr[LTQ_GSWIP_MDIO_MAX_PHYS];
+-	int n_phys;
+-};
+-
+-/*
+- * The MDIO control word convention is calibrated at probe: PHYID1 is read
+- * with each candidate encoding and the one that answers is kept. MBUSY lives
+- * in the control register on this instance.
+- */
+-static inline u32 ltq_gswip_mdio_ctrl_word(const struct ltq_gswip_mdio_priv *priv,
+-					   u32 op, int addr, int reg)
+-{
+-	return (priv->ctrl_mbusy ? LTQ_GSWIP_MDIO_CTRL_MBUSY : 0)
+-	     | op
+-	     | (((u32)addr & LTQ_GSWIP_MDIO_PHYAD_MASK) << GSWT_MDCTRL_PHYAD_SHIFT)
+-	     | (((u32)reg  & LTQ_GSWIP_MDIO_REGAD_MASK) << GSWT_MDCTRL_REGAD_SHIFT);
+-}
+-
+-int gsw_hw_reinit_gswl(void);
+-
+-static int ltq_gswip_mdio_poll_mbusy(struct ltq_gswip_mdio_priv *priv);
+-
+-/* Raw C22 read on priv->base (no mii_bus) — probe-time CTRL calibration. */
+-static int ltq_gswip_mdio_dbg_rd(struct ltq_gswip_mdio_priv *priv,
+-				 int addr, int reg)
+-{
+-	u32 cmd;
+-
+-	if (ltq_gswip_mdio_poll_mbusy(priv))
+-		return -1;
+-	cmd = ltq_gswip_mdio_ctrl_word(priv, LTQ_GSWIP_MDIO_OP_READ, addr, reg);
+-	__raw_writel(cmd, priv->base + LTQ_GSWIP_MDIO_CTRL_OFF);
+-	udelay(LTQ_GSWIP_MDIO_ISSUE_DELAY_US);
+-	if (ltq_gswip_mdio_poll_mbusy(priv))
+-		return -1;
+-	return __raw_readl(priv->base + LTQ_GSWIP_MDIO_READ_OFF) & 0xFFFF;
+-}
+-
+-/*
+- * The vendor PHY driver sets MII_CTRL1000 bit 10 (prefer multi-port device)
+- * before every autonegotiation (lantiq.c, vr9_gphy_config_aneg); genphy does
+- * not, and the resulting 1000BASE-T slave role makes this PHY recover its
+- * clock from the link partner. Registered as a phylib fixup.
+- */
+-#define LTQ_GPHY11G_PHY_ID	0xd565a409
+-#define LTQ_GPHY11G_PHY_MASK	0xfffffff8
+-#define LTQ_CTL1000_MULTIPORT	BIT(10)
+-
+-/*
+- * phylib's fixup list is global and keyed on PHY uid, so the fixup below is
+- * registered once for all buses rather than once per bus. See the probe site.
+- */
+-static bool ltq_gswip_mdio_fixup_registered;
+-
+-static int ltq_gswip_gphy_mpd_fixup(struct phy_device *phydev)
+-{
+-	int ret;
+-
+-	ret = genphy_soft_reset(phydev);
+-	if (ret)
+-		return ret;
+-
+-	ret = phy_write_mmd(phydev, 0x1f, 0x707, 0x11);
+-	if (ret)
+-		return ret;
+-
+-	ret = phy_write_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_ADV, 0);
+-	if (ret)
+-		return ret;
+-	phy_disable_eee(phydev);
+-
+-	return phy_set_bits(phydev, MII_CTRL1000, LTQ_CTL1000_MULTIPORT);
+-}
+-
+-static void ltq_gswip_mdio_calibrate_ctrl(struct ltq_gswip_mdio_priv *priv)
+-{
+-	int last_id = -1;
+-	int i;
+-
+-	if (!priv->n_phys) {
+-		dev_warn(priv->dev,
+-			 "mdio: CTRL calibration skipped: no PHY child nodes; keeping MBUSY=0 (AVM-exact)\n");
+-		priv->ctrl_mbusy = false;
+-		return;
+-	}
+-
+-	priv->ctrl_mbusy = false;
+-	for (i = 0; i < priv->n_phys; i++) {
+-		last_id = ltq_gswip_mdio_dbg_rd(priv, priv->phy_addr[i],
+-						2 /* PHYID1 */);
+-		if ((last_id & 0xFFFF) == 0xD565) {
+-			dev_info(priv->dev,
+-				 "mdio: CTRL calibration: MBUSY=0 (AVM-exact) verified at phy %u, PHYID1=0x%04x\n",
+-				 priv->phy_addr[i], last_id & 0xFFFF);
+-			return;
+-		}
+-	}
+-
+-	priv->ctrl_mbusy = true;
+-	last_id = ltq_gswip_mdio_dbg_rd(priv, priv->phy_addr[0], 2);
+-	dev_warn(priv->dev,
+-		 "mdio: CTRL calibration: MBUSY=0 FAILED on all %d phy(s), fallback MBUSY=1 active (phy %u PHYID1=0x%04x, want 0xd565)\n",
+-		 priv->n_phys, priv->phy_addr[0], last_id & 0xFFFF);
+-}
+-
+-/**
+- * ltq_gswip_mdio_wait_phys_ready() - wait for the GPHY cores to finish booting.
+- *
+- * @priv: per-bus state.
+- *
+- * The cores answer their identification registers out of hardwired logic as
+- * soon as the MDIO master is alive, which is long before the firmware the SoC
+- * loaded into them is running. In that window BMSR reads back as 0x0000 on a
+- * transaction that reports success, so anything sampling a core this early
+- * gets an answer that looks valid and is not. Wait for every declared address
+- * to return a status word that is neither of the two "nothing here" patterns
+- * before the bus is handed to phylib.
+- *
+- * Fails open: a core that never answers must not take the whole bus down with
+- * it, and the PHY devices are created from the device tree either way.
+- */
+-static void ltq_gswip_mdio_wait_phys_ready(struct ltq_gswip_mdio_priv *priv)
+-{
+-	ktime_t deadline = ktime_add_us(ktime_get(),
+-					LTQ_GSWIP_MDIO_PHY_READY_TIMEOUT_US);
+-	int i;
+-
+-	for (i = 0; i < priv->n_phys; i++) {
+-		s64 budget_us = ktime_us_delta(deadline, ktime_get());
+-		int bmsr;
+-
+-		/*
+-		 * read_poll_timeout() reads a zero timeout as "no timeout", so
+-		 * an exhausted budget still has to buy one attempt.
+-		 */
+-		if (budget_us < LTQ_GSWIP_MDIO_PHY_READY_INTERVAL_US)
+-			budget_us = LTQ_GSWIP_MDIO_PHY_READY_INTERVAL_US;
+-
+-		if (!read_poll_timeout(ltq_gswip_mdio_dbg_rd, bmsr,
+-				       bmsr > 0 && bmsr != 0xFFFF,
+-				       LTQ_GSWIP_MDIO_PHY_READY_INTERVAL_US,
+-				       budget_us, false,
+-				       priv, priv->phy_addr[i], MII_BMSR))
+-			continue;
+-
+-		if (bmsr < 0)
+-			dev_warn(priv->dev,
+-				 "mdio: phy %u did not answer within the boot wait; continuing\n",
+-				 priv->phy_addr[i]);
+-		else
+-			dev_warn(priv->dev,
+-				 "mdio: phy %u still reports BMSR=0x%04x after the boot wait; continuing\n",
+-				 priv->phy_addr[i], bmsr);
+-	}
+-}
+-
+-/*
+- * Read this bus's PHY child nodes: their addresses (for calibration, which
+- * runs before the bus is registered and so cannot use mdiobus_get_phy) and
+- * the MDC_CFG_0 polling-unit enable mask.
+- *
+- * So a bus whose PEN mask does not name its own PHY gets no link->MAC
+- * coupling at all. The mask used to be the literal 0x003C (PEN_2..PEN_5, the
+- * four GSW-L GPHY addresses) on every bus.
+- */
+-static void ltq_gswip_mdio_scan_dt_phys(struct ltq_gswip_mdio_priv *priv,
+-					struct device_node *np)
+-{
+-	struct device_node *child;
+-
+-	for_each_available_child_of_node(np, child) {
+-		u32 addr;
+-
+-		if (of_property_read_u32(child, "reg", &addr))
+-			continue;
+-		if (priv->n_phys >= LTQ_GSWIP_MDIO_MAX_PHYS)
+-			continue;
+-		priv->phy_addr[priv->n_phys++] = (u8)addr;
+-
+-		/*
+-		 * PEN_ALL is bits 6:1, so the polling unit can only cover PHY
+-		 * addresses 1..6. A PHY outside that still works over software
+-		 * MDIO; it just gets no hardware link polling, which is worth
+-		 * saying out loud rather than silently dropping the bit.
+-		 */
+-		if (addr >= 1 && addr <= 6)
+-			priv->pen_mask |= BIT(addr);
+-		else
+-			dev_warn(priv->dev,
+-				 "mdio: phy address %u is outside the PEN_ALL range 1..6; no HW link polling for it\n",
+-				 addr);
+-	}
+-}
+-
+-/*
+- * One-shot GSW-L switch-core re-init, matching the vendor's GSW_HW_Init
+- * sequence. It runs from a work function because it must not run from the
+- * MDIO bus callbacks it re-initialises.
+- */
+-#define LTQ_GSWIP_GSW_REINIT_DELAY_MS	(3000 + 14 * 2000)
+-
+-static void ltq_gswip_gsw_reinit_work(struct work_struct *w)
+-{
+-	struct ltq_gswip_mdio_priv *priv =
+-		container_of(to_delayed_work(w), struct ltq_gswip_mdio_priv,
+-			     gsw_reinit_work);
+-	u32 c1;
+-	int ret;
+-
+-	if (priv->bus)
+-		mutex_lock(&priv->bus->mdio_lock);
+-	ret = gsw_hw_reinit_gswl();
+-	/* MDIO master re-init: FREQ, then MCEN, then RES (self-clearing). */
+-	c1 = __raw_readl(priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+-	c1 &= ~GENMASK(GSWT_MDCCFG_1_FREQ_SHIFT +
+-		       GSWT_MDCCFG_1_FREQ_SIZE - 1,
+-		       GSWT_MDCCFG_1_FREQ_SHIFT);
+-	c1 |= LTQ_GSWIP_MDIO_MDC_CFG_1_FREQ_DEFAULT;
+-	__raw_writel(c1, priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+-	c1 = __raw_readl(priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+-	__raw_writel(c1 | LTQ_GSWIP_MDIO_MDC_CFG_1_MCEN,
+-		     priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+-	c1 = __raw_readl(priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+-	__raw_writel(c1 | LTQ_GSWIP_MDIO_MDC_CFG_1_RES,
+-		     priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+-	/* Re-enable the HW polling unit for this bus's own PHY addresses. */
+-	__raw_writel(priv->pen_mask, priv->base + LTQ_GSWIP_MDIO_MDC_CFG_0_OFF);
+-	if (priv->bus)
+-		mutex_unlock(&priv->bus->mdio_lock);
+-	dev_info(priv->dev,
+-		 "GSW-L re-init under live link done (rc=%d)\n", ret);
+-}
+-
+-/**
+- * ltq_gswip_mdio_poll_mbusy() - wait for MDIO_CTRL.MBUSY to clear.
+- *
+- * @priv: per-bus state.
+- *
+- * Polls the MBUSY bit (MDIO_CTRL[12]) until it reads 0 or the 10 ms hard cap
+- * fires. The hard cap matters because phylink and the phy_state machine may
+- * end up calling into this from softirq context during link-state changes — a
+- * wedged bus must NOT block the kernel indefinitely.
+- *
+- * Return: 0 when MBUSY cleared in time, -ETIMEDOUT on cap expiry.
+- */
+-static int ltq_gswip_mdio_poll_mbusy(struct ltq_gswip_mdio_priv *priv)
+-{
+-	u32 ctrl;
+-
+-	return read_poll_timeout(__raw_readl, ctrl,
+-				 !(ctrl & LTQ_GSWIP_MDIO_CTRL_MBUSY),
+-				 LTQ_GSWIP_MDIO_POLL_INTERVAL_US,
+-				 LTQ_GSWIP_MDIO_POLL_TIMEOUT_US,
+-				 false,
+-				 priv->base + LTQ_GSWIP_MDIO_CTRL_OFF);
+-}
+-
+-/**
+- * ltq_gswip_mdio_read() - mii_bus read callback (C22).
+- *
+- * @bus:  registered mii_bus.
+- *
+- * @addr: PHY address (5-bit, 0..31).
+- *
+- * @reg:  register address (5-bit, 0..31).
+- *
+- * Return: PHY register value (0..0xFFFF) on success, -ETIMEDOUT on
+- * a wedged bus.
+- */
+-static int ltq_gswip_mdio_read(struct mii_bus *bus, int addr, int reg)
+-{
+-	struct ltq_gswip_mdio_priv *priv = bus->priv;
+-	u32 cmd;
+-	int ret;
+-
+-	/* Drain any in-flight prior operation first. */
+-	ret = ltq_gswip_mdio_poll_mbusy(priv);
+-	if (ret) {
+-		dev_err(priv->dev,
+-			"mdio_read: pre-issue MBUSY poll timed out (phy=%d reg=%d)\n",
+-			addr, reg);
+-		return -ETIMEDOUT;
+-	}
+-
+-	cmd = ltq_gswip_mdio_ctrl_word(priv, LTQ_GSWIP_MDIO_OP_READ, addr, reg);
+-	__raw_writel(cmd, priv->base + LTQ_GSWIP_MDIO_CTRL_OFF);
+-	udelay(LTQ_GSWIP_MDIO_ISSUE_DELAY_US);
+-
+-	/* Wait for the read transaction to complete (MBUSY -> 0). */
+-	ret = ltq_gswip_mdio_poll_mbusy(priv);
+-	if (ret) {
+-		dev_err(priv->dev,
+-			"mdio_read: post-issue MBUSY poll timed out (phy=%d reg=%d)\n",
+-			addr, reg);
+-		return -ETIMEDOUT;
+-	}
+-
+-	return __raw_readl(priv->base + LTQ_GSWIP_MDIO_READ_OFF) & 0xFFFF;
+-}
+-
+-/**
+- * ltq_gswip_mdio_write() - mii_bus write callback (C22).
+- *
+- * @bus:  registered mii_bus.
+- *
+- * @addr: PHY address (5-bit, 0..31).
+- *
+- * @reg:  register address (5-bit, 0..31).
+- *
+- * @val:  16-bit value to write.
+- *
+- * Return: 0 on success, -ETIMEDOUT on a wedged bus.
+- */
+-static int ltq_gswip_mdio_write(struct mii_bus *bus, int addr, int reg,
+-				u16 val)
+-{
+-	struct ltq_gswip_mdio_priv *priv = bus->priv;
+-	u32 cmd;
+-	int ret;
+-
+-	ret = ltq_gswip_mdio_poll_mbusy(priv);
+-	if (ret) {
+-		dev_err(priv->dev,
+-			"mdio_write: pre-issue MBUSY poll timed out (phy=%d reg=%d)\n",
+-			addr, reg);
+-		return -ETIMEDOUT;
+-	}
+-
+-	/*
+-	 * WDATA must be staged BEFORE MDIO_CTRL is written
+-	 * (gsw_flow_core.c:12069). Use __raw_writel (native byte order) to
+-	 * match ltq_w32 (lantiq.h:17) on big-endian MIPS.
+-	 */
+-	__raw_writel((u32)val, priv->base + LTQ_GSWIP_MDIO_WRITE_OFF);
+-
+-	cmd = ltq_gswip_mdio_ctrl_word(priv, LTQ_GSWIP_MDIO_OP_WRITE, addr, reg);
+-	__raw_writel(cmd, priv->base + LTQ_GSWIP_MDIO_CTRL_OFF);
+-	udelay(LTQ_GSWIP_MDIO_ISSUE_DELAY_US);
+-
+-	/* Wait for the write transaction to retire. */
+-	ret = ltq_gswip_mdio_poll_mbusy(priv);
+-	if (ret) {
+-		dev_err(priv->dev,
+-			"mdio_write: post-issue MBUSY poll timed out (phy=%d reg=%d val=0x%04x)\n",
+-			addr, reg, val);
+-		return -ETIMEDOUT;
+-	}
+-
+-	return 0;
+-}
+-
+-/**
+- * ltq_gswip_mdio_log_scanned_phys() - dump the discovered PHY-address list.
+- *
+- * @pdev: probing platform_device, used for dev_info routing.
+- *
+- * @bus:  registered mii_bus whose mdio_map[] is now populated.
+- */
+-static void ltq_gswip_mdio_log_scanned_phys(struct platform_device *pdev,
+-					    struct mii_bus *bus)
+-{
+-	char list[80] = "";
+-	int n = 0;
+-	int i;
+-
+-	for (i = 0; i < PHY_MAX_ADDR; i++) {
+-		struct phy_device *phydev;
+-		size_t off;
+-
+-		phydev = mdiobus_get_phy(bus, i);
+-		if (!phydev)
+-			continue;
+-
+-		off = strlen(list);
+-		scnprintf(list + off, sizeof(list) - off,
+-			  "%s0x%02x", n ? "," : "", i);
+-		n++;
+-	}
+-
+-	dev_info(&pdev->dev,
+-		 "lantiq-gswip-mdio: bus registered, scanned %d PHY(s) at addresses [%s]\n",
+-		 n, list);
+-}
+-
+-static int ltq_gswip_mdio_probe(struct platform_device *pdev)
+-{
+-	struct ltq_gswip_mdio_priv *priv;
+-	struct device_node *parent;
+-	struct mii_bus *bus;
+-	struct resource res;
+-	u32 mdc_cfg_1;
+-	int ret;
+-
+-	if (!xrx500_gphy_fw_is_loaded()) {
+-		dev_dbg(&pdev->dev,
+-			"GPHY firmware not yet loaded; deferring MDIO probe\n");
+-		return -EPROBE_DEFER;
+-	}
+-
+-	bus = devm_mdiobus_alloc_size(&pdev->dev, sizeof(*priv));
+-	if (!bus)
+-		return -ENOMEM;
+-
+-	priv = bus->priv;
+-	priv->dev = &pdev->dev;
+-	priv->bus = bus;	/* LINKDBG mdio_lock serialization */
+-
+-	/*
+-	 * Which switch instance this bus belongs to, using the same property
+-	 * the gswip nodes carry. Absent means instance 0, so a DT that
+-	 * predates the second bus behaves exactly as it did.
+-	 */
+-	{
+-		u32 instance = 0;
+-
+-		of_property_read_u32(pdev->dev.of_node, "lantiq,gswip-instance",
+-				     &instance);
+-		priv->is_gswl = (instance == 0);
+-	}
+-
+-	/*
+-	 * PHY addresses and the polling-unit mask come from this bus's own DT
+-	 * children. Done before the register writes below, which need the mask.
+-	 */
+-	ltq_gswip_mdio_scan_dt_phys(priv, pdev->dev.of_node);
+-
+-	/*
+-	 * This node carries no reg: the bus registers are inside the parent
+-	 * switch's window, at a fixed offset that is the same on both
+-	 * instances. Map without a resource claim, because the switch driver
+-	 * has already claimed the whole window.
+-	 */
+-	parent = of_get_parent(pdev->dev.of_node);
+-	ret = of_address_to_resource(parent, 0, &res);
+-	of_node_put(parent);
+-	if (ret) {
+-		dev_err(&pdev->dev,
+-			"no reg on the parent switch node: %d\n", ret);
+-		return ret;
+-	}
+-
+-	priv->base = devm_ioremap(&pdev->dev,
+-				  res.start + LTQ_GSWIP_MDIO_SUBAP_BYTE_BASE,
+-				  LTQ_GSWIP_MDIO_SUBAP_SIZE);
+-	if (!priv->base) {
+-		dev_err(&pdev->dev,
+-			"devm_ioremap(MDIO sub-aperture at %pa + 0x%x) failed\n",
+-			&res.start, LTQ_GSWIP_MDIO_SUBAP_BYTE_BASE);
+-		return -ENOMEM;
+-	}
+-
+-	__raw_writel(0u, priv->base + LTQ_GSWIP_MDIO_MDC_CFG_0_OFF);
+-
+-	/* 1) FREQ = 0x09 (2.5 MHz MDC), preserving the rest of the reg. */
+-	mdc_cfg_1 = __raw_readl(priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+-	mdc_cfg_1 &= ~GENMASK(GSWT_MDCCFG_1_FREQ_SHIFT + GSWT_MDCCFG_1_FREQ_SIZE - 1,
+-			      GSWT_MDCCFG_1_FREQ_SHIFT);
+-	mdc_cfg_1 |= LTQ_GSWIP_MDIO_MDC_CFG_1_FREQ_DEFAULT;
+-	__raw_writel(mdc_cfg_1, priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+-
+-	/* 2) MCEN = 1 (enable management clock) — separate write. */
+-	mdc_cfg_1 = __raw_readl(priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+-	mdc_cfg_1 |= LTQ_GSWIP_MDIO_MDC_CFG_1_MCEN;
+-	__raw_writel(mdc_cfg_1, priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+-
+-	/* 3) RES = 1 (MDIO HW reset) LAST — on its own so it does not
+-	 *    clobber the just-latched MCEN bit. RES self-clears. */
+-	mdc_cfg_1 = __raw_readl(priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+-	mdc_cfg_1 |= LTQ_GSWIP_MDIO_MDC_CFG_1_RES;
+-	__raw_writel(mdc_cfg_1, priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+-
+-	mdc_cfg_1 = __raw_readl(priv->base + LTQ_GSWIP_MDIO_MDC_CFG_1_OFF);
+-
+-	ltq_gswip_mdio_calibrate_ctrl(priv);
+-	ltq_gswip_mdio_wait_phys_ready(priv);
+-
+-	if (ltq_gswip_mdio_fixup_registered)
+-		ret = 0;
+-	else
+-		ret = phy_register_fixup_for_uid(LTQ_GPHY11G_PHY_ID,
+-						 LTQ_GPHY11G_PHY_MASK,
+-						 ltq_gswip_gphy_mpd_fixup);
+-	if (!ret)
+-		ltq_gswip_mdio_fixup_registered = true;
+-	else
+-		dev_warn(&pdev->dev,
+-			 "MPD fixup registration failed: %d\n", ret);
+-
+-	bus->name = "lantiq-gswip-mdio";
+-	bus->read = ltq_gswip_mdio_read;
+-	bus->write = ltq_gswip_mdio_write;
+-	bus->parent = &pdev->dev;
+-	snprintf(bus->id, MII_BUS_ID_SIZE, "%s", dev_name(&pdev->dev));
+-
+-	platform_set_drvdata(pdev, bus);
+-
+-	ret = devm_of_mdiobus_register(&pdev->dev, bus, pdev->dev.of_node);
+-	if (ret) {
+-		dev_err(&pdev->dev,
+-			"of_mdiobus_register failed: %d\n", ret);
+-		return ret;
+-	}
+-
+-	ltq_gswip_mdio_log_scanned_phys(pdev, bus);
+-
+-	/*
+-	 * Enable the GSWIP-3.0 hardware MDIO poller (MDC_CFG_0.PEN). It is
+-	 * the only link-to-MAC coupling the vendor uses — its phylib
+-	 * adjust_link is an empty stub — and the vendor enables it at
+-	 * switch-core init (gsw_flow_core.c legacy init and GSW_HW_Init), not
+-	 * before the bus comes up. It has to stay off until then: the poller
+-	 * is a second autonomous master on the same MDIO control and read
+-	 * registers, so anything it issues while the bus is being brought up
+-	 * lands on a transaction of ours. The PHY address register is left at
+-	 * its reset default.
+-	 */
+-	__raw_writel(priv->pen_mask, priv->base + LTQ_GSWIP_MDIO_MDC_CFG_0_OFF);
+-
+-	dev_info(&pdev->dev,
+-		 "gswip%c MDC_CFG_0=0x%08x (PEN for %d phy(s)) MDC_CFG_1=0x%08x\n",
+-		 priv->is_gswl ? 'l' : 'r',
+-		 __raw_readl(priv->base + LTQ_GSWIP_MDIO_MDC_CFG_0_OFF),
+-		 priv->n_phys, mdc_cfg_1);
+-
+-	/*
+-	 * One-shot GSW-L switch-core re-init, matching the vendor's
+-	 * GSW_HW_Init sequence. It runs from a work function because it must
+-	 * not run from the MDIO bus callbacks it re-initialises.
+-	 */
+-	INIT_DELAYED_WORK(&priv->gsw_reinit_work, ltq_gswip_gsw_reinit_work);
+-	if (priv->is_gswl)
+-		schedule_delayed_work(&priv->gsw_reinit_work,
+-				      msecs_to_jiffies(LTQ_GSWIP_GSW_REINIT_DELAY_MS));
+-	return 0;
+-}
+-
+-static const struct of_device_id ltq_gswip_mdio_match[] = {
+-	{ .compatible = "lantiq,gswip-mdio" },
+-	{ /* sentinel */ }
+-};
+-MODULE_DEVICE_TABLE(of, ltq_gswip_mdio_match);
+-
+-struct platform_driver ltq_gswip_mdio_driver = {
+-	.probe = ltq_gswip_mdio_probe,
+-	.driver = {
+-		.name = "lantiq-gswip-mdio",
+-		.of_match_table = ltq_gswip_mdio_match,
+-	},
+-};
+diff --git a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+deleted file mode 100644
+index ecc99d59c8a2..000000000000
+--- a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
++++ /dev/null
+@@ -1,556 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only
+-/*
+- * Copyright (C) 2012 John Crispin <blogic@openwrt.org>
+- *
+- * Ported from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
+- * drivers/net/ethernet/lantiq/xrx500_phy_fw.c.
+- *
+- * GPHY firmware loader: stages the firmware blob into memory the GPHY cores
+- * can reach, points their base-address registers at it and releases them from
+- * reset.
+- */
+-
+-#include <crypto/sha2.h>
+-#include <linux/array_size.h>
+-#include <linux/delay.h>
+-#include <linux/dma-mapping.h>
+-#include <linux/err.h>
+-#include <linux/firmware.h>
+-#include <linux/gfp.h>
+-#include <linux/io.h>
+-#include <linux/mm.h>
+-#include <linux/kernel.h>
+-#include <linux/mod_devicetable.h>
+-#include <linux/module.h>
+-#include <linux/of.h>
+-#include <linux/of_address.h>
+-#include <linux/of_platform.h>
+-#include <linux/platform_device.h>
+-#include <linux/printk.h>
+-#include <linux/reset.h>
+-#include <linux/types.h>
+-
+-#include "include/xrx500_phy_fw.h"
+-
+-/*
+- * GPHY firmware code requires a 16 KiB-aligned contiguous backing
+- * buffer (AVM 4.9 xrx500_phy_fw.c:18). The dma_alloc_coherent caller
+- * over-allocates by XRX200_GPHY_FW_ALIGN and then PTR_ALIGN()s the
+- * returned virtual+physical addresses to the alignment boundary.
+- */
+-#define XRX200_GPHY_FW_ALIGN (16 * 1024)
+-
+-/*
+- * The base-address registers are a sub-aperture of the GSW-L switch register
+- * window: they live in that block's "top" section, which starts
+- * GSW30_TOP_OFFSET (0xf00 DWORDs) into it per gsw30_reg_top.h. The span has
+- * to cover the LBADR/MBADR pairs at 0x228..0x26f below.
+- */
+-#define XRX500_GPHY_SUBAP_OFFSET 0x3c00
+-#define XRX500_GPHY_SUBAP_SIZE   0x280
+-
+-/*
+- * Per-GPHY base-address register offsets (AVM 4.9 xrx500_phy_fw.c:23-32),
+- * relative to the sub-aperture above.
+- */
+-#define GPHY2_LBADR_XRX500 0x0228
+-#define GPHY2_MBADR_XRX500 0x022C
+-#define GPHY3_LBADR_XRX500 0x0238
+-#define GPHY3_MBADR_XRX500 0x023C
+-#define GPHY4_LBADR_XRX500 0x0248
+-#define GPHY4_MBADR_XRX500 0x024C
+-#define GPHY5_LBADR_XRX500 0x0258
+-#define GPHY5_MBADR_XRX500 0x025C
+-#define GPHYF_LBADR_XRX500 0x0268
+-#define GPHYF_MBADR_XRX500 0x026C
+-
+-/*
+- * These are the values the AVM grx_common.dtsi phy_id property contains; in
+- * the 4.9 source they were re-interpreted at the C side as packed [0..4]
+- * indices into the (then contiguous) xrx500_gphy[] table - here the DT stays
+- * as silicon ids and the C code does an explicit sparse mapping.
+- */
+-#define XRX500_GPHY_SILICON_ID_2 0x02
+-#define XRX500_GPHY_SILICON_ID_3 0x03
+-#define XRX500_GPHY_SILICON_ID_4 0x04
+-#define XRX500_GPHY_SILICON_ID_5 0x05
+-#define XRX500_GPHY_SILICON_ID_F 0x0F
+-
+-/* Per-GPHY base-address-register pair. AVM 4.9 xrx500_phy_fw.c:35-44. */
+-struct ltq_xrx500_gphy_reset {
+-	u32 rd;		/* RCU mask bit, written to RCU_RST_REQ */
+-	u32 addr;	/* LBADR byte offset within the GSW-L sub-aperture */
+-};
+-
+-#define RCU_RD_GPHY2_XRX500 BIT(29)
+-#define RCU_RD_GPHY3_XRX500 BIT(28)
+-#define RCU_RD_GPHY4_XRX500 BIT(26)
+-#define RCU_RD_GPHY5_XRX500 BIT(25)
+-#define RCU_RD_GPHYF_XRX500 BIT(31)
+-
+-static const struct ltq_xrx500_gphy_reset xrx500_gphy[] = {
+-	{ RCU_RD_GPHY2_XRX500, GPHY2_LBADR_XRX500 }, /* idx 0 - silicon id 0x02 */
+-	{ RCU_RD_GPHY3_XRX500, GPHY3_LBADR_XRX500 }, /* idx 1 - silicon id 0x03 */
+-	{ RCU_RD_GPHY4_XRX500, GPHY4_LBADR_XRX500 }, /* idx 2 - silicon id 0x04 */
+-	{ RCU_RD_GPHY5_XRX500, GPHY5_LBADR_XRX500 }, /* idx 3 - silicon id 0x05 */
+-	{ RCU_RD_GPHYF_XRX500, GPHYF_LBADR_XRX500 }, /* idx 4 - silicon id 0x0F */
+-};
+-
+-/*
+- * File-scope load flag - mirrors AVM 4.9's g_xway_gphy_fw_loaded. Set
+- * to true after a successful probe completion; queried via the
+- * intra-module accessor xrx500_gphy_fw_is_loaded().
+- */
+-static bool g_xrx500_gphy_fw_loaded;
+-
+-/*
+- * Per the platform_driver contract there is exactly one phy-xrx500 instance
+- * per board, so a file-scope pointer is sufficient; no per-device struct is
+- * required.
+- */
+-static void __iomem *gsw_l_phy_base;
+-
+-#define XRX500_RCU_BASE_PHYS 0x16000000u
+-#define XRX500_RCU_RST_REQ   0x10u
+-static void __iomem *rcu_rst_base;
+-
+-/**
+- * xrx500_gphy_idx_for_silicon_id() - map a DT silicon id to xrx500_gphy[]
+- * idx.
+- *
+- * @id: silicon id read from the DT phy_id u32 array.
+- *
+- * Return: 0..4 on a valid silicon id, -EINVAL otherwise.
+- */
+-static int xrx500_gphy_idx_for_silicon_id(u32 id)
+-{
+-	switch (id) {
+-	case XRX500_GPHY_SILICON_ID_2:
+-		return 0;
+-	case XRX500_GPHY_SILICON_ID_3:
+-		return 1;
+-	case XRX500_GPHY_SILICON_ID_4:
+-		return 2;
+-	case XRX500_GPHY_SILICON_ID_5:
+-		return 3;
+-	case XRX500_GPHY_SILICON_ID_F:
+-		return 4;
+-	default:
+-		return -EINVAL;
+-	}
+-}
+-
+-static void gsw_reg_w32(u32 val, u32 reg_off)
+-{
+-	/*
+-	 * Cast from the byte offset within the ioremap'd sub-aperture; the
+-	 * AVM-style offsets (GPHY*_LBADR/MBADR = 0x228..0x26C) are passed
+-	 * straight through. This is the v6.18 writel() replacement for the
+-	 * AVM ltq_w32() KSEG1 cast - see header comment.
+-	 */
+-	writel(val, (u8 __iomem *)gsw_l_phy_base + reg_off);
+-}
+-
+-static u32 gsw_reg_r32(u32 reg_off)
+-{
+-	return readl((u8 __iomem *)gsw_l_phy_base + reg_off);
+-}
+-
+-/**
+- * xrx500_gphy_boot() - program a GPHY's firmware base-address registers.
+- *
+- * @dev:      probing device (for dev_info / dev_err).
+- *
+- * @phy_rst:  per-PHY reset_control handle (already devm_-acquired).
+- *
+- * @silicon_id: silicon id (0x02, 0x03, 0x04, 0x05, or 0x0F).
+- *
+- * @dev_addr: 16 KiB-aligned bus address of the firmware buffer.
+- *
+- * Return: 0 on success, -EINVAL for an unknown silicon id, or a
+- * negative errno relayed from the reset-control framework when an
+- * assert/deassert fails on a hardware level the loader cannot recover.
+- * (Logging-only failures of the assert/deassert calls do NOT propagate.)
+- */
+-static int xrx500_gphy_boot(struct device *dev, struct reset_control *phy_rst,
+-			    u32 silicon_id, dma_addr_t dev_addr)
+-{
+-	int idx;
+-
+-	if (!of_machine_is_compatible("intel,xrx500"))
+-		return 0;
+-
+-	idx = xrx500_gphy_idx_for_silicon_id(silicon_id);
+-	if (idx < 0) {
+-		dev_err(dev, "xrx500-phy-fw: invalid silicon id 0x%X\n",
+-			silicon_id);
+-		return -EINVAL;
+-	}
+-
+-	(void)phy_rst; /* reset now via direct RCU MMIO, not framework */
+-
+-	/*
+-	 * The v5.10 reference driver reuses a preset firmware base rather
+-	 * than loading its own, and this driver deliberately does not. Both
+-	 * firmware variants are PHY11G and answer with the same PHY ID, so
+-	 * a preset base does not tell which one is loaded, and the LAN
+-	 * ports need the LAN blob. The vendor loads it explicitly, so this
+-	 * driver always reset-cycles the core and re-points the base at its
+-	 * own copy.
+-	 */
+-	if (rcu_rst_base) {
+-		u32 rd = xrx500_gphy[idx].rd;
+-
+-		/* assert reset: RCU_RST_REQ |= rd */
+-		writel(readl(rcu_rst_base) | rd, rcu_rst_base);
+-		/*
+-		 * The address pair is sampled when the core leaves reset, so
+-		 * the reset is held while the pair is written below and the
+-		 * write is given time to land before the core is released.
+-		 */
+-		udelay(50);
+-	} else {
+-		dev_warn(dev,
+-			 "xrx500-phy-fw: rcu_rst_base NULL; cannot assert GPHY reset (phy%X)\n",
+-			 silicon_id);
+-	}
+-
+-	/*
+-	 * 16 KiB-aligned firmware base address split across the LBADR
+-	 * (bits 15..0) and MBADR (bits 31..16) sibling registers. The
+-	 * AVM source writes LBADR at addr+0 and MBADR at addr+4 - the
+-	 * sibling register pairs are spaced 4 bytes apart per
+-	 * gsw30_reg_top.h GPHYx_LBADR/MBADR DWORD layout. Programmed while
+-	 * the GPHY is held in reset so it boots from this base on deassert.
+-	 */
+-	gsw_reg_w32((u32)dev_addr & 0xFFFF, xrx500_gphy[idx].addr);
+-	gsw_reg_w32(((u32)dev_addr >> 16) & 0xFFFF,
+-		    xrx500_gphy[idx].addr + 4);
+-
+-	if (rcu_rst_base) {
+-		u32 rd = xrx500_gphy[idx].rd;
+-
+-		/* deassert reset: RCU_RST_REQ &= ~rd -> GPHY boots from MBADR */
+-		writel(readl(rcu_rst_base) & ~rd, rcu_rst_base);
+-		udelay(100);
+-	}
+-
+-	return 0;
+-}
+-
+-/**
+- * xway_gphy_load() - request the firmware blob and stage it into DMA memory.
+- *
+- * @pdev:    probing platform_device.
+- *
+- * @dev_out: out-parameter receiving the 16 KiB-aligned bus address.
+- *
+- * @fw_size_out: out-parameter receiving the firmware blob size (bytes).
+- *
+- * @sha_out: out-parameter receiving the SHA-256 digest of the blob.
+- *
+- * Return: 0 on success, a negative errno on failure.
+- */
+-static int xway_gphy_load(struct platform_device *pdev,
+-			  dma_addr_t *dev_out, const char **fw_name_out,
+-			  size_t *fw_size_out,
+-			  u8 sha_out[SHA256_DIGEST_SIZE])
+-{
+-	const struct firmware *fw;
+-	dma_addr_t dev_addr = 0;
+-	const char *fw_name;
+-	void *fw_addr;
+-	size_t size;
+-	int err;
+-
+-	err = of_property_read_string(pdev->dev.of_node, "firmware-name",
+-				      &fw_name);
+-	if (err) {
+-		dev_err(&pdev->dev,
+-			"xrx500-phy-fw: failed to read DT 'firmware-name' property: %d\n",
+-			err);
+-		return err;
+-	}
+-
+-	dev_info(&pdev->dev, "xrx500-phy-fw: requesting %s\n", fw_name);
+-	err = request_firmware(&fw, fw_name, &pdev->dev);
+-	if (err) {
+-		dev_err(&pdev->dev,
+-			"xrx500-phy-fw: request_firmware(%s) failed: %d\n",
+-			fw_name, err);
+-		return err;
+-	}
+-
+-	sha256(fw->data, fw->size, sha_out);
+-
+-	/*
+-	 * GPHY cores need the firmware code in a persistent and contiguous
+-	 * memory area with a 16 KiB-aligned start address (AVM 4.9
+-	 * comment). Over-allocate by XRX200_GPHY_FW_ALIGN, then PTR_ALIGN()
+-	 * the returned virtual+physical addresses to land on the boundary.
+-	 */
+-	size = fw->size + XRX200_GPHY_FW_ALIGN;
+-	/*
+-	 * The GPHY core is a bus master: the firmware must be staged at an
+-	 * address it can reach, and the base-address registers take that
+-	 * address in two halves.
+-	 */
+-	{
+-		unsigned long pg;
+-		phys_addr_t phys;
+-
+-		pg = __get_free_pages(GFP_KERNEL, get_order(size));
+-		if (!pg) {
+-			dev_err(&pdev->dev,
+-				"xrx500-phy-fw: __get_free_pages(%zu) failed\n",
+-				size);
+-			release_firmware(fw);
+-			return -ENOMEM;
+-		}
+-		fw_addr = PTR_ALIGN((void *)pg, XRX200_GPHY_FW_ALIGN);
+-		memcpy(fw_addr, fw->data, fw->size);
+-
+-		phys = virt_to_phys(fw_addr);
+-		dma_sync_single_for_device(&pdev->dev, (dma_addr_t)phys,
+-					   fw->size, DMA_TO_DEVICE);
+-		dev_addr = (dma_addr_t)phys;
+-		dev_info(&pdev->dev,
+-			 "xrx500-phy-fw: staged blob at virt=%p phys=0x%08x (was using dma_alloc dev_addr; now virt_to_phys)\n",
+-			 fw_addr, (u32)dev_addr);
+-	}
+-
+-	*dev_out = dev_addr;
+-	*fw_name_out = fw_name;
+-	*fw_size_out = fw->size;
+-
+-	release_firmware(fw);
+-	return 0;
+-}
+-
+-/**
+- * xway_phy_fw_probe() - platform_driver probe for "lantiq,phy-xrx500".
+- */
+-static int xway_phy_fw_probe(struct platform_device *pdev)
+-{
+-	dma_addr_t fw_addr;
+-	const char *fw_name = NULL;
+-	size_t fw_size = 0;
+-	u8 sha[SHA256_DIGEST_SIZE];
+-	bool eva_preset;
+-	int phy_count;
+-	int i;
+-	int ret;
+-
+-	/*
+-	 * Force THIS device non-coherent. The platform enables IOCU hardware
+-	 * DMA coherency globally (arch/mips/intel-mips/prom.c) so the datapath
+-	 * descriptor rings get cached, snooped coherent memory. But the GPHY
+-	 * firmware-fetch master is NOT in the IOCU coherence domain: it reads
+-	 * the firmware blob from DRAM directly. With the device coherent, our
+-	 * dma_sync_single_for_device(DMA_TO_DEVICE) in xway_gphy_load would be
+-	 * a no-op and the GPHY would fetch stale (cached-but-not-written-back)
+-	 * bytes -> firmware never boots, MDIO reads 0x0 (observed regression).
+-	 * Marking this one device non-coherent makes that sync perform a real
+-	 * cache writeback so the GPHY sees the firmware. Datapath devices are
+-	 * unaffected (they stay coherent via dma_default_coherent).
+-	 */
+-	pdev->dev.dma_coherent = false;
+-
+-	/*
+-	 * This node carries no reg: the registers are inside the GSW-L switch
+-	 * window, so the aperture is that node's base plus the block-relative
+-	 * offset. The whole window is claimed by the intel-xrx500-gswip
+-	 * platform_driver, so map it with devm_ioremap() and no
+-	 * request_mem_region() — GSW-L never touches the GPHY*_LBADR/MBADR
+-	 * registers, and this is the standard pattern for sharing a sub-region
+-	 * of another driver's exclusive window. devm-owned so the mapping is
+-	 * released on probe failure or unbind.
+-	 */
+-	{
+-		struct device_node *parent;
+-		struct resource res;
+-
+-		parent = of_get_parent(pdev->dev.of_node);
+-		ret = of_address_to_resource(parent, 0, &res);
+-		of_node_put(parent);
+-		if (ret) {
+-			dev_err(&pdev->dev,
+-				"xrx500-phy-fw: no reg on the parent switch node: %d\n",
+-				ret);
+-			return ret;
+-		}
+-
+-		gsw_l_phy_base = devm_ioremap(&pdev->dev,
+-					      res.start + XRX500_GPHY_SUBAP_OFFSET,
+-					      XRX500_GPHY_SUBAP_SIZE);
+-		if (!gsw_l_phy_base) {
+-			dev_err(&pdev->dev,
+-				"xrx500-phy-fw: devm_ioremap failed at %pa + 0x%x size 0x%x\n",
+-				&res.start, XRX500_GPHY_SUBAP_OFFSET,
+-				XRX500_GPHY_SUBAP_SIZE);
+-			return -ENOMEM;
+-		}
+-	}
+-
+-	/*
+-	 * Detect firmware that is already running: when it is, do not touch
+-	 * the block clock or the group reset — either stops the cores.
+-	 */
+-	{
+-		u32 lb0 = gsw_reg_r32(GPHY2_LBADR_XRX500) & 0xFFFF;
+-		u32 mb0 = gsw_reg_r32(GPHY2_MBADR_XRX500) & 0xFFFF;
+-
+-		eva_preset = (lb0 != 0 || mb0 != 0);
+-	}
+-
+-	if (!eva_preset) {
+-		void __iomem *cgu_gsr1_en = ioremap(0x16200124u, sizeof(u32));
+-
+-		if (cgu_gsr1_en) {
+-			writel(BIT(28), cgu_gsr1_en);
+-			(void)readl(cgu_gsr1_en); /* post-write settle */
+-			iounmap(cgu_gsr1_en);
+-			udelay(50);
+-		} else {
+-			dev_warn(&pdev->dev,
+-				 "xrx500-phy-fw: failed to ioremap CGU GSR1 enable @0x16200124\n");
+-		}
+-	}
+-
+-	rcu_rst_base = devm_ioremap(&pdev->dev,
+-				    XRX500_RCU_BASE_PHYS + XRX500_RCU_RST_REQ,
+-				    sizeof(u32));
+-	if (!rcu_rst_base)
+-		dev_warn(&pdev->dev,
+-			 "xrx500-phy-fw: failed to ioremap RCU_RST_REQ @0x%x; GPHY reset will be skipped\n",
+-			 XRX500_RCU_BASE_PHYS + XRX500_RCU_RST_REQ);
+-
+-	if (!eva_preset && rcu_rst_base) {
+-		u32 v = readl(rcu_rst_base);
+-
+-		if (v & BIT(31)) {
+-			writel(v & ~BIT(31), rcu_rst_base);
+-			(void)readl(rcu_rst_base); /* post write, settle */
+-			udelay(50);
+-		}
+-	}
+-
+-	ret = xway_gphy_load(pdev, &fw_addr, &fw_name, &fw_size, sha);
+-	if (ret)
+-		return ret;
+-
+-	/* Read the silicon-id array. */
+-	phy_count = of_property_count_u32_elems(pdev->dev.of_node, "phy_id");
+-	if (phy_count <= 0) {
+-		dev_err(&pdev->dev,
+-			"xrx500-phy-fw: missing or empty DT 'phy_id' property\n");
+-		return -ENOENT;
+-	}
+-
+-	for (i = 0; i < phy_count; i++) {
+-		struct reset_control *phy_rst;
+-		char phy_str[8];
+-		u32 silicon_id;
+-		int idx;
+-
+-		ret = of_property_read_u32_index(pdev->dev.of_node, "phy_id",
+-						 i, &silicon_id);
+-		if (ret) {
+-			dev_err(&pdev->dev,
+-				"xrx500-phy-fw: phy_id[%d] read failed: %d\n",
+-				i, ret);
+-			return ret;
+-		}
+-
+-		idx = xrx500_gphy_idx_for_silicon_id(silicon_id);
+-		if (idx < 0) {
+-			dev_err(&pdev->dev,
+-				"xrx500-phy-fw: phy_id[%d]=0x%X is not a recognised xRX500 silicon id\n",
+-				i, silicon_id);
+-			return -EINVAL;
+-		}
+-
+-		/*
+-		 * The 5 reset-names entries
+-		 * {"phy2","phy3","phy4","phy5","phyF"} live in the DT.
+-		 */
+-		snprintf(phy_str, sizeof(phy_str), "phy%X", silicon_id);
+-
+-		phy_rst = devm_reset_control_get(&pdev->dev, phy_str);
+-		if (IS_ERR(phy_rst)) {
+-			ret = PTR_ERR(phy_rst);
+-			pr_err("xrx500-phy-fw: devm_reset_control_get(\"%s\") failed: %d\n",
+-			       phy_str, ret);
+-			/*
+-			 * Surface -ENODEV explicitly when the underlying
+-			 * reset-controller phandle resolved but the named line
+-			 * was not registered; relay any other errno verbatim.
+-			 */
+-			return ret == -EINVAL ? -ENODEV : ret;
+-		}
+-
+-		ret = xrx500_gphy_boot(&pdev->dev, phy_rst, silicon_id,
+-				       fw_addr);
+-		if (ret)
+-			return ret;
+-	}
+-
+-	/* Let the GPHY firmware boot. Probe context sleeps; no need to spin. */
+-	msleep(100);
+-
+-	pr_info("xrx500-phy-fw: loaded %s size=%zu sha256-prefix=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+-		fw_name, fw_size,
+-		sha[0], sha[1], sha[2], sha[3],
+-		sha[4], sha[5], sha[6], sha[7]);
+-
+-	g_xrx500_gphy_fw_loaded = true;
+-	return 0;
+-}
+-
+-bool xrx500_gphy_fw_is_loaded(void)
+-{
+-	return g_xrx500_gphy_fw_loaded;
+-}
+-
+-static const struct of_device_id xway_phy_match[] = {
+-	{ .compatible = "lantiq,phy-xrx500" },
+-	{ }
+-};
+-MODULE_DEVICE_TABLE(of, xway_phy_match);
+-
+-struct platform_driver xway_phy_driver = {
+-	.probe = xway_phy_fw_probe,
+-	.driver = {
+-		.name = "phy-xrx500",
+-		.of_match_table = xway_phy_match,
+-	},
+-};
+-
+-/*
+- * The bus driver must not scan for PHYs that have no firmware yet, so the
+- * loader registers first.
+- */
+-static struct platform_driver * const xrx500_mdio_drivers[] = {
+-	&xway_phy_driver,
+-	&ltq_gswip_mdio_driver,
+-};
+-
+-static int __init xrx500_mdio_init(void)
+-{
+-	return platform_register_drivers(xrx500_mdio_drivers,
+-					 ARRAY_SIZE(xrx500_mdio_drivers));
+-}
+-module_init(xrx500_mdio_init);
+-
+-static void __exit xrx500_mdio_exit(void)
+-{
+-	platform_unregister_drivers(xrx500_mdio_drivers,
+-				    ARRAY_SIZE(xrx500_mdio_drivers));
+-}
+-module_exit(xrx500_mdio_exit);
+-
+-MODULE_LICENSE("GPL");
+-MODULE_AUTHOR("Grische <github@grische.xyz>");
+-MODULE_DESCRIPTION("Intel xRX500 (GRX350) GPHY firmware loader and MDIO bus");
+-/* The loader takes the name from DT; this is what the board files set. */
+-MODULE_FIRMWARE("lantiq/xrx500-phy-fw.bin");

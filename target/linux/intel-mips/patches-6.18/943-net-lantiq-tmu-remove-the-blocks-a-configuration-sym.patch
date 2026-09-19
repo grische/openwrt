@@ -1,0 +1,596 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 10:11:07 +0200
+Subject: net: lantiq: tmu: remove the blocks a configuration symbol never
+ defined
+
+Nine blocks of the traffic manager were guarded on a configuration
+symbol that no Kconfig file in this tree has ever offered: a mock
+register shim, a value table it read, four self-tests exercising the
+initialisation ordering against that shim, and their initcall
+dispatcher. The symbol cannot be set, so none of it has ever been
+compiled, let alone run.
+
+Its near-namesake, which did exist, was the symbol that used to build
+this whole directory and was removed when the vendor suite went. Keeping
+a guard whose only remaining property is that it is always false leaves
+five hundred lines that no build can reach and no reader can trust.
+
+Remove the guarded blocks, and with them the statistics reset that only
+the self-tests called and the two counter helpers behind it. Two unused
+helpers in the buffer manager's header go the same way.
+
+With this, no function under drivers/net/ethernet/lantiq is unreachable
+from an entry point.
+
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+index d7ef844b7f68..b26c4efbb5a5 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+@@ -276,11 +276,6 @@ static inline u32 xrx500_cbm_r32(u32 off)
+ {
+ 	return __raw_readl(g_cbm_base + off);
+ }
+-static inline void xrx500_cbm_w32(u32 off, u32 val)
+-{
+-	__raw_writel(val, g_cbm_base + off);
+-}
+-
+ static inline u32 cbm_eqm_r32(u32 off)
+ {
+ 	return __raw_readl(g_cbm_eqm_base + off);
+@@ -455,12 +450,6 @@ struct cbm_pmac_port_map {
+ 	struct list_head list;
+ };
+ 
+-/* AVM cqm/cqm_common.h:232-235 verbatim — lowest-set-bit helper. */
+-static inline int get_is_bit_set(u32 flags)
+-{
+-	return ffs(flags) - 1;
+-}
+-
+ int cbm_configure_dqm_cpu_ports(void);
+ /*
+  * Descriptor count conf_dqm_cpu_port recorded for a DQM port, 0 if no config
+diff --git a/drivers/net/ethernet/lantiq/tmu/drv_tmu_ll.c b/drivers/net/ethernet/lantiq/tmu/drv_tmu_ll.c
+index 368fe6c367a7..04fbbd85876f 100644
+--- a/drivers/net/ethernet/lantiq/tmu/drv_tmu_ll.c
++++ b/drivers/net/ethernet/lantiq/tmu/drv_tmu_ll.c
+@@ -34,43 +34,6 @@ atomic_t tmu_init_done = ATOMIC_INIT(0);
+  */
+ static DEFINE_SPINLOCK(tmu_lock);
+ 
+-/*
+- * Optional CONFIG_INTEL_XRX500_GSWIP_API_DEBUG mock-MMIO glue.
+- *
+- * The gate is compile-time so production builds carry zero runtime cost.
+- *
+- * Limited to the SIX control-register offsets that the seven sub-init
+- * routines and tmu_egress_port_enable poll on (EPMTC, SBITC, SBOTC,
+- * TBSTC, PPTC, CFGCMD, QMTC).
+- */
+-#ifdef CONFIG_INTEL_XRX500_GSWIP_API_DEBUG
+-static bool tmu_mock_mmio_active;
+-
+-static inline u32 tmu_mock_val_for_offset(u32 off)
+-{
+-	switch (off) {
+-	case TMU_EPMTC_OFFSET:
+-		return TMU_EPMTC_EMV | TMU_EPMTC_EOV |
+-		       TMU_EPMTC_ETV | TMU_EPMTC_EDV;
+-	case TMU_SBITC_OFFSET:
+-		return TMU_SBITC_VAL;
+-	case TMU_SBOTC_OFFSET:
+-		return TMU_SBOTC_VAL;
+-	case TMU_TBSTC_OFFSET:
+-		return TMU_TBSTC_VAL;
+-	case TMU_PPTC_OFFSET:
+-		return TMU_PPTC_VAL;
+-	case TMU_CFGCMD_OFFSET:
+-		return TMU_CFGCMD_VAL;
+-	case TMU_QMTC_OFFSET:
+-		return TMU_QMTC_QEV | TMU_QMTC_QSV | TMU_QMTC_QTV |
+-		       TMU_QMTC_QOV | TMU_QMTC_QDV | TMU_QMTC_QFV;
+-	default:
+-		return 0;
+-	}
+-}
+-#endif
+-
+ /*
+  * MMIO helpers
+  *
+@@ -85,10 +48,6 @@ static inline u32 tmu_r32(u32 off)
+ 
+ static inline void tmu_w32(u32 val, u32 off)
+ {
+-#ifdef CONFIG_INTEL_XRX500_GSWIP_API_DEBUG
+-	if (tmu_mock_mmio_active)
+-		val |= tmu_mock_val_for_offset(off);
+-#endif
+ 	__raw_writel(val, g_cbm_tmu_base + off);
+ }
+ 
+@@ -217,51 +176,6 @@ static void tmu_qfmt_write(u32 qid, const u32 *qfm)
+ 	spin_unlock_irqrestore(&tmu_lock, flags);
+ }
+ 
+-int tmu_qfmt_read(u32 qid, u32 *qfm)
+-{
+-	unsigned long flags;
+-	int spins = 0;
+-
+-	spin_lock_irqsave(&tmu_lock, flags);
+-	tmu_w32(TMU_QMTC_QFR | qid, TMU_QMTC_OFFSET);
+-	while ((tmu_r32(TMU_QMTC_OFFSET) & TMU_QMTC_QFV) == 0) {
+-		if (++spins > 1000000) {
+-			spin_unlock_irqrestore(&tmu_lock, flags);
+-			return -ETIMEDOUT;
+-		}
+-		cpu_relax();
+-	}
+-	qfm[0] = tmu_r32(TMU_QFMT0_OFFSET);
+-	qfm[1] = tmu_r32(TMU_QFMT1_OFFSET);
+-	qfm[2] = tmu_r32(TMU_QFMT2_OFFSET);
+-	spin_unlock_irqrestore(&tmu_lock, flags);
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(tmu_qfmt_read);
+-
+-int tmu_ppt_read(u32 pos, u32 *ppt)
+-{
+-	unsigned long flags;
+-	int spins = 0;
+-
+-	spin_lock_irqsave(&tmu_lock, flags);
+-	tmu_w32(pos, TMU_PPTC_OFFSET);   /* RW bit clear => read; index = pos */
+-	while ((tmu_r32(TMU_PPTC_OFFSET) & TMU_PPTC_VAL) == 0) {
+-		if (++spins > 1000000) {
+-			spin_unlock_irqrestore(&tmu_lock, flags);
+-			return -ETIMEDOUT;
+-		}
+-		cpu_relax();
+-	}
+-	ppt[0] = tmu_r32(TMU_PPT0_OFFSET);
+-	ppt[1] = tmu_r32(TMU_PPT1_OFFSET);
+-	ppt[2] = tmu_r32(TMU_PPT2_OFFSET);
+-	ppt[3] = tmu_r32(TMU_PPT3_OFFSET);
+-	spin_unlock_irqrestore(&tmu_lock, flags);
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(tmu_ppt_read);
+-
+ /* AVM drv_tmu_ll.c:842-864 — tmu_epmt_write. */
+ static void tmu_epmt_write(u32 epn, u32 epe, u32 sbid)
+ {
+@@ -848,394 +762,5 @@ EXPORT_SYMBOL(tmu_create_flat_egress_path);
+ /* Per-queue counter-ring zero helpers. */
+ 
+ /* AVM cqm/grx500/cbm.c:4813-4817 — reset_enq_counter (XRX500). */
+-static void reset_enq_counter(uint32_t qid)
+-{
+-	if (!g_cbm_qeqcnt_base) {
+-		WARN_ONCE(1, "%s: g_cbm_qeqcnt_base NULL\n", __func__);
+-		return;
+-	}
+-	__raw_writel(0, (u32 __force *)g_cbm_qeqcnt_base + qid);
+-}
+-
+ /* AVM cqm/grx500/cbm.c:4819-4823 — reset_deq_counter (XRX500). */
+-static void reset_deq_counter(uint32_t qid)
+-{
+-	if (!g_cbm_qdqcnt_base) {
+-		WARN_ONCE(1, "%s: g_cbm_qdqcnt_base NULL\n", __func__);
+-		return;
+-	}
+-	__raw_writel(0, (u32 __force *)g_cbm_qdqcnt_base + qid);
+-}
+-
+ /* tmu_reset_mib_all - zero every per-queue MIB counter. */
+-int tmu_reset_mib_all(void)
+-{
+-	uint32_t qdc[4] = { 0, 0, 0, 0 };
+-	uint32_t i;
+-
+-	if (!atomic_read(&tmu_init_done)) {
+-		WARN_ONCE(1, "%s called before tmu_init\n", __func__);
+-		return -EAGAIN;
+-	}
+-	if (!g_cbm_qeqcnt_base) {
+-		WARN_ONCE(1, "%s: g_cbm_qeqcnt_base NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-	if (!g_cbm_qdqcnt_base) {
+-		WARN_ONCE(1, "%s: g_cbm_qdqcnt_base NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	for (i = 0; i < EGRESS_QUEUE_ID_MAX; i++) {
+-		reset_enq_counter(i);
+-		reset_deq_counter(i);
+-		tmu_qdct_write(i, qdc);
+-	}
+-	return 0;
+-}
+-
+-/*
+- * Production builds carry zero overhead — the entire block compiles to
+- * nothing when CONFIG_INTEL_XRX500_GSWIP_API_DEBUG is unset.
+- *
+- * Mock-buffer details: - 4 KiB is large enough to cover the entire TMU
+- * register window through TMU_CFGCMD_OFFSET=0x720. The plan's original 1 KiB
+- * sizing is recorded in build-manifest notes — 1 KiB is insufficient. The
+- * mock_mmio_active flag arms the tmu_w32 shim so the indirect- access
+- * busy-waits exit on first read against plain memory. Each test
+- * saves/restores g_cbm_tmu_base, tmu_mock_mmio_active, and tmu_init_done so
+- * subsequent tests start from a clean state.
+- *
+- * Reordering breaks the dependency invariants between the tests.
+- */
+-#ifdef CONFIG_INTEL_XRX500_GSWIP_API_DEBUG
+-
+-#define TMU_MOCK_BUFSZ 4096
+-
+-static int tmu_epoc_zero_init_mock_check(void)
+-{
+-	void *mock_buf, *saved;
+-	void __iomem *saved_base;
+-	u32 epot0_final, epot1_final;
+-	int ret = 0;
+-
+-	mock_buf = kmalloc(TMU_MOCK_BUFSZ, GFP_KERNEL);
+-	saved = kmalloc(TMU_MOCK_BUFSZ, GFP_KERNEL);
+-	if (!mock_buf || !saved) {
+-		ret = -ENOMEM;
+-		goto out;
+-	}
+-
+-	saved_base = g_cbm_tmu_base;
+-
+-	/* Round 1 — capture deterministic post-init state. */
+-	memset(mock_buf, 0xAA, TMU_MOCK_BUFSZ);
+-	g_cbm_tmu_base = (void __iomem *)mock_buf;
+-	tmu_mock_mmio_active = true;
+-
+-	ret = __tmu_ll_init();
+-	if (ret) {
+-		pr_err("tmu: mock __tmu_ll_init round1 failed: %d\n", ret);
+-		goto restore;
+-	}
+-
+-	epot0_final = tmu_r32(TMU_EPOT0_OFFSET);
+-	epot1_final = tmu_r32(TMU_EPOT1_OFFSET);
+-	if (epot0_final != 0 || epot1_final != 0) {
+-		pr_err("tmu: EPOC zero-init read-back nonzero (EPOT0=%#x EPOT1=%#x)\n",
+-		       epot0_final, epot1_final);
+-		ret = -EIO;
+-		goto restore;
+-	}
+-
+-	memcpy(saved, mock_buf, TMU_MOCK_BUFSZ);
+-
+-	/* Round 2 — same prefill, must produce byte-for-byte identical state. */
+-	memset(mock_buf, 0xAA, TMU_MOCK_BUFSZ);
+-	ret = __tmu_ll_init();
+-	if (ret) {
+-		pr_err("tmu: mock __tmu_ll_init round2 failed: %d\n", ret);
+-		goto restore;
+-	}
+-
+-	if (memcmp(saved, mock_buf, TMU_MOCK_BUFSZ) != 0) {
+-		pr_err("tmu: determinism failure — mock buffer diverged across runs\n");
+-		ret = -EIO;
+-		goto restore;
+-	}
+-
+-	pr_info("tmu: EPOC zero-init determinism check PASS\n");
+-
+-restore:
+-	tmu_mock_mmio_active = false;
+-	g_cbm_tmu_base = saved_base;
+-out:
+-	kfree(mock_buf);
+-	kfree(saved);
+-	return ret;
+-}
+-
+-static int tmu_as013_guard_check(void)
+-{
+-	void *mock_buf;
+-	void __iomem *saved_base;
+-	const u8 sentinel = 0xAA;
+-	int ret = 0;
+-	size_t i;
+-
+-	mock_buf = kmalloc(TMU_MOCK_BUFSZ, GFP_KERNEL);
+-	if (!mock_buf)
+-		return -ENOMEM;
+-
+-	saved_base = g_cbm_tmu_base;
+-
+-	/* Confirm guard state — tmu_init_done MUST be 0 going in. */
+-	if (atomic_read(&tmu_init_done) != 0) {
+-		pr_err("tmu: setup invariant violated (tmu_init_done!=0)\n");
+-		ret = -EINVAL;
+-		goto out;
+-	}
+-
+-	memset(mock_buf, sentinel, TMU_MOCK_BUFSZ);
+-	g_cbm_tmu_base = (void __iomem *)mock_buf;
+-	tmu_mock_mmio_active = true;
+-
+-	/* Pre-init call — must WARN_ONCE and return without any MMIO. */
+-	tmu_egress_port_enable(0, true);
+-
+-	/* Assert every byte still equals the prefill — no MMIO touched. */
+-	for (i = 0; i < TMU_MOCK_BUFSZ; i++) {
+-		u8 v = ((const u8 *)mock_buf)[i];
+-
+-		if (v != sentinel) {
+-			pr_err("tmu: guard breach at off=%zu (got %#x, expected %#x)\n",
+-			       i, v, sentinel);
+-			ret = -EIO;
+-			goto restore;
+-		}
+-	}
+-
+-	pr_info("tmu: EPOC ordering guard check PASS\n");
+-
+-restore:
+-	tmu_mock_mmio_active = false;
+-	g_cbm_tmu_base = saved_base;
+-out:
+-	kfree(mock_buf);
+-	return ret;
+-}
+-
+-static int tmu_egress_port_enable_protocol_check(void)
+-{
+-	void *mock_buf;
+-	void __iomem *saved_base;
+-	u32 cfgcmd_v, epmt_v;
+-	const u32 test_epn = 3;
+-	int ret = 0;
+-
+-	mock_buf = kmalloc(TMU_MOCK_BUFSZ, GFP_KERNEL);
+-	if (!mock_buf)
+-		return -ENOMEM;
+-
+-	saved_base = g_cbm_tmu_base;
+-
+-	memset(mock_buf, 0, TMU_MOCK_BUFSZ);
+-	g_cbm_tmu_base = (void __iomem *)mock_buf;
+-	tmu_mock_mmio_active = true;
+-	atomic_set(&tmu_init_done, 1);
+-
+-	tmu_egress_port_enable(test_epn, true);
+-
+-	/*
+-	 * Inspect the CFGCMD slot. The two-step protocol's commit-write packs
+-	 * TMU_CFGCMD_CMD_EP_ON into the opcode field and the EPN into the EPN
+-	 * field.
+-	 */
+-	cfgcmd_v = tmu_r32(TMU_CFGCMD_OFFSET);
+-	if ((cfgcmd_v & TMU_CFGCMD_CMD_MASK) != TMU_CFGCMD_CMD_EP_ON) {
+-		pr_err("tmu: CFGCMD opcode mismatch (got %#x, want %#x)\n",
+-		       cfgcmd_v & TMU_CFGCMD_CMD_MASK,
+-		       (u32)TMU_CFGCMD_CMD_EP_ON);
+-		ret = -EIO;
+-		goto restore;
+-	}
+-	if ((cfgcmd_v & TMU_CFGEPN_EPN_MASK) != test_epn) {
+-		pr_err("tmu: CFGCMD EPN mismatch (got %#x, want %u)\n",
+-		       cfgcmd_v & TMU_CFGEPN_EPN_MASK, test_epn);
+-		ret = -EIO;
+-		goto restore;
+-	}
+-
+-	/* Step-1 proof — EPMT EPE bit set by the read-modify-write. */
+-	epmt_v = tmu_r32(TMU_EPMT_OFFSET);
+-	if (!(epmt_v & TMU_EPMT_EPE)) {
+-		pr_err("tmu: EPMT EPE bit not set after EPE enable (got %#x)\n",
+-		       epmt_v);
+-		ret = -EIO;
+-		goto restore;
+-	}
+-
+-	pr_info("tmu: egress-port-enable protocol check PASS\n");
+-
+-restore:
+-	/*
+-	 * Reset tmu_init_done so the next debug-self-test pass (or any
+-	 * production caller) observes the initial guard state.
+-	 */
+-	atomic_set(&tmu_init_done, 0);
+-	tmu_mock_mmio_active = false;
+-	g_cbm_tmu_base = saved_base;
+-	kfree(mock_buf);
+-	return ret;
+-}
+-
+-static int tmu_reset_mib_all_check(void)
+-{
+-	void *qeqcnt_buf, *qdqcnt_buf, *tmu_buf;
+-	void __iomem *saved_qeq, *saved_qdq, *saved_tmu;
+-	const u8 sentinel = 0xAA;
+-	const size_t cnt_sz = EGRESS_QUEUE_ID_MAX * sizeof(u32);
+-	int ret = 0;
+-	size_t i;
+-
+-	qeqcnt_buf = kmalloc(cnt_sz, GFP_KERNEL);
+-	qdqcnt_buf = kmalloc(cnt_sz, GFP_KERNEL);
+-	tmu_buf = kmalloc(TMU_MOCK_BUFSZ, GFP_KERNEL);
+-	if (!qeqcnt_buf || !qdqcnt_buf || !tmu_buf) {
+-		ret = -ENOMEM;
+-		goto out;
+-	}
+-
+-	saved_qeq = g_cbm_qeqcnt_base;
+-	saved_qdq = g_cbm_qdqcnt_base;
+-	saved_tmu = g_cbm_tmu_base;
+-
+-	/* Confirm guard state — tmu_init_done MUST be 0 going in. */
+-	if (atomic_read(&tmu_init_done) != 0) {
+-		pr_err("tmu: reset-mib setup invariant violated (tmu_init_done!=0)\n");
+-		ret = -EINVAL;
+-		goto restore;
+-	}
+-
+-	memset(qeqcnt_buf, sentinel, cnt_sz);
+-	memset(qdqcnt_buf, sentinel, cnt_sz);
+-	memset(tmu_buf, 0, TMU_MOCK_BUFSZ);
+-	g_cbm_qeqcnt_base = (void __iomem *)qeqcnt_buf;
+-	g_cbm_qdqcnt_base = (void __iomem *)qdqcnt_buf;
+-	g_cbm_tmu_base = (void __iomem *)tmu_buf;
+-	tmu_mock_mmio_active = true;
+-
+-	ret = tmu_reset_mib_all();
+-	if (ret != -EAGAIN) {
+-		pr_err("tmu: guard return mismatch (got %d, want -EAGAIN)\n",
+-		       ret);
+-		ret = -EIO;
+-		goto restore;
+-	}
+-	for (i = 0; i < cnt_sz; i++) {
+-		if (((const u8 *)qeqcnt_buf)[i] != sentinel) {
+-			pr_err("tmu: QEQCNTR breach at byte %zu (got %#x)\n",
+-			       i, ((const u8 *)qeqcnt_buf)[i]);
+-			ret = -EIO;
+-			goto restore;
+-		}
+-		if (((const u8 *)qdqcnt_buf)[i] != sentinel) {
+-			pr_err("tmu: QDQCNTR breach at byte %zu (got %#x)\n",
+-			       i, ((const u8 *)qdqcnt_buf)[i]);
+-			ret = -EIO;
+-			goto restore;
+-		}
+-	}
+-	pr_info("tmu: reset-mib ordering guard check PASS\n");
+-
+-	atomic_set(&tmu_init_done, 1);
+-	ret = tmu_reset_mib_all();
+-	if (ret != 0) {
+-		pr_err("tmu: reset call returned %d (want 0)\n", ret);
+-		ret = -EIO;
+-		goto restore;
+-	}
+-	for (i = 0; i < EGRESS_QUEUE_ID_MAX; i++) {
+-		u32 v;
+-
+-		v = ((const u32 *)qeqcnt_buf)[i];
+-		if (v != 0) {
+-			pr_err("tmu: QEQCNTR[%zu]=%#x (want 0)\n", i, v);
+-			ret = -EIO;
+-			goto restore;
+-		}
+-		v = ((const u32 *)qdqcnt_buf)[i];
+-		if (v != 0) {
+-			pr_err("tmu: QDQCNTR[%zu]=%#x (want 0)\n", i, v);
+-			ret = -EIO;
+-			goto restore;
+-		}
+-	}
+-	ret = 0;
+-	pr_info("tmu: mock-counter zero invariant PASS\n");
+-
+-restore:
+-	/* Reset tmu_init_done so subsequent tests / production code observe
+-	 * the initial guard state.
+-	 */
+-	atomic_set(&tmu_init_done, 0);
+-	tmu_mock_mmio_active = false;
+-	g_cbm_qeqcnt_base = saved_qeq;
+-	g_cbm_qdqcnt_base = saved_qdq;
+-	g_cbm_tmu_base = saved_tmu;
+-out:
+-	kfree(qeqcnt_buf);
+-	kfree(qdqcnt_buf);
+-	kfree(tmu_buf);
+-	return ret;
+-}
+-
+-/*
+- * tmu_debug_self_tests - late_initcall dispatcher for the four
+- * CONFIG_INTEL_XRX500_GSWIP_API_DEBUG self-tests.
+- *
+- * Wired via late_initcall so it runs deterministically AFTER all
+- * subsystem init but BEFORE any user-space process touches the TMU.
+- * Each test's failure return aborts the dispatcher; the kernel boots
+- * regardless (the dispatcher returns the error, but late_initcall
+- * does not propagate errors out of initcall ordering).
+- *
+- * Test ordering is significant — each test relies on tmu_init_done == 0 on
+- * entry and resets it back to 0 at restore.
+- */
+-static int __init tmu_debug_self_tests(void)
+-{
+-	int ret;
+-
+-	pr_info("tmu: CONFIG_INTEL_XRX500_GSWIP_API_DEBUG self-tests starting\n");
+-
+-	ret = tmu_epoc_zero_init_mock_check();
+-	if (ret) {
+-		pr_err("tmu: determinism check FAILED (%d)\n", ret);
+-		return ret;
+-	}
+-
+-	ret = tmu_as013_guard_check();
+-	if (ret) {
+-		pr_err("tmu: ordering-guard check FAILED (%d)\n", ret);
+-		return ret;
+-	}
+-
+-	ret = tmu_egress_port_enable_protocol_check();
+-	if (ret) {
+-		pr_err("tmu: protocol check FAILED (%d)\n", ret);
+-		return ret;
+-	}
+-
+-	ret = tmu_reset_mib_all_check();
+-	if (ret) {
+-		pr_err("tmu: reset-mib-all check FAILED (%d)\n", ret);
+-		return ret;
+-	}
+-
+-	pr_info("tmu: all CONFIG_INTEL_XRX500_GSWIP_API_DEBUG self-tests PASS\n");
+-	return 0;
+-}
+-late_initcall(tmu_debug_self_tests);
+-
+-#endif /* CONFIG_INTEL_XRX500_GSWIP_API_DEBUG */
+diff --git a/drivers/net/ethernet/lantiq/tmu/drv_tmu_ll.h b/drivers/net/ethernet/lantiq/tmu/drv_tmu_ll.h
+index 9947b229737c..4285d969e6b3 100644
+--- a/drivers/net/ethernet/lantiq/tmu/drv_tmu_ll.h
++++ b/drivers/net/ethernet/lantiq/tmu/drv_tmu_ll.h
+@@ -461,28 +461,6 @@ int tmu_init(void);
+  */
+ void tmu_egress_port_enable(uint32_t epn, bool ena);
+ 
+-/**
+- * tmu_qfmt_read - indirect read of the Queue Format table for @qid. Faithful
+- * port of AVM drv_tmu_ll.c:724-744. Fills qfm[0..2] (QFMT0/1/2); qfm[1]
+- * HQPP[13:0] is the head PDU's PPT index. Bounded spin; returns -ETIMEDOUT if
+- * the QMTC valid bit never sets.
+- */
+-int tmu_qfmt_read(u32 qid, u32 *qfm);
+-
+-/**
+- * tmu_ppt_read - indirect read of Packet Pointer Table entry @pos. Faithful
+- * port of AVM drv_tmu_ll.c:3954-3963. Fills ppt[0..3] (PPT0/1/2/3); ppt[2]
+- * BDYL[15:0] is the PDU body length, ppt[1] SEGL[9:0], ppt[0] OFFS[15:8].
+- * Bounded spin; returns -ETIMEDOUT on timeout.
+- */
+-int tmu_ppt_read(u32 pos, u32 *ppt);
+-
+-/**
+- * tmu_reset_mib_all - zero all egress-queue MIB counters (enq + deq + QDCT
+- * rings) for every QID up to EGRESS_QUEUE_ID_MAX.
+- */
+-int tmu_reset_mib_all(void);
+-
+ /**
+  * tmu_create_flat_egress_path - build a flat TMU egress path for one port.
+  *

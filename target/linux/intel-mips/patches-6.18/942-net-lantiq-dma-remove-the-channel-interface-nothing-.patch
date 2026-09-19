@@ -1,0 +1,508 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 10:07:59 +0200
+Subject: net: lantiq: dma: remove the channel interface nothing drives
+
+The packet DMA driver offers a per-channel configuration interface:
+packet drop policy, packet size, byte offset, traffic class, software
+poll interval, peripheral-to-peripheral pairing, the data buffer
+allocator behind it, and a port teardown.
+
+The network device that drives this datapath uses seven entry points of
+this driver - reset a channel, free and configure its descriptors, turn
+it on and off, and mask and unmask its interrupt - and no others. Every
+function listed above was called from the peripheral-to-peripheral relay
+bring-up, which is gone, or from the ioctl surface of the deleted suite,
+or from nowhere at all. The port teardown never had a caller at all:
+nothing in this driver ever unwinds a port once it is open.
+
+Remove them, and the width test that only the buffer allocator asked.
+
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/dma/hdma.c b/drivers/net/ethernet/lantiq/dma/hdma.c
+index 7222572d6e8f..b8a9d3265ba5 100644
+--- a/drivers/net/ethernet/lantiq/dma/hdma.c
++++ b/drivers/net/ethernet/lantiq/dma/hdma.c
+@@ -270,11 +270,6 @@ static int dma_set_chan_port_data(struct dmax_chan *pch, struct dma_port *port)
+ }
+ 
+ /* AVM hdma.c:372-374 verbatim. */
+-static inline bool dma_is_64bit(struct dma_ctrl *ctrl)
+-{
+-	return (ctrl->flags & DMA_CTL_64BIT) ? true : false;
+-}
+-
+ /* AVM hdma.c:377-380 verbatim. */
+ static inline bool dma_chan_tx(struct dmax_chan *pch)
+ {
+@@ -1197,7 +1192,6 @@ static int ltq_dma_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
+-
+ 	id = ltq_dma_r32(pctrl, DMA_ID);
+ 	pctrl->chans = MS(id, DMA_ID_CHNR);
+ 	pctrl->port_nrs = MS(id, DMA_ID_PRTNR);
+@@ -1214,7 +1208,6 @@ static int ltq_dma_probe(struct platform_device *pdev)
+ 	/* Link platform with driver data for retrieving */
+ 	platform_set_drvdata(pdev, pctrl);
+ 
+-
+ 	irq = platform_get_irq(pdev, 0);
+ 
+ 	pr_info("probe entry cid=%d name=%s reg=0x%lx irq=%d\n",
+@@ -1572,113 +1565,22 @@ int ltq_dma_chan_close(u32 chan)
+  * the RX side where silicon needs a fallback when the descriptor ring
+  * overflows.
+  */
+-static void dma_chan_pkt_drop_cfg(struct dmax_chan *pch, int enable)
+-{
+-	unsigned long flags;
+-	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
+-
+-	if (dma_chan_tx(pch))
+-		return;
+-
+-	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
+-	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
+-	if (enable)
+-		ltq_dma_w32_mask(pctrl, 0, DMA_CCTRL_PDEN, DMA_CCTRL);
+-	else
+-		ltq_dma_w32_mask(pctrl, DMA_CCTRL_PDEN, 0, DMA_CCTRL);
+-	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
+-}
+-
+-int ltq_dma_chan_pkt_drop_cfg(u32 chan, int enable)
+-{
+-	struct dmax_chan *pch = dma_chan_l2p(chan);
+-
+-	if (WARN_ON(!pch))
+-		return -EINVAL;
+-	dma_chan_pkt_drop_cfg(pch, enable);
+-	mutex_lock(&pch->ch_lock);
+-	pch->pden = enable;
+-	mutex_unlock(&pch->ch_lock);
+-	return 0;
+-}
+-
+ /*
+  * ltq_dma_chan_pktsize_cfg — AVM hdma.c:1134-1147 verbatim. Stores
+  * pkt_size in the per-channel slot; the silicon honours this at
+  * data_buf_alloc / descriptor-seed time.
+  */
+-int ltq_dma_chan_pktsize_cfg(u32 chan, size_t pktsize)
+-{
+-	struct dmax_chan *pch = dma_chan_l2p(chan);
+-
+-	if (WARN_ON(!pch))
+-		return -EINVAL;
+-	if (pktsize > DMA_MAX_PKT_SIZE)
+-		return -EINVAL;
+-	mutex_lock(&pch->ch_lock);
+-	pch->pkt_size = (int)pktsize;
+-	mutex_unlock(&pch->ch_lock);
+-	return 0;
+-}
+-
+ /*
+  * dma_chan_byte_offset_cfg / ltq_dma_chan_byte_offset_cfg — AVM
+  * hdma.c:1241-1278 verbatim. boff_len > DMA_CHAN_BOFF_MAX (255) disables
+  * the feature; valid 1..255 enables and writes the length to DMA_C_BOFF.
+  * V2.2 hardware doesn't have DMA_C_BOFF — returns -EPERM there.
+  */
+-static void dma_chan_byte_offset_cfg(struct dmax_chan *pch, u32 boff_len)
+-{
+-	u32 val = 0;
+-	unsigned long flags;
+-	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
+-
+-	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
+-	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
+-	if (boff_len == 0 || boff_len > DMA_CHAN_BOFF_MAX) {
+-		ltq_dma_w32_mask(pctrl, DMA_C_BOFF_EN | DMA_C_BOFF_BOF_LEN,
+-				 0, DMA_C_BOFF);
+-	} else {
+-		val = SM(boff_len, DMA_C_BOFF_BOF_LEN) | DMA_C_BOFF_EN;
+-		ltq_dma_w32(pctrl, val, DMA_C_BOFF);
+-	}
+-	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
+-}
+-
+-int ltq_dma_chan_byte_offset_cfg(u32 chan, u32 boff_len)
+-{
+-	struct dma_ctrl *pctrl;
+-	struct dmax_chan *pch = dma_chan_l2p(chan);
+-
+-	if (WARN_ON(!pch))
+-		return -EINVAL;
+-
+-	pctrl = dma_chan_get_controller(pch);
+-	if (pctrl->ver <= DMA_VER_22)
+-		return -EPERM;
+-
+-	dma_chan_byte_offset_cfg(pch, boff_len);
+-
+-	mutex_lock(&pch->ch_lock);
+-	pch->boff_len = boff_len;
+-	mutex_unlock(&pch->ch_lock);
+-	return 0;
+-}
+-
+ /*
+  * Programs the 5-bit CCTRL_CLASS / CCTRL_CLASSH field used by GSWIP-3.0
+  * traffic classes. V2.2 silicon does NOT have the class field — returns
+  * -EPERM there. cls > 31 (5-bit max) returns -EINVAL.
+  */
+-int ltq_dma_chan_class_cfg(u32 chan, u32 cls)
+-{
+-	struct dmax_chan *pch = dma_chan_l2p(chan);
+-
+-	if (WARN_ON(!pch))
+-		return -EINVAL;
+-	return dma_chan_set_class(pch, cls);
+-}
+-
+ /*
+  * Upper bound on physical addresses this driver may take a CKSEG1 alias of.
+  *
+@@ -1842,82 +1744,7 @@ int ltq_dma_chan_desc_free(u32 chan)
+  * ltq_dma_chan_data_buf_alloc — AVM hdma.c:1887-1906 verbatim. Walks the
+  * descriptor ring and uses pch->alloc to populate the per-desc data buffer.
+  */
+-int ltq_dma_chan_data_buf_alloc(u32 chan)
+-{
+-	int i;
+-	int byte_offset;
+-	int ret;
+-	char *buffer;
+-	struct dma_rx_desc *rx_desc_p;
+-	struct dmax_chan *pch = dma_chan_l2p(chan);
+-	struct dma_ctrl *pctrl;
+-
+-	if (WARN_ON(!pch))
+-		return -EINVAL;
+-	pctrl = dma_chan_get_controller(pch);
+-	if (!pch->alloc)
+-		return -EINVAL;
+-	if (!pch->desc_base || pch->desc_len <= 0)
+-		return -EINVAL;
+-
+-	if (!pch->opt) {
+-		pch->opt = devm_kzalloc(pctrl->dev,
+-					(size_t)pch->desc_len * sizeof(void *),
+-					GFP_KERNEL);
+-		if (!pch->opt)
+-			return -ENOMEM;
+-	}
+-	ret = ltq_dma_chan_desc_cfg(chan, pch->desc_phys, pch->desc_len);
+-	if (ret)
+-		return ret;
+-
+-	for (i = 0; i < pch->desc_len; i++) {
+-		rx_desc_p = (struct dma_rx_desc *)(uintptr_t)pch->desc_base + i;
+-		buffer = pch->alloc(pch->pkt_size, &byte_offset, &pch->opt[i]);
+-		if (!buffer) {
+-			dev_err(pctrl->dev, "No enough memory for %s\n",
+-				pch->device_id ? pch->device_id : "(unnamed)");
+-			return -ENOMEM;
+-		}
+-		rx_desc_p->data_pointer = dma_map_single(pctrl->dev, buffer,
+-							 pch->pkt_size,
+-							 DMA_FROM_DEVICE);
+-		if (dma_mapping_error(pctrl->dev, rx_desc_p->data_pointer)) {
+-			dev_err(pctrl->dev, "%s DMA map failed\n", __func__);
+-			pch->free(buffer, pch->opt[i]);
+-			return -ENOMEM;
+-		}
+-		rx_desc_p->status.all = 0;
+-		rx_desc_p->status.field.sop = 1;
+-		rx_desc_p->status.field.eop = 1;
+-		rx_desc_p->status.field.c = 0;
+-		rx_desc_p->status.field.byte_offset = byte_offset;
+-		rx_desc_p->status.field.data_len = pch->pkt_size;
+-		/* Ensure data field ready before ownership change */
+-		wmb();
+-		rx_desc_p->status.field.own = DMA_OWN;
+-		/* Ensure ownership changed before moving to next step */
+-		wmb();
+-	}
+-
+-	pr_info("hdma: %s ch%d rx ring seeded: %d desc x %d B, cdba=0x%08llx\n",
+-		dma_get_name_by_cid(pctrl->cid), pch->nr, pch->desc_len,
+-		pch->pkt_size, (unsigned long long)pch->desc_phys);
+-	return 0;
+-}
+-
+ /* ltq_dma_chan_data_buf_free — counterpart to data_buf_alloc. */
+-int ltq_dma_chan_data_buf_free(u32 chan)
+-{
+-	struct dmax_chan *pch = dma_chan_l2p(chan);
+-
+-	if (WARN_ON(!pch))
+-		return -EINVAL;
+-	if (!pch->free)
+-		return 0;
+-	return 0;
+-}
+-
+ /*
+  * ltq_dma_chan_pseudo_irq_handler_callback_cfg — AVM hdma.c:2107-2122
+  * verbatim.
+@@ -2025,7 +1852,6 @@ static int __init ltq_dma_init(void)
+ }
+ postcore_initcall(ltq_dma_init);
+ 
+-
+ /*
+  *   AVM cbm_config.c:40-49 (DEQUEUE, TX-egress) — CBM tmu_port=7 row:
+  *     { .type = DQM_DMA_TYPE, .tmu_port = 7, .tmu_queue = 17,
+@@ -2171,39 +1997,6 @@ extern int init_cbm_dqm_dma_port(int dqp);
+  * (DMA_C_SWPOLL), which takes one channel off the controller-global CH_FL
+  * flow control engine.
+  */
+-static void dma_chan_sw_poll_cfg(struct dmax_chan *pch, int enable)
+-{
+-	unsigned long flags;
+-	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
+-
+-	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
+-	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
+-	/* MUX always on; EN (bit31) gates SW-poll on/off. */
+-	ltq_dma_w32_mask(pctrl, 0, DMA_C_SWPOLL_MUX, DMA_C_SWPOLL);
+-	if (enable)
+-		ltq_dma_w32_mask(pctrl, 0, DMA_C_SWPOLL_EN, DMA_C_SWPOLL);
+-	else
+-		ltq_dma_w32_mask(pctrl, DMA_C_SWPOLL_EN, 0, DMA_C_SWPOLL);
+-	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
+-}
+-
+-int ltq_dma_chan_sw_poll_cfg(u32 chan, int enable)
+-{
+-	struct dma_ctrl *pctrl;
+-	struct dmax_chan *pch = dma_chan_l2p(chan);
+-
+-	if (WARN_ON(!pch))
+-		return -EINVAL;
+-	pctrl = dma_chan_get_controller(pch);
+-	if (pctrl->ver <= DMA_VER_22)
+-		return -EPERM;
+-	dma_chan_sw_poll_cfg(pch, enable);
+-	mutex_lock(&pch->ch_lock);
+-	pch->sw_poll = enable;
+-	mutex_unlock(&pch->ch_lock);
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(ltq_dma_chan_sw_poll_cfg);
+ 
+ /*
+  * Faithful port of AVM hdma.c dma_chan_p2p_cfg (:1545), dma_chan_global_buf_
+@@ -2217,95 +2010,10 @@ EXPORT_SYMBOL_GPL(ltq_dma_chan_sw_poll_cfg);
+  */
+ 
+ /* AVM hdma.c:790-802 verbatim. Programs CDBA/CDLEN + sets desc_configured. */
+-static void dma_chan_desc_hw_cfg(struct dmax_chan *pch, dma_addr_t desc_base,
+-				 int desc_num)
+-{
+-	unsigned long flags;
+-	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
+-
+-	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
+-	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
+-	ltq_dma_w32(pctrl, desc_base, DMA_CDBA);
+-	ltq_dma_w32(pctrl, desc_num, DMA_CDLEN);
+-	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
+-	pch->desc_configured = true;
+-}
+-
+ /* AVM hdma.c:1545-1562 verbatim. TX-only: P2P-copy bit in DMA_CCTRL. */
+-static void dma_chan_p2p_cfg(struct dmax_chan *pch, int enable)
+-{
+-	unsigned long flags;
+-	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
+-
+-	if (dma_chan_rx(pch)) {
+-		dev_err(pctrl->dev,
+-			"RX channel has no need to configure P2P bit\n");
+-		return;
+-	}
+-	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
+-	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
+-	if (enable)
+-		ltq_dma_w32_mask(pctrl, 0, DMA_CCTRL_P2PCPY, DMA_CCTRL);
+-	else
+-		ltq_dma_w32_mask(pctrl, DMA_CCTRL_P2PCPY, 0, DMA_CCTRL);
+-	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
+-}
+-
+ /* AVM hdma.c:1564-1580 verbatim. TX-only: global buffer length in DMA_CGBL. */
+-static void dma_chan_global_buf_len_cfg(struct dmax_chan *pch, int data_len)
+-{
+-	unsigned long flags;
+-	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
+-
+-	if (dma_chan_rx(pch)) {
+-		dev_err(pctrl->dev,
+-			"RX channel has no need to configure P2P bit\n");
+-		return;
+-	}
+-	if (data_len < 0 || data_len > DMA_MAX_PKT_SIZE)
+-		return;
+-	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
+-	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
+-	ltq_dma_w32(pctrl, data_len, DMA_CGBL);
+-	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
+-}
+-
+ /* dma_p2p_cfg - AVM hdma.c:2291-2311. */
+-static void dma_p2p_cfg(struct dmax_chan *rch, struct dmax_chan *tch)
+-{
+-	/*
+-	 * Assume RX and TX has been configured using
+-	 * DMA descriptor and data buffer functions.
+-	 * TX has to be released its old buffer for default cases.
+-	 */
+-	if (WARN_ON(rch->desc_len == 0))
+-		return;
+-	dma_chan_desc_hw_cfg(rch, rch->desc_phys, rch->desc_len);
+-	mutex_lock(&tch->ch_lock);
+-	tch->desc_len = rch->desc_len;
+-	tch->desc_base = rch->desc_base;
+-	tch->desc_phys = rch->desc_phys;
+-	tch->pkt_size = rch->pkt_size;
+-	tch->p2pcpy = 1;
+-	tch->global_buffer_len = tch->pkt_size;
+-	mutex_unlock(&tch->ch_lock);
+-	dma_chan_desc_hw_cfg(tch, tch->desc_phys, tch->desc_len);
+-	dma_chan_p2p_cfg(tch, 1);
+-	dma_chan_global_buf_len_cfg(tch, tch->global_buffer_len);
+-}
+-
+ /* AVM hdma.c:2313-2323 verbatim. Public entry used by CBM setup_DMA_p2p. */
+-int ltq_dma_p2p_cfg(u32 rx_chan, u32 tx_chan)
+-{
+-	struct dmax_chan *rxch = dma_chan_l2p(rx_chan);
+-	struct dmax_chan *txch = dma_chan_l2p(tx_chan);
+-
+-	if (WARN_ON((!rxch) || (!txch)))
+-		return -EINVAL;
+-	dma_p2p_cfg(rxch, txch);
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(ltq_dma_p2p_cfg);
+ 
+ /*
+  * hdma_ig192_toe_dma3_reset - reset-parity for the TOE DMA controller (AVM
+@@ -2547,66 +2255,3 @@ int hdma_port_enable(int port_id)
+  * No AVM analogue because AVM never carried an hdma_port_enable wrapper
+  * either.
+  */
+-int hdma_port_disable(int port_id)
+-{
+-	const struct port7_chan_desc *tbl;
+-	size_t n, i;
+-	int rc;
+-	int first_err = 0;
+-	u32 chan;
+-
+-	/*
+-	 * Never tear down a CBM-managed DMA2TX egress channel from the netdev
+-	 * path: the descriptors belong to the CBM dequeue port, not to this
+-	 * driver.
+-	 */
+-	if (hdma_deq_armed(port_id))
+-		return 0;
+-
+-	tbl = hdma_port_chan_tbl(port_id, &n);
+-	if (!tbl)
+-		return -EINVAL;
+-
+-	for (i = 0; i < n; i++) {
+-		const struct port7_chan_desc *e = &tbl[i];
+-
+-		chan = _DMA_C(e->cid, e->pid, e->nid);
+-
+-		/* (1) inverse of ltq_dma_chan_open. */
+-		rc = ltq_dma_chan_close(chan);
+-		if (rc) {
+-			pr_err("hdma_port_disable(%d): ltq_dma_chan_close(%s) failed: %d\n",
+-			       port_id, e->label, rc);
+-			if (!first_err)
+-				first_err = rc;
+-		}
+-
+-		/*
+-		 * (2) inverse of ltq_dma_chan_desc_alloc /
+-		 *     ltq_dma_chan_desc_cfg. ltq_dma_chan_desc_free is
+-		 *     idempotent (returns 0 on NULL desc_base) so a
+-		 *     prior partial-teardown path is safe.
+-		 */
+-		rc = ltq_dma_chan_desc_free(chan);
+-		if (rc) {
+-			pr_err("hdma_port_disable(%d): ltq_dma_chan_desc_free(%s) failed: %d\n",
+-			       port_id, e->label, rc);
+-			if (!first_err)
+-				first_err = rc;
+-		}
+-
+-		/* (3) inverse of ltq_request_dma. */
+-		rc = ltq_free_dma(chan);
+-		if (rc) {
+-			pr_err("hdma_port_disable(%d): ltq_free_dma(%s) failed: %d\n",
+-			       port_id, e->label, rc);
+-			if (!first_err)
+-				first_err = rc;
+-		} else {
+-			pr_info("hdma_port_disable(%d): released %s (cid=%u pid=%u nid=%u)\n",
+-				port_id, e->label, e->cid, e->pid, e->nid);
+-		}
+-	}
+-	return first_err;
+-}
+-
+diff --git a/drivers/net/ethernet/lantiq/dma/lantiq_dmax.h b/drivers/net/ethernet/lantiq/dma/lantiq_dmax.h
+index 6359f7f3b479..fc3d37e2d34f 100644
+--- a/drivers/net/ethernet/lantiq/dma/lantiq_dmax.h
++++ b/drivers/net/ethernet/lantiq/dma/lantiq_dmax.h
+@@ -289,16 +289,10 @@ int ltq_dma_chan_off(u32 chan);
+ int ltq_dma_chan_open(u32 chan);
+ int ltq_dma_chan_close(u32 chan);
+ int ltq_dma_chan_reset(u32 chan);
+-int ltq_dma_chan_pktsize_cfg(u32 chan, size_t pktsize);
+ int ltq_dma_chan_desc_alloc(u32 chan, u32 desc_num);
+ int ltq_dma_chan_desc_free(u32 chan);
+-int ltq_dma_chan_data_buf_alloc(u32 chan);
+-int ltq_dma_chan_data_buf_free(u32 chan);
+ int ltq_dma_chan_irq_enable(u32 chan);
+ int ltq_dma_chan_irq_disable(u32 chan);
+-int ltq_dma_chan_pkt_drop_cfg(u32 chan, int enable);
+-int ltq_dma_chan_byte_offset_cfg(u32 chan, u32 boff_len);
+-int ltq_dma_chan_class_cfg(u32 chan, u32 cls);
+ int ltq_dma_chan_pseudo_irq_handler_callback_cfg(u32 chan,
+ 						 intr_handler_t handler,
+ 						 void *priv);
+@@ -334,23 +328,4 @@ int hdma_port_enable(int port_id);
+ 
+ int hdma_ig192_toe_dma3_reset(void);
+ 
+-/*
+- * AVM per-channel SW-poll knob (DMA_C_SWPOLL): takes one channel off the
+- * controller-global CH_FL flow-control engine.
+- */
+-int ltq_dma_chan_sw_poll_cfg(u32 chan, int enable);
+-
+-int ltq_dma_p2p_cfg(u32 rx_chan, u32 tx_chan);
+-
+-/*
+- * Releases the DMA channels that hdma_port_enable(port_id) opened, in reverse
+- * order: ltq_dma_chan_close -> ltq_dma_chan_desc_free -> ltq_free_dma per
+- * channel.
+- *
+- * Returns 0 on success; non-zero on partial failure (each failing step
+- * is logged via pr_err and teardown continues for the remaining
+- * channels so a single stuck channel does not strand the others).
+- */
+-int hdma_port_disable(int port_id);
+-
+ #endif /* LANTIQ_DMAX_H */

@@ -1,0 +1,289 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 09:52:10 +0200
+Subject: net: lantiq: cbm: remove the receive delivery nothing can bind to
+
+The buffer manager carries a receive demultiplexer: a table of network
+devices indexed by the source port the packet MAC records in a received
+frame's header, and a delivery tail that copies the frame into a socket
+buffer and hands it to the stack.
+
+Nothing fills that table. Its one setter has no caller anywhere in the
+tree, so the bound mask stays zero, the delivery test never passes and
+not one frame has ever taken the tail. The processor's end of this
+datapath is a network device of its own, and it terminates its macro's
+receive ring directly rather than through the buffer manager.
+
+Remove the table, its setter, the source-port resolver and the delivery
+tail. The bottom half still drains the load spreader's output and
+returns every segment it finds to the free-segment pool, so a descriptor
+that does arrive is accounted for rather than leaked.
+
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+index ddf051eec07f..5215289e8375 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+@@ -514,8 +514,6 @@ void dqm_intr_ctrl(u32 val);
+ int init_cbm_dqm_dma_port(int dqp);
+ int init_cbm_dqm_cpu_port(int idx);
+ void cbm_rx_engine_init(void);
+-void cbm_rx_set_netdev(u32 sppid, struct net_device *dev);
+-int turn_on_DMA_p2p(void);
+ extern bool g_cbm_egress_preconfig[CBM_MAX_DP_PORTS];
+ int setup_eqm_dma_desc(int pid, int desc_count, u32 flags, u32 buf_offset);
+ u8 get_lookup_qid_via_index(u32 lookup_idx);
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+index 49b05174c394..52d6f9ea3be2 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+@@ -3,9 +3,8 @@
+  * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
+  * drivers/net/ethernet/lantiq/cqm/grx500/cbm.c.
+  *
+- * CBM interrupt handling: the per-line ISRs, the load-spreader receive
+- * tasklet, and the per-source-port receive demultiplexer that hands frames to
+- * the right netdev.
++ * CBM interrupt handling: the per-line ISRs and the load-spreader receive
++ * tasklet.
+  */
+ 
+ #include <linux/kernel.h>
+@@ -19,9 +18,7 @@
+ #include <linux/bitops.h>
+ #include <linux/string.h>
+ #include <linux/dma-mapping.h>
+-#include <linux/netdevice.h>
+-#include <linux/skbuff.h>
+-#include <linux/etherdevice.h>
++#include <linux/if_ether.h>
+ 
+ #include "cbm.h"
+ #include "cbm_regs.h"
+@@ -105,69 +102,18 @@ static u32 cbm_rx_return_port(void)
+  */
+ #define CBM_RX_DRAIN_BUDGET 50
+ 
+-/*
+- * The 8-byte header the packet MAC prepends to a received frame; skb_pull'd
+- * before eth_type_trans so the Ethernet header is at skb->data.
+- */
++/* The 8-byte header the packet MAC prepends to a received frame. */
+ #define CBM_PMAC_RX_HDR_LEN 8
+ 
+ static struct cbm_desc g_cbm_dlist[CPU_DQM_PORT_NUM][64];
+ static unsigned long g_cpu_port_alloc;
+ static struct tasklet_struct cbm_tasklet[CPU_DQM_PORT_NUM];
+ 
+-#define CBM_RX_SPPID_MIN	2
+-#define CBM_RX_SPPID_MAX	15
+-#define CBM_RX_SPPID_DEFAULT	5	/* dp5 / eth0 / LAN1 */
+-
+-static struct net_device *g_cbm_rx_netdev[CBM_RX_SPPID_MAX + 1];
+-static struct net_device *g_cbm_rx_netdev_default;
+-static u32 g_cbm_rx_mask;
+-
+ #define CBM_RX_RESCHED_CAP 1000
+ static u32 g_cbm_resched_cnt[CPU_DQM_PORT_NUM];
+ 
+ static DEFINE_RAW_SPINLOCK(g_cbm_irnen_ls_lock);
+ 
+-/*
+- * The source port is the high nibble of byte 2 of the header the packet MAC
+- * prepends to a received frame. Read as a byte rather than through a
+- * bitfield overlay: the header is network data at an arbitrary alignment.
+- */
+-static u32 cbm_rx_pmac_sppid(const void *hdr)
+-{
+-	return ((const u8 *)hdr)[2] >> 4;
+-}
+-
+-/* Any netdev bound at all? One test to skip the whole delivery path. */
+-static bool cbm_rx_netdev_bound(void)
+-{
+-	return g_cbm_rx_mask != 0;
+-}
+-
+-/*
+- * Resolve the delivery netdev for @sppid, falling back to the default netdev
+- * (the dp5/eth0 registration) with a ratelimited warning when the source port
+- * is out of range or has nothing registered. Returning the fallback rather
+- * than NULL is the point: a wrong sppid assumption must cost attribution
+- * accuracy, not RX.
+- */
+-static struct net_device *cbm_rx_resolve_netdev(u32 sppid)
+-{
+-	struct net_device *ndev = NULL;
+-
+-	if (sppid >= CBM_RX_SPPID_MIN && sppid <= CBM_RX_SPPID_MAX)
+-		ndev = READ_ONCE(g_cbm_rx_netdev[sppid]);
+-
+-	if (ndev)
+-		return ndev;
+-
+-	ndev = READ_ONCE(g_cbm_rx_netdev_default);
+-	if (ndev)
+-		pr_warn_ratelimited("cbm: RX sppid=%u has no registered netdev; delivering to %s (mask=0x%x)\n",
+-				    sppid, netdev_name(ndev), g_cbm_rx_mask);
+-	return ndev;
+-}
+-
+ static void cbm_irnen_ls_rmw(u32 pid, bool enable)
+ {
+ 	u32 mask = (u32)(3UL << (pid * 2 + 16));
+@@ -656,9 +602,7 @@ static int cbm_cpu_dequeue_list(u32 pid)
+  *
+  * Flow: read the LS port status; if the queued count is non-zero, stage the
+  * ring via cbm_cpu_dequeue_list and walk the staged descriptors to the
+- * desc2 == 0 sentinel; for each, decode then deliver (copy-break, only when a
+- * netdev is bound and the segment resolves, preceded by the dma_sync) and
+- * recycle the segment EXACTLY ONCE on every path. Finally re-arm: if the
++ * desc2 == 0 sentinel, recycling every segment. Finally re-arm: if the
+  * budget was hit or the ring is not yet QUEUE_EMPTY, re-schedule WITHOUT
+  * re-arming; else ack line 4, flush, and re-enable IRNEN_LS + CBM line 4.
+  */
+@@ -709,14 +653,10 @@ static void do_cbm_tasklet(unsigned long cpu)
+ 
+ 		/* Walk staged descriptors to the desc2 == 0 sentinel. */
+ 		while (desc_list->desc2) {
+-			u32 desc0 = desc_list->desc0;
+-			u32 desc1 = desc_list->desc1;
+ 			u32 desc2_phys = desc_list->desc2;
+ 			u32 desc3 = desc_list->desc3;
+ 			int data_len = (int)(desc3 & 0x0000FFFFu);
+ 			int data_offset = (int)((desc3 & 0x03800000u) >> 23);
+-			struct net_device *ndev = NULL;
+-			void *buf_virt = NULL;
+ 			u32 seg_off;
+ 
+ 			seg_off = desc2_phys & (g_cbm_buff.std_frm_size - 1);
+@@ -730,68 +670,13 @@ static void do_cbm_tasklet(unsigned long cpu)
+ 				continue;
+ 			}
+ 
+-			if (cbm_rx_netdev_bound())
+-				buf_virt = cbm_buf_phys_to_virt(desc2_phys);
+-
+-			if (buf_virt) {
+-				const u8 *pmac = (const u8 *)buf_virt + data_offset;
+-
+-				dma_cache_inv((unsigned long)buf_virt,
+-					      (unsigned long)(data_offset + data_len));
+-
+-				pr_info_once("cbm: first RX frame: pmac=%02x %02x %02x %02x %02x %02x %02x %02x (sppid=%u) desc0=0x%08x desc1=0x%08x (ep=%u) len=%d off=%d\n",
+-					     pmac[0], pmac[1], pmac[2], pmac[3],
+-					     pmac[4], pmac[5], pmac[6], pmac[7],
+-					     cbm_rx_pmac_sppid(pmac),
+-					     desc0, desc1, (desc1 >> 8) & 0xFu,
+-					     data_len, data_offset);
+-
+-				ndev = cbm_rx_resolve_netdev(cbm_rx_pmac_sppid(pmac));
+-			}
+-
+-			if (ndev) {
+-				struct sk_buff *skb;
+-
+-				skb = netdev_alloc_skb_ip_align(ndev, data_len);
+-				if (skb) {
+-					unsigned int rx_len;
+-
+-					memcpy(skb_put(skb, data_len),
+-					       (u8 *)buf_virt + data_offset,
+-					       (size_t)data_len);
+-					/* Strip the 8-byte PMAC RX header before L2. */
+-					skb_pull(skb, CBM_PMAC_RX_HDR_LEN);
+-					rx_len = skb->len;
+-					skb->dev = ndev;
+-					skb->protocol = eth_type_trans(skb, ndev);
+-					dev_sw_netstats_rx_add(ndev, rx_len);
+-					netif_receive_skb(skb);
+-				} else {
+-					pr_err_ratelimited("cbm: do_cbm_tasklet: skb alloc failed; dropping frame (segment recycled)\n");
+-					dev_core_stats_rx_dropped_inc(ndev);
+-				}
+-			}
+-
+ 			/*
+-			 * Return the consumed CBM segment to the FSQM free
+-			 * pool on EVERY path (delivered included). This is
+-			 * copy-break: the bytes were memcpy'd into a plain
+-			 * slab skb, so the pool segment is finished the
+-			 * instant the copy completes and must be returned
+-			 * exactly once. There is NO CBM/FSQM hardware
+-			 * auto-recycle on the RX-consume path —
+-			 * cbm_ls_deq_list only READS the LS port registers
+-			 * (AVM cbm.c:1985-2003) and the sole return path to
+-			 * the free-list is the DQM ptr_rtn write in
+-			 * cbm_fsqm_buf_free / cbm_buffer_free_grx500 (AVM
+-			 * cbm.c:1039). AVM returns every consumed segment
+-			 * exactly once too: drop = immediately in the tasklet
+-			 * (cbm.c:2645), delivered = deferred via dp_rx -> the
+-			 * registered .cbm_buffer_free callback (cbm.c:5425),
+-			 * refcount-gated (cbm.c:1018-1023). The
+-			 * cbm_dma.c:412-420 'HW recycles after egress' note
+-			 * applies to the TX-EGRESS rollback case, NOT this
+-			 * RX-consume path (no egress here).
++			 * Return the consumed segment to the free-segment
++			 * pool. There is no hardware auto-recycle on this
++			 * path: draining the load spreader's output only
++			 * reads its registers, and the sole way back to the
++			 * free list is the dequeue port's pointer-return
++			 * register that cbm_fsqm_buf_free writes.
+ 			 */
+ 			cbm_fsqm_buf_free(cbm_rx_return_port(), desc2_phys);
+ 
+@@ -827,52 +712,6 @@ static void do_cbm_tasklet(unsigned long cpu)
+ 	}
+ }
+ 
+-/*
+- * cbm_rx_set_netdev - bind (@dev) or unbind (NULL) the netdev the RX engine
+- * delivers frames whose PMAC sppid is @sppid to.
+- *
+- * A bound netdev must have been allocated with NETDEV_PCPU_STAT_TSTATS: the
+- * delivery path counts received frames on its per-CPU software statistics.
+- */
+-void cbm_rx_set_netdev(u32 sppid, struct net_device *dev)
+-{
+-	struct net_device *dflt;
+-	u32 i;
+-
+-	if (sppid < CBM_RX_SPPID_MIN || sppid > CBM_RX_SPPID_MAX) {
+-		pr_err("cbm: cbm_rx_set_netdev: sppid %u out of range %u..%u\n",
+-		       sppid, CBM_RX_SPPID_MIN, CBM_RX_SPPID_MAX);
+-		return;
+-	}
+-
+-	WRITE_ONCE(g_cbm_rx_netdev[sppid], dev);
+-	if (dev)
+-		g_cbm_rx_mask |= BIT(sppid);
+-	else
+-		g_cbm_rx_mask &= ~BIT(sppid);
+-
+-	/*
+-	 * Recompute the fallback target for an sppid with nothing registered:
+-	 * prefer the designated default port (dp5/eth0, whose datapath is the
+-	 * proven one), else the lowest bound port, else none. Recomputing beats
+-	 * patching it in place — an unbind of the default must not leave a
+-	 * dangling pointer, and a rebind must resurrect it.
+-	 *
+-	 * Building it up in the global would leave the RX tasklet — which can
+-	 * interrupt this process-context caller — reading a transiently NULL
+-	 * or wrong fallback on every iteration. One store makes the worst
+-	 * case "the previous fallback or the new one", never neither.
+-	 */
+-	dflt = g_cbm_rx_netdev[CBM_RX_SPPID_DEFAULT];
+-	for (i = CBM_RX_SPPID_MIN; !dflt && i <= CBM_RX_SPPID_MAX; i++)
+-		dflt = g_cbm_rx_netdev[i];
+-	WRITE_ONCE(g_cbm_rx_netdev_default, dflt);
+-
+-	pr_info("cbm: RX demux: sppid %u -> %s (mask=0x%x, default=%s)\n",
+-		sppid, dev ? netdev_name(dev) : "(unbound)", g_cbm_rx_mask,
+-		dflt ? netdev_name(dflt) : "(none)");
+-}
+-
+ /* cbm_rx_engine_init — one-time RX engine arm. */
+ void cbm_rx_engine_init(void)
+ {
