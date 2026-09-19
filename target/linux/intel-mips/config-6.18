@@ -163,37 +163,55 @@ CONFIG_CRYPTO=y
 CONFIG_CRYPTO_DEFLATE=y
 CONFIG_CRYPTO_LZO=y
 CONFIG_INTEL_XRX500_NET=y
-# Built in rather than =m: the netdev driver's transmit path and the CBM
-# receive path call dma_cache_wback()/dma_cache_inv(), which MIPS does not
-# export to modules.
-CONFIG_INTEL_XRX500_GSWIP_API=y
+# Built in rather than =m, because the buffer manager's transmit path and
+# the conduit's receive path call dma_cache_wback()/dma_cache_inv(), which
+# MIPS does not export to modules.
+CONFIG_INTEL_XRX500_BM=y
+CONFIG_INTEL_XRX500_CBM_CONDUIT=y
 
-# =m, and it has to be. The GPHY firmware is proprietary, so nothing links
-# it into the kernel image; xrx500-phy11g-firmware installs it in the
-# rootfs instead. Built in, the loader would probe during do_initcalls()
-# with no rootfs mounted, miss the direct load and then block for the full
-# 60 s usermode-helper timeout that generic/config-6.18 arms tree-wide with
-# CONFIG_FW_LOADER_USER_HELPER_FALLBACK=y. As a module loaded from
-# /etc/modules-boot.d the rootfs is already there.
-CONFIG_INTEL_XRX500_MDIO=m
+# The two switch macros are driven as DSA switches. The core and the tagging
+# driver are built in, so a conduit that comes up before the root filesystem
+# has its protocol available and nothing has to be demand-loaded on the
+# receive path.
+CONFIG_NET_DSA=y
+CONFIG_NET_DSA_TAG_GSWIP3=y
 
-# The GSWIP-MDIO scan finds the 4 XWAY VR9 GPHYs
-# at addresses 0x02..0x05, but with no XWAY/lantiq PHY driver enabled they
-# bind to the "Generic PHY" fallback. Generic PHY does autoneg correctly in
-# the simple case BUT does not handle the GPHY's GBE_LBADR/MBADR (firmware
-# load anchor) nor the GPHYF status quirks. End result observed on hardware:
-# kernel reaches phylink_start, MDIO bus is up, but the netdev never gets
-# carrier=1 and `ip link` stays NO-CARRIER. Enable INTEL_XWAY_PHY to bind
-# the proper driver to the gswip-mdio:0[2..5] devices.
+# The switch driver itself is =m, and it has to be. The firmware the
+# integrated PHYs need is proprietary, so nothing links it into the kernel
+# image; xrx500-phy11g-firmware installs it in the rootfs instead. Built in,
+# the driver would probe during do_initcalls() with no rootfs mounted and
+# fail the direct firmware read with no way to retry. As a module loaded
+# from /etc/modules-boot.d the rootfs is already there. The common core
+# follows it, being a library the switch driver links against.
+CONFIG_NET_DSA_LANTIQ_COMMON=m
+CONFIG_NET_DSA_LANTIQ_GSWIP_XRX500=m
+
+# The GSWIP 2.x driver and its tagging driver belong to the xRX200/xRX300
+# switch, which this SoC does not carry; the backport that brought the
+# common core into this tree brings them along. Off, so nothing installs a
+# module for a switch that is not there.
+# CONFIG_NET_DSA_LANTIQ_GSWIP is not set
+# CONFIG_NET_DSA_TAG_GSWIP is not set
+
+# The integrated Gigabit PHYs sit on the switch macros' own management
+# buses, and the device tree gives each of them the ID d565.a409, which
+# intel-xway.c matches. Enable INTEL_XWAY_PHY so they bind to that driver
+# rather than to the Generic PHY fallback.
 CONFIG_INTEL_XWAY_PHY=y
 
 # rcu_reset0 (reset-controller@10 inside rcu@16000000,
 # compatible "lantiq,xrx200-reset") binds via reset-lantiq.c which depends on
 # MFD_SYSCON + REGMAP_MMIO. CONFIG_RESET_LANTIQ defaults to SOC_TYPE_XWAY,
 # which the intel-mips target does NOT set (we are INTEL_MIPS, not LANTIQ).
-# Enable explicitly. Without this, devm_reset_control_get("phyN") returns
-# -EPROBE_DEFER forever, the GPHY firmware never loads, MDIO bus probe
-# defers, and intel-xrx500 ndo_open never reaches the 4-step ordering.
+# Without it, every per-PHY reset lookup of the switch driver returns
+# -EPROBE_DEFER forever, so the integrated PHYs are never started and the
+# switch never registers its ports.
+#
+# The line below does not by itself decide that, and cannot. The symbol has
+# no prompt outside COMPILE_TEST, so it falls back to its default whatever
+# a fragment says. What settles it is the switch driver's own "select
+# RESET_LANTIQ if INTEL_MIPS". This records the requirement and keeps the
+# merged configuration readable; it is not the mechanism.
 CONFIG_RESET_LANTIQ=y
 CONFIG_MFD_SYSCON=y
 CONFIG_REGMAP_MMIO=y
@@ -470,7 +488,7 @@ CONFIG_INTEL_GRX500_WDT=y
 #    watchdog.o), this target has no modules.mk to ship a .ko from, and
 #    a governor that is built but never installed leaves
 #    watchdog_notify_pretimeout() with nothing registered -- a silent
-#    no-op exactly like the INTEL_XRX500_GSWIP_API case above.
+#    no-op exactly like a datapath symbol left unset above.
 #  - DEFAULT_GOV_NOOP is the boot default, deliberately overriding
 #    upstream's choice default of _GOV_PANIC (Kconfig:116-118). This
 #    driver's interrupt path has never executed on this silicon, so the

@@ -33,27 +33,34 @@ endef
 
 $(eval $(call KernelPackage,leds-lgm-sso))
 
-define KernelPackage/intel-xrx500-mdio
+define KernelPackage/dsa-lantiq-gswip-xrx500
   SUBMENU:=$(NETWORK_DEVICES_MENU)
-  TITLE:=Intel xRX500 GPHY firmware loader and MDIO bus
-  KCONFIG:=CONFIG_INTEL_XRX500_MDIO
-  FILES:=$(LINUX_DIR)/drivers/net/ethernet/lantiq/intel-xrx500-mdio.ko
+  TITLE:=Lantiq/Intel GSWIP 3.0 switch support
+  KCONFIG:=CONFIG_NET_DSA_LANTIQ_GSWIP_XRX500
+  FILES:= \
+	$(LINUX_DIR)/drivers/net/dsa/lantiq/lantiq_gswip_common.ko \
+	$(LINUX_DIR)/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.ko
   DEPENDS:=@TARGET_intel_mips +xrx500-phy11g-firmware
   #
   # The trailing 1 is the boot flag: /etc/modules-boot.d rather than
-  # /etc/modules.d, so preinit loads it. Nothing links the proprietary
-  # GPHY firmware into the kernel image, so the loader has to run with a
-  # mounted rootfs -- and it has to run before the network comes up,
-  # because until the PHYs answer MDIO there are no netdevs at all and
-  # failsafe has no LAN port.
+  # /etc/modules.d, so preinit loads it. The integrated PHYs stay in ROM
+  # mode until their firmware is read out of the root filesystem, so the
+  # driver cannot be built in -- and it has to run before the network
+  # comes up, because until the switch registers there are no ports at
+  # all and failsafe has no LAN jack.
   #
-  AUTOLOAD:=$(call AutoLoad,41,intel-xrx500-mdio,1)
+  # The two modules are named in link order. The second depends on the
+  # first, which is a library rather than a driver of its own.
+  #
+  AUTOLOAD:=$(call AutoLoad,41,lantiq_gswip_common lantiq_gswip_xrx500,1)
 endef
 
-define KernelPackage/intel-xrx500-mdio/description
-  GPHY firmware loader and MDIO bus driver for the Gigabit PHYs integrated
-  in the Intel xRX500/GRX350 SoC. The PHYs stay in ROM mode until the
-  firmware is loaded, so without this package no LAN port comes up.
+define KernelPackage/dsa-lantiq-gswip-xrx500/description
+  Distributed Switch Architecture driver for the two GSWIP 3.0 switch
+  macros of the Intel xRX500 SoC family, the four-port LAN macro every
+  board has and the WAN macro of the GRX550 die. It brings up the
+  integrated Gigabit PHYs from firmware in the root filesystem, so
+  without this package no front-panel port comes up.
 endef
 
-$(eval $(call KernelPackage,intel-xrx500-mdio))
+$(eval $(call KernelPackage,dsa-lantiq-gswip-xrx500))
