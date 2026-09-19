@@ -108,13 +108,14 @@ define Device/avm_fritz7560
   # -E 5 is the tree-wide value and matches the lantiq avm_fritz3370
   # precedent (vr9.mk).
   UBINIZE_OPTS := -E 5
-  # kmod-intel-xrx500-mdio is the GPHY firmware loader; xrx500-phy11g-firmware
-  # is the firmware it loads, installed as /lib/firmware/lantiq/xrx500-phy-fw.bin
-  # — the exact path the DT 'firmware' property in seale_avm.dtsi's phy-xrx500
-  # node names, and therefore the string request_firmware() looks up. Renaming
-  # either side alone leaves the GPHYs in ROM mode and the LAN ports dead. The
-  # loader is a module precisely so the proprietary blob stays a separate file
-  # in the rootfs and is never linked into the kernel image.
+  # kmod-dsa-lantiq-gswip-xrx500 is the switch driver, which stages the GPHY
+  # firmware; xrx500-phy11g-firmware is the firmware it stages, installed as
+  # /lib/firmware/lantiq/xrx500-phy-fw.bin — the exact path the DT
+  # 'firmware-name' property in seale_avm.dtsi's gphy-fw node names, and
+  # therefore the string request_firmware_direct() looks up. Renaming either
+  # side alone leaves the GPHYs in ROM mode and the LAN ports dead. The
+  # blob lives in the root filesystem, so the driver is built as a module
+  # and loads once that is mounted; ../config-6.18 says why.
   #
   # Blob: ltq_fw_PHY11G_IP_1v1_xRx5xx_A21_R8548.bin, sha256
   # d8269703afd369c28a6aeeb65d2751334e38e2228816eda0bdb11c2475b0df33.
@@ -223,7 +224,7 @@ define Device/avm_fritz7560
   # is this board's answer and not the subtarget's: every LED on the 7560 hangs
   # off a raw SoC GPIO, while the 7590 drives its panel through the SSO shift
   # register and takes kmod-leds-lgm-sso instead.
-  DEVICE_PACKAGES := fritz-tffs-nand fritz-caldata kmod-intel-xrx500-mdio \
+  DEVICE_PACKAGES := fritz-tffs-nand fritz-caldata kmod-dsa-lantiq-gswip-xrx500 \
 	xrx500-phy11g-firmware \
 	pciutils kmod-ath9k kmod-ath10k ath10k-firmware-qca988x wpad-basic-mbedtls \
 	kmod-usb-storage kmod-usb-storage-uas kmod-fs-vfat kmod-fs-ext4 block-mount usbutils \
@@ -334,7 +335,7 @@ define Device/avm_fritz7590
   # kmod-leds-lgm-sso drives the front panel, which hangs off a shift register
   # here rather than off GPIOs; ../xrx500/target.mk says why kmod-leds-gpio is
   # not the answer on this board, and the 7560 block above names it instead.
-  DEVICE_PACKAGES := fritz-tffs-nand fritz-caldata kmod-intel-xrx500-mdio \
+  DEVICE_PACKAGES := fritz-tffs-nand fritz-caldata kmod-dsa-lantiq-gswip-xrx500 \
 	xrx500-phy11g-firmware \
 	pciutils kmod-ath10k ath10k-firmware-qca9984 wpad-basic-mbedtls \
 	kmod-usb-storage kmod-usb-storage-uas kmod-fs-vfat kmod-fs-ext4 block-mount usbutils \
@@ -407,7 +408,7 @@ define Device/avm_fritz7580
   # ../base-files' 11-ath10k-caldata extracts nothing for it. The package is
   # kept anyway, as bring-up insurance. Drop it once both radios are proven to
   # associate on OTP calibration alone.
-  DEVICE_PACKAGES := fritz-tffs-nand fritz-caldata kmod-intel-xrx500-mdio \
+  DEVICE_PACKAGES := fritz-tffs-nand fritz-caldata kmod-dsa-lantiq-gswip-xrx500 \
 	xrx500-phy11g-firmware \
 	pciutils kmod-ath10k ath10k-firmware-qca9984 wpad-basic-mbedtls \
 	kmod-usb-storage kmod-usb-storage-uas kmod-fs-vfat kmod-fs-ext4 block-mount usbutils \

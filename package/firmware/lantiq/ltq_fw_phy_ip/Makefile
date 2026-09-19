@@ -41,10 +41,11 @@ define Package/xrx500-phy11g-firmware/description
   (UGW-7.5.2.50/dl/ltq_fw_PHY_IP-2.3.tar.gz).
 
   xRx5xx is this silicon: GRX350 and GRX550 both take this blob. It is
-  installed as lantiq/xrx500-phy-fw.bin, the path the device tree's firmware
-  property names and therefore the string request_firmware() looks up -
-  renaming a vendor blob to the kernel's requested name follows the xRX200
-  packages in package/firmware/lantiq/lantiq-gphy-firmware.
+  installed as lantiq/xrx500-phy-fw.bin, the path the device tree's
+  firmware-name property names and therefore the string
+  request_firmware_direct() looks up - renaming a vendor blob to the
+  kernel's requested name follows the xRX200 packages in
+  package/firmware/lantiq/lantiq-gphy-firmware.
 
   Two nearby revisions are easy to confuse. The repository's master branch
   carries A21 R8547; only the ugw-* branches carry R8548. The xRx3xx A21 blob
@@ -54,7 +55,7 @@ define Package/xrx500-phy11g-firmware/description
   The firmware is covered by the Lantiq Software License Agreement, whose
   text is installed next to the blob as xrx500-phy-fw.bin.LICENSE, as the
   vrx518 firmware packages do. It is kept a separate file in the rootfs and
-  is deliberately not built into the kernel image; kmod-intel-xrx500-mdio
+  is deliberately not built into the kernel image; kmod-dsa-lantiq-gswip-xrx500
   reads it from there.
 endef
 
