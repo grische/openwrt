@@ -1,0 +1,41 @@
+From fb976091b4df9ccdfd8d787db898d64cafc184ae Mon Sep 17 00:00:00 2001
+From: Shmulik Ladkani <shmulik.ladkani@gmail.com>
+Date: Wed, 4 Jul 2012 11:06:02 +0300
+Subject: [PATCH] UBI: kill CONFIG_MTD_UBI_BEB_RESERVE
+
+CONFIG_MTD_UBI_BEB_RESERVE and MIN_RESEVED_PEBS are no longer used,
+since the amount of reserved eraseblocks for bad PEB handling is now
+derived from 'ubi->bad_peb_limit' (ubi's maximum expected bad
+eraseblocks).
+
+Signed-off-by: Shmulik Ladkani <shmulik.ladkani@gmail.com>
+Signed-off-by: Artem Bityutskiy <Artem.Bityutskiy@linux.intel.com>
+(cherry picked from commit 1b2a5790613756d54fdf58d0b3965e43735f153b)
+[The option is in include/ubi_uboot.h instead of Kconfig.]
+---
+ drivers/mtd/ubi/ubi.h | 3 ---
+ include/ubi_uboot.h   | 1 -
+ 2 files changed, 4 deletions(-)
+
+--- a/drivers/mtd/ubi/ubi.h
++++ b/drivers/mtd/ubi/ubi.h
+@@ -69,9 +69,6 @@
+ #define ubi_err(fmt, ...) printk(KERN_ERR "UBI error: %s: " fmt "\n", \
+ 				 __func__, ##__VA_ARGS__)
+ 
+-/* Lowest number PEBs reserved for bad PEB handling */
+-#define MIN_RESEVED_PEBS 2
+-
+ /* Background thread name pattern */
+ #define UBI_BGT_NAME_PATTERN "ubi_bgt%dd"
+ 
+--- a/include/ubi_uboot.h
++++ b/include/ubi_uboot.h
+@@ -40,7 +40,6 @@ do {									\
+ 
+ /* configurable */
+ #define CONFIG_MTD_UBI_WL_THRESHOLD	4096
+-#define CONFIG_MTD_UBI_BEB_RESERVE	1
+ #ifndef CONFIG_MTD_UBI_BEB_LIMIT
+ #define CONFIG_MTD_UBI_BEB_LIMIT	2
+ #endif

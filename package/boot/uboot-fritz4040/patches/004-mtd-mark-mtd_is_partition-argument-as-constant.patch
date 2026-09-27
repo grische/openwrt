@@ -1,0 +1,38 @@
+From ba71603c70359a1d0fad2e4390fbdce8a8fc7c4d Mon Sep 17 00:00:00 2001
+From: Richard Genoud <richard.genoud@gmail.com>
+Date: Tue, 10 Jul 2012 18:23:39 +0200
+Subject: [PATCH] mtd: mark mtd_is_partition argument as constant
+
+'struct mtd_info' is not modified by 'mtd_is_partition()' so it can be marked
+as "const".
+
+Signed-off-by: Richard Genoud <richard.genoud@gmail.com>
+Signed-off-by: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+(cherry picked from commit 5dee4674c8dd4398f4806aae153888319c7e2be9)
+---
+ drivers/mtd/mtdpart.c          | 2 +-
+ include/linux/mtd/partitions.h | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+--- a/drivers/mtd/mtdpart.c
++++ b/drivers/mtd/mtdpart.c
+@@ -572,7 +572,7 @@ int add_mtd_partitions(struct mtd_info *
+ 	return 0;
+ }
+ 
+-int mtd_is_partition(struct mtd_info *mtd)
++int mtd_is_partition(const struct mtd_info *mtd)
+ {
+ 	struct mtd_part *part;
+ 	int ispart = 0;
+--- a/include/linux/mtd/partitions.h
++++ b/include/linux/mtd/partitions.h
+@@ -52,7 +52,7 @@ struct mtd_partition {
+ 
+ int add_mtd_partitions(struct mtd_info *, const struct mtd_partition *, int);
+ int del_mtd_partitions(struct mtd_info *);
+-int mtd_is_partition(struct mtd_info *mtd);
++int mtd_is_partition(const struct mtd_info *mtd);
+ int mtd_add_partition(struct mtd_info *master, char *name,
+ 		      long long offset, long long length);
+ int mtd_del_partition(struct mtd_info *master, int partno);

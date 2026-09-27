@@ -1,0 +1,69 @@
+From f78e57af9e4b90cd4634f5f72cf85b6372caea17 Mon Sep 17 00:00:00 2001
+From: Mike Dunn <mikedunn@newsguy.com>
+Date: Wed, 25 Apr 2012 12:06:08 -0700
+Subject: [PATCH] mtd: bitflip_threshold added to mtd_info and sysfs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+An element 'bitflip_threshold' is added to struct mtd_info, and also exposed as
+a read/write variable in sysfs.  This will be used to determine whether or not
+mtd_read() returns -EUCLEAN or 0 (absent a hard error).  If the driver leaves it
+as zero, mtd will set it to a default value of ecc_strength.
+
+This v2 adds the line that propagates bitflip_threshold from the master to the
+partitions - thanks Ivan¹.
+
+¹ http://lists.infradead.org/pipermail/linux-mtd/2012-April/040900.html
+
+Signed-off-by: Mike Dunn <mikedunn@newsguy.com>
+Signed-off-by: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit d062d4ede877fcd2ecc4c6262abad09a6f32950a)
+[U-Boot has no sysfs, so the bitflip_threshold attribute is left out.]
+---
+ drivers/mtd/mtdcore.c   | 4 ++++
+ drivers/mtd/mtdpart.c   | 2 ++
+ include/linux/mtd/mtd.h | 7 +++++++
+ 3 files changed, 13 insertions(+)
+
+--- a/drivers/mtd/mtdcore.c
++++ b/drivers/mtd/mtdcore.c
+@@ -19,6 +19,10 @@ int add_mtd_device(struct mtd_info *mtd)
+ 
+ 	BUG_ON(mtd->writesize == 0);
+ 
++	/* default value if not set by driver */
++	if (mtd->bitflip_threshold == 0)
++		mtd->bitflip_threshold = mtd->ecc_strength;
++
+ 	for (i = 0; i < MAX_MTD_DEVICES; i++)
+ 		if (!mtd_table[i]) {
+ 			mtd_table[i] = mtd;
+--- a/drivers/mtd/mtdpart.c
++++ b/drivers/mtd/mtdpart.c
+@@ -429,6 +429,8 @@ static struct mtd_part *allocate_partiti
+ 	}
+ 
+ 	slave->mtd.ecclayout = master->ecclayout;
++	slave->mtd.bitflip_threshold = master->bitflip_threshold;
++
+ 	if (master->block_isbad) {
+ 		uint64_t offs = 0;
+ 
+--- a/include/linux/mtd/mtd.h
++++ b/include/linux/mtd/mtd.h
+@@ -143,6 +143,13 @@ struct mtd_info {
+ 	/* max number of correctible bit errors per ecc step */
+ 	unsigned int ecc_strength;
+ 
++	/*
++	 * read ops return -EUCLEAN if max number of bitflips corrected on any
++	 * one region comprising an ecc step equals or exceeds this value.
++	 * Settable by driver, else defaults to ecc_strength.
++	 */
++	unsigned int bitflip_threshold;
++
+ 	/* Data for variable erase regions. If numeraseregions is zero,
+ 	 * it means that the whole device has erasesize as given above.
+ 	 */

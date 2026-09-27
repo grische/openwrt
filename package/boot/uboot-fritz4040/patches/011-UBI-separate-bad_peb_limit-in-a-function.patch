@@ -1,0 +1,91 @@
+From 7df81d6f1148b0ac8f176318909c0180e09a0843 Mon Sep 17 00:00:00 2001
+From: Richard Genoud <richard.genoud@gmail.com>
+Date: Fri, 17 Aug 2012 16:35:18 +0200
+Subject: [PATCH] UBI: separate bad_peb_limit in a function
+
+No functional changes here, just to prepare for next patch.
+
+Signed-off-by: Richard Genoud <richard.genoud@gmail.com>
+Signed-off-by: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+(cherry picked from commit 95e6fb027e041641baed441fcbd27c2f082c760e)
+---
+ drivers/mtd/ubi/build.c | 54 +++++++++++++++++++++++------------------
+ 1 file changed, 31 insertions(+), 23 deletions(-)
+
+--- a/drivers/mtd/ubi/build.c
++++ b/drivers/mtd/ubi/build.c
+@@ -523,6 +523,34 @@ out_si:
+ 	return err;
+ }
+ 
++static int get_bad_peb_limit(const struct ubi_device *ubi, int max_beb_per1024)
++{
++	int limit, device_pebs;
++	uint64_t device_size;
++
++	if (!max_beb_per1024)
++		return 0;
++
++	/*
++	 * Here we are using size of the entire flash chip and
++	 * not just the MTD partition size because the maximum
++	 * number of bad eraseblocks is a percentage of the
++	 * whole device and bad eraseblocks are not fairly
++	 * distributed over the flash chip. So the worst case
++	 * is that all the bad eraseblocks of the chip are in
++	 * the MTD partition we are attaching (ubi->mtd).
++	 */
++	device_size = mtd_get_device_size(ubi->mtd);
++	device_pebs = mtd_div_by_eb(device_size, ubi->mtd);
++	limit = mult_frac(device_pebs, max_beb_per1024, 1024);
++
++	/* Round it up */
++	if (mult_frac(limit, 1024, max_beb_per1024) < device_pebs)
++		limit += 1;
++
++	return limit;
++}
++
+ /**
+  * io_init - initialize I/O sub-system for a given UBI device.
+  * @ubi: UBI device description object
+@@ -540,6 +568,8 @@ out_si:
+  */
+ static int io_init(struct ubi_device *ubi)
+ {
++	const int max_beb_per1024 = CONFIG_MTD_UBI_BEB_LIMIT;
++
+ 	if (ubi->mtd->numeraseregions != 0) {
+ 		/*
+ 		 * Some flashes have several erase regions. Different regions
+@@ -568,29 +598,7 @@ static int io_init(struct ubi_device *ub
+ 
+ 	if (mtd_can_have_bb(ubi->mtd)) {
+ 		ubi->bad_allowed = 1;
+-		if (CONFIG_MTD_UBI_BEB_LIMIT > 0) {
+-			int per1024 = CONFIG_MTD_UBI_BEB_LIMIT;
+-			int limit, device_pebs;
+-			uint64_t device_size;
+-
+-			/*
+-			 * Here we are using size of the entire flash chip and
+-			 * not just the MTD partition size because the maximum
+-			 * number of bad eraseblocks is a percentage of the
+-			 * whole device and bad eraseblocks are not fairly
+-			 * distributed over the flash chip. So the worst case
+-			 * is that all the bad eraseblocks of the chip are in
+-			 * the MTD partition we are attaching (ubi->mtd).
+-			 */
+-			device_size = mtd_get_device_size(ubi->mtd);
+-			device_pebs = mtd_div_by_eb(device_size, ubi->mtd);
+-			limit = mult_frac(device_pebs, per1024, 1024);
+-
+-			/* Round it up */
+-			if (mult_frac(limit, 1024, per1024) < device_pebs)
+-				limit += 1;
+-			ubi->bad_peb_limit = limit;
+-		}
++		ubi->bad_peb_limit = get_bad_peb_limit(ubi, max_beb_per1024);
+ 	}
+ 
+ 	if (ubi->mtd->type == MTD_NORFLASH) {

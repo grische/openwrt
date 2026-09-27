@@ -1,0 +1,203 @@
+From f10cce3b0010e7daaa8bb93def8250d367abeaa2 Mon Sep 17 00:00:00 2001
+From: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+Date: Fri, 23 Dec 2011 17:30:16 +0200
+Subject: [PATCH] mtd: introduce mtd_read interface
+
+Signed-off-by: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit 329ad399a9b3adf52c90637b21ca029fcf7f8795)
+[Converted the mtd->read() users of this tree. The Linux-only users
+ (mtdchar, mtdblock, jffs2, ...) do not exist here.]
+---
+ common/cmd_onenand.c          | 2 +-
+ common/env_onenand.c          | 2 +-
+ drivers/mtd/mtdconcat.c       | 2 +-
+ drivers/mtd/nand/diskonchip.c | 4 ++--
+ drivers/mtd/nand/nand_bbt.c   | 6 +++---
+ drivers/mtd/ubi/debug.c       | 2 +-
+ drivers/mtd/ubi/io.c          | 4 ++--
+ fs/yaffs2/yaffs_mtdif.c       | 4 ++--
+ fs/yaffs2/yaffs_mtdif2.c      | 4 ++--
+ include/linux/mtd/mtd.h       | 6 ++++++
+ include/nand.h                | 2 +-
+ 11 files changed, 22 insertions(+), 16 deletions(-)
+
+--- a/common/cmd_onenand.c
++++ b/common/cmd_onenand.c
+@@ -282,7 +282,7 @@ static int onenand_block_test(u32 start,
+ 			goto next;
+ 		}
+ 
+-		ret = mtd->read(mtd, ofs, blocksize, &retlen, verify_buf);
++		ret = mtd_read(mtd, ofs, blocksize, &retlen, verify_buf);
+ 		if (ret) {
+ 			printk("Read failed 0x%x, %d\n", (u32)ofs, ret);
+ 			goto next;
+--- a/common/env_onenand.c
++++ b/common/env_onenand.c
+@@ -68,7 +68,7 @@ void env_relocate_spec(void)
+ 	/* Check OneNAND exist */
+ 	if (mtd->writesize)
+ 		/* Ignore read fail */
+-		mtd->read(mtd, env_addr, ONENAND_MAX_ENV_SIZE,
++		mtd_read(mtd, env_addr, ONENAND_MAX_ENV_SIZE,
+ 				&retlen, (u_char *)buf);
+ 	else
+ 		mtd->writesize = MAX_ONENAND_PAGESIZE;
+--- a/drivers/mtd/mtdconcat.c
++++ b/drivers/mtd/mtdconcat.c
+@@ -70,7 +70,7 @@ concat_read(struct mtd_info *mtd, loff_t
+ 			/* Entire transaction goes into this subdev */
+ 			size = len;
+ 
+-		err = subdev->read(subdev, from, size, &retsize, buf);
++		err = mtd_read(subdev, from, size, &retsize, buf);
+ 
+ 		/* Save information about bitflips! */
+ 		if (unlikely(err)) {
+--- a/drivers/mtd/nand/diskonchip.c
++++ b/drivers/mtd/nand/diskonchip.c
+@@ -1073,7 +1073,7 @@ static int __init find_media_headers(str
+ 	size_t retlen;
+ 
+ 	for (offs = 0; offs < mtd->size; offs += mtd->erasesize) {
+-		ret = mtd->read(mtd, offs, mtd->writesize, &retlen, buf);
++		ret = mtd_read(mtd, offs, mtd->writesize, &retlen, buf);
+ 		if (retlen != mtd->writesize)
+ 			continue;
+ 		if (ret) {
+@@ -1098,7 +1098,7 @@ static int __init find_media_headers(str
+ 	/* Only one mediaheader was found.  We want buf to contain a
+ 	   mediaheader on return, so we'll have to re-read the one we found. */
+ 	offs = doc->mh0_page << this->page_shift;
+-	ret = mtd->read(mtd, offs, mtd->writesize, &retlen, buf);
++	ret = mtd_read(mtd, offs, mtd->writesize, &retlen, buf);
+ 	if (retlen != mtd->writesize) {
+ 		/* Insanity.  Give up. */
+ 		printk(KERN_ERR "Read DiskOnChip Media Header once, but can't reread it???\n");
+--- a/drivers/mtd/nand/nand_bbt.c
++++ b/drivers/mtd/nand/nand_bbt.c
+@@ -236,7 +236,7 @@ static int read_bbt(struct mtd_info *mtd
+ 			from += marker_len;
+ 			marker_len = 0;
+ 		}
+-		res = mtd->read(mtd, from, len, &retlen, buf);
++		res = mtd_read(mtd, from, len, &retlen, buf);
+ 		if (res < 0) {
+ 			if (retlen != len) {
+ 				printk(KERN_INFO "nand_bbt: Error reading bad block table\n");
+@@ -326,7 +326,7 @@ static int scan_read_raw_data(struct mtd
+ 	if (td->options & NAND_BBT_VERSION)
+ 		len++;
+ 
+-	return mtd->read(mtd, offs, len, &retlen, buf);
++	return mtd_read(mtd, offs, len, &retlen, buf);
+ }
+ 
+ /*
+@@ -798,7 +798,7 @@ static int write_bbt(struct mtd_info *mt
+ 			/* Make it block aligned */
+ 			to &= ~((loff_t) ((1 << this->bbt_erase_shift) - 1));
+ 			len = 1 << this->bbt_erase_shift;
+-			res = mtd->read(mtd, to, len, &retlen, buf);
++			res = mtd_read(mtd, to, len, &retlen, buf);
+ 			if (res < 0) {
+ 				if (retlen != len) {
+ 					printk(KERN_INFO "nand_bbt: Error "
+--- a/drivers/mtd/ubi/debug.c
++++ b/drivers/mtd/ubi/debug.c
+@@ -206,7 +206,7 @@ void ubi_dbg_dump_flash(struct ubi_devic
+ 	buf = vmalloc(len);
+ 	if (!buf)
+ 		return;
+-	err = ubi->mtd->read(ubi->mtd, addr, len, &read, buf);
++	err = mtd_read(ubi->mtd, addr, len, &read, buf);
+ 	if (err && err != -EUCLEAN) {
+ 		ubi_err("error %d while reading %d bytes from PEB %d:%d, "
+ 			"read %zd bytes", err, len, pnum, offset, read);
+--- a/drivers/mtd/ubi/io.c
++++ b/drivers/mtd/ubi/io.c
+@@ -173,7 +173,7 @@ int ubi_io_read(const struct ubi_device
+ 
+ 	addr = (loff_t)pnum * ubi->peb_size + offset;
+ retry:
+-	err = ubi->mtd->read(ubi->mtd, addr, len, &read, buf);
++	err = mtd_read(ubi->mtd, addr, len, &read, buf);
+ 	if (err) {
+ 		const char *errstr = (err == -EBADMSG) ? " (ECC error)" : "";
+ 
+@@ -1354,7 +1354,7 @@ int ubi_dbg_check_all_ff(struct ubi_devi
+ 	loff_t addr = (loff_t)pnum * ubi->peb_size + offset;
+ 
+ 	mutex_lock(&ubi->dbg_buf_mutex);
+-	err = ubi->mtd->read(ubi->mtd, addr, len, &read, ubi->dbg_peb_buf);
++	err = mtd_read(ubi->mtd, addr, len, &read, ubi->dbg_peb_buf);
+ 	if (err && err != -EUCLEAN) {
+ 		ubi_err("error %d while reading %d bytes from PEB %d:%d, "
+ 			"read %u bytes", err, len, pnum, offset, (unsigned int)read);
+--- a/fs/yaffs2/yaffs_mtdif.c
++++ b/fs/yaffs2/yaffs_mtdif.c
+@@ -153,7 +153,7 @@ int nandmtd_ReadChunkFromNAND(yaffs_Devi
+ 	__u8 spareAsBytes[8]; /* OOB */
+ 
+ 	if (data && !spare)
+-		retval = mtd->read(mtd, addr, dev->nDataBytesPerChunk,
++		retval = mtd_read(mtd, addr, dev->nDataBytesPerChunk,
+ 				&dummy, data);
+ 	else if (spare) {
+ 		if (dev->useNANDECC) {
+@@ -193,7 +193,7 @@ int nandmtd_ReadChunkFromNAND(yaffs_Devi
+ 	} else {
+ 		if (data)
+ 			retval =
+-			    mtd->read(mtd, addr, dev->nDataBytesPerChunk, &dummy,
++			    mtd_read(mtd, addr, dev->nDataBytesPerChunk, &dummy,
+ 				      data);
+ 		if (spare)
+ 			retval =
+--- a/fs/yaffs2/yaffs_mtdif2.c
++++ b/fs/yaffs2/yaffs_mtdif2.c
+@@ -122,7 +122,7 @@ int nandmtd2_ReadChunkWithTagsFromNAND(y
+ 
+ #if (LINUX_VERSION_CODE > KERNEL_VERSION(2,6,17))
+ 	if (data && !tags)
+-		retval = mtd->read(mtd, addr, dev->nDataBytesPerChunk,
++		retval = mtd_read(mtd, addr, dev->nDataBytesPerChunk,
+ 				&dummy, data);
+ 	else if (tags) {
+ 		ops.mode = MTD_OOB_AUTO;
+@@ -149,7 +149,7 @@ int nandmtd2_ReadChunkWithTagsFromNAND(y
+ 	} else {
+ 		if (data)
+ 			retval =
+-			    mtd->read(mtd, addr, dev->nDataBytesPerChunk, &dummy,
++			    mtd_read(mtd, addr, dev->nDataBytesPerChunk, &dummy,
+ 				      data);
+ 		if (tags)
+ 			retval =
+--- a/include/linux/mtd/mtd.h
++++ b/include/linux/mtd/mtd.h
+@@ -236,6 +236,12 @@ struct mtd_info {
+ 	void (*put_device) (struct mtd_info *mtd);
+ };
+ 
++static inline int mtd_read(struct mtd_info *mtd, loff_t from, size_t len,
++			   size_t *retlen, u_char *buf)
++{
++	return mtd->read(mtd, from, len, retlen, buf);
++}
++
+ static inline int mtd_can_have_bb(const struct mtd_info *mtd)
+ {
+ 	return !!mtd->block_isbad;
+--- a/include/nand.h
++++ b/include/nand.h
+@@ -57,7 +57,7 @@ extern nand_info_t nand_info[];
+ 
+ static inline int nand_read(nand_info_t *info, loff_t ofs, size_t *len, u_char *buf)
+ {
+-	return info->read(info, ofs, *len, (size_t *)len, buf);
++	return mtd_read(info, ofs, *len, (size_t *)len, buf);
+ }
+ 
+ static inline int nand_write(nand_info_t *info, loff_t ofs, size_t *len, u_char *buf)

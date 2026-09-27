@@ -1,0 +1,44 @@
+From 7b90c06c2e5748241e85b152c3396ea5f5243a1a Mon Sep 17 00:00:00 2001
+From: Richard Genoud <richard.genoud@gmail.com>
+Date: Tue, 10 Jul 2012 18:23:40 +0200
+Subject: [PATCH] mtd: mtdparts: introduce mtd_get_device_size
+
+'mtd_get_device_size()' returns the size of the whole MTD device, that is the
+mtd_info master size. This will be used by UBI to calculate the maximum number
+of bad blocks (MBB) on a MTD device.
+
+Artem: amended the patch a bit.
+
+Signed-off-by: Richard Genoud <richard.genoud@gmail.com>
+Signed-off-by: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+(cherry picked from commit 62082e56cbb807cb325a8968f35dbd922432eb48)
+---
+ drivers/mtd/mtdpart.c          | 9 +++++++++
+ include/linux/mtd/partitions.h | 1 +
+ 2 files changed, 10 insertions(+)
+
+--- a/drivers/mtd/mtdpart.c
++++ b/drivers/mtd/mtdpart.c
+@@ -588,3 +588,12 @@ int mtd_is_partition(const struct mtd_in
+ 
+ 	return ispart;
+ }
++
++/* Returns the size of the entire flash chip */
++uint64_t mtd_get_device_size(const struct mtd_info *mtd)
++{
++	if (!mtd_is_partition(mtd))
++		return mtd->size;
++
++	return PART(mtd)->master->size;
++}
+--- a/include/linux/mtd/partitions.h
++++ b/include/linux/mtd/partitions.h
+@@ -56,6 +56,7 @@ int mtd_is_partition(const struct mtd_in
+ int mtd_add_partition(struct mtd_info *master, char *name,
+ 		      long long offset, long long length);
+ int mtd_del_partition(struct mtd_info *master, int partno);
++uint64_t mtd_get_device_size(const struct mtd_info *mtd);
+ 
+ #if 0
+ /*

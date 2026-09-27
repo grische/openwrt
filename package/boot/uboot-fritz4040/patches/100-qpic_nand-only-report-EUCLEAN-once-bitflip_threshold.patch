@@ -1,0 +1,129 @@
+From 26a1c639703eb274dcec258eff12ac365e9b9a43 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sun, 27 Sep 2026 16:08:26 +0200
+Subject: [PATCH] qpic_nand: only report -EUCLEAN once bitflip_threshold is
+ reached
+
+qpic_nand_read_oob() returns -EUCLEAN as soon as a single bit got
+corrected in any codeword. UBI treats that as "this PEB needs scrubbing"
+and copies the data to another PEB. If reading back the copy reports
+bitflips again, UBI tortures the target PEB and marks it bad when the
+freshly erased PEB does not read back cleanly.
+
+The tested FRITZ!Box 7520 v2 (Typ B) uses a Macronix MX30LF1G28AD,
+which requires 8-bit ECC and shows corrected bitflips now and then.
+Booting from NAND then scrubbed PEBs and marked a good one bad:
+
+  UBI: run torture test for PEB 324
+  UBI error: torture_peb: read problems on freshly erased PEB 324, must be bad
+  UBI error: erase_worker: failed to erase PEB 324, error -5
+  UBI: mark PEB 324 as bad
+  UBI: scrubbed PEB 263 (LEB 0:18), data moved to PEB 322
+
+Track the highest number of corrected bitflips of any codeword instead
+and only return -EUCLEAN once it reaches mtd->bitflip_threshold.
+Set ecc_strength and default the threshold to 3/4 of it, like the
+generic Linux NAND driver.
+
+This follows Linux commit 3f91e94f7f51 ("mtd: nand: read_page() returns
+max_bitflips") and commit ea3b2ea24ef0 ("mtd: nand: initialize
+bitflip_threshold prior to BBT scanning").
+
+The threshold is applied in the driver, as this tree does not have
+commit edbc4540e02c ("mtd: driver _read() returns max_bitflips;
+mtd_read() returns -EUCLEAN").
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ drivers/mtd/qpic_nand.c | 25 +++++++++++++++++--------
+ 1 file changed, 17 insertions(+), 8 deletions(-)
+
+--- a/drivers/mtd/qpic_nand.c
++++ b/drivers/mtd/qpic_nand.c
+@@ -1464,7 +1464,8 @@ static void qpic_nand_read_datcopy(struc
+ static int
+ qpic_nand_read_page(struct mtd_info *mtd, uint32_t page,
+ 		    enum nand_cfg_value cfg_mode,
+-		    struct mtd_oob_ops *ops)
++		    struct mtd_oob_ops *ops,
++		    unsigned int *max_bitflips)
+ {
+ 	struct qpic_nand_dev *dev = MTD_QPIC_NAND_DEV(mtd);
+ 	struct cfg_params params;
+@@ -1680,8 +1681,8 @@ qpic_nand_read_page(struct mtd_info *mtd
+ 	for (i = 0; i < (dev->cws_per_page); i++) {
+ 		num_errors = buffer_sts[i];
+ 		num_errors &= NUM_ERRORS_MASK;
+-		if(num_errors)
+-			mtd->ecc_stats.corrected++;
++		mtd->ecc_stats.corrected += num_errors;
++		*max_bitflips = max_t(unsigned int, *max_bitflips, num_errors);
+ 	}
+ qpic_nand_read_page_error:
+ return nand_ret;
+@@ -1690,13 +1691,13 @@ return nand_ret;
+ static int qpic_nand_read_oob(struct mtd_info *mtd, loff_t to,
+                                     struct mtd_oob_ops *ops)
+ {
++	unsigned int max_bitflips = 0;
+ 	unsigned i = 0, ret = 0;
+ 	struct qpic_nand_dev *dev = MTD_QPIC_NAND_DEV(mtd);
+ 	struct nand_chip *chip = MTD_NAND_CHIP(mtd);
+ 	uint32_t start_page;
+ 	uint32_t num_pages;
+ 	loff_t offs;
+-	uint32_t corrected;
+ 	enum nand_cfg_value cfg_mode;
+ 
+ 	/* We don't support MTD_OOB_PLACE as of yet. */
+@@ -1724,8 +1725,6 @@ static int qpic_nand_read_oob(struct mtd
+ 	start_page = ((to >> chip->page_shift));
+ 	num_pages = qpic_get_read_page_count(mtd, ops);
+ 
+-	corrected = mtd->ecc_stats.corrected;
+-
+ 	for (i = 0; i < num_pages; i++) {
+ 		struct mtd_oob_ops page_ops;
+ 		page_ops.mode = ops->mode;
+@@ -1737,7 +1736,7 @@ static int qpic_nand_read_oob(struct mtd
+ 		page_ops.oobretlen = 0;
+ 
+ 		ret = qpic_nand_read_page(mtd, start_page + i, cfg_mode,
+-					  &page_ops);
++					  &page_ops, &max_bitflips);
+ 		if (ret == NANDC_RESULT_BAD_PAGE) {
+ 			offs = (start_page + i) << chip->page_shift;
+ 			qpic_nand_mark_badblock(mtd, offs);
+@@ -1751,7 +1750,7 @@ static int qpic_nand_read_oob(struct mtd
+ 		qpic_nand_read_oobcopy(mtd, ops);
+ 	}
+ 
+-	if (mtd->ecc_stats.corrected != corrected) {
++	if (max_bitflips >= mtd->bitflip_threshold) {
+ 		ret = -EUCLEAN;
+ 		return ret;
+ 	}
+@@ -2112,6 +2111,8 @@ void
+ qpic_nand_mtd_params(struct mtd_info *mtd)
+ {
+ 	struct nand_chip *chip = MTD_NAND_CHIP(mtd);
++	struct qpic_nand_dev *dev = MTD_QPIC_NAND_DEV(mtd);
++
+ 	mtd->type = MTD_NANDFLASH;
+ 	mtd->flags = MTD_CAP_NANDFLASH;
+ 
+@@ -2130,6 +2131,14 @@ qpic_nand_mtd_params(struct mtd_info *mt
+ 
+ 	mtd->ecclayout = NULL;
+ 
++	mtd->ecc_strength = (dev->ecc_width & NAND_WITH_8_BIT_ECC) ? 8 : 4;
++	/*
++	 * Set the bitflip_threshold to 3/4th of the ECC strength, like the
++	 * generic NAND layer does, unless the driver sets it.
++	 */
++	if (!mtd->bitflip_threshold)
++		mtd->bitflip_threshold = DIV_ROUND_UP(mtd->ecc_strength * 3, 4);
++
+ 	chip->page_shift = ffs(mtd->writesize) - 1;
+ 	chip->phys_erase_shift = ffs(mtd->erasesize) - 1;
+ 

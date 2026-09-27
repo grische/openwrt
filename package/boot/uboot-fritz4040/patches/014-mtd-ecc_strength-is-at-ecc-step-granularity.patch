@@ -1,0 +1,37 @@
+From 884bd58caa4c050bd6554498d50023d3adddc166 Mon Sep 17 00:00:00 2001
+From: Mike Dunn <mikedunn@newsguy.com>
+Date: Wed, 25 Apr 2012 12:06:05 -0700
+Subject: [PATCH] mtd: ecc_strength is at ecc step granularity
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ecc_strength element of mtd_info will be the strength of one ecc step, not of
+the entire writesize, as was previously planned.  This is the appropriate way
+because, as was pointed out¹, bit errors in excess of the strength of one
+step can cause a hard error if they all occur within the same ecc region.
+
+¹ http://lists.infradead.org/pipermail/linux-mtd/2012-March/040313.html
+
+Signed-off-by: Mike Dunn <mikedunn@newsguy.com>
+Signed-off-by: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit 86c2072be6f3c2150cc35f00233f2c31bdba2745)
+[nand_scan_tail() does not propagate chip->ecc.strength in this tree,
+ as commit 6a918bade9da ("mtd: flash drivers set ecc strength") is not
+ backported, and the other drivers do not exist here.]
+---
+ include/linux/mtd/mtd.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/include/linux/mtd/mtd.h
++++ b/include/linux/mtd/mtd.h
+@@ -140,7 +140,7 @@ struct mtd_info {
+ 	/* ecc layout structure pointer - read only ! */
+ 	struct nand_ecclayout *ecclayout;
+ 
+-	/* max number of correctible bit errors per writesize */
++	/* max number of correctible bit errors per ecc step */
+ 	unsigned int ecc_strength;
+ 
+ 	/* Data for variable erase regions. If numeraseregions is zero,

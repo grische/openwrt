@@ -1,0 +1,76 @@
+From 1ffaeca822bc93677d2161e487c4783f5dcf4fa1 Mon Sep 17 00:00:00 2001
+From: Shmulik Ladkani <shmulik.ladkani@gmail.com>
+Date: Wed, 4 Jul 2012 11:06:00 +0300
+Subject: [PATCH] UBI: introduce new bad PEB limit
+
+Introduce 'ubi->bad_peb_limit', which specifies an upper limit of PEBs
+UBI expects to go bad.  Currently, it is initialized to a fixed percentage
+of total PEBs in the UBI device (configurable via CONFIG_MTD_UBI_BEB_LIMIT).
+
+The 'bad_peb_limit' is intended to be used for calculating the amount of PEBs
+UBI needs to reserve for bad eraseblock handling.
+
+Artem: minor amendments.
+
+Signed-off-by: Shmulik Ladkani <shmulik.ladkani@gmail.com>
+Signed-off-by: Artem Bityutskiy <Artem.Bityutskiy@linux.intel.com>
+(cherry picked from commit 8beeb3bb9df8caba36ad3e4f226255dff9c92556)
+[U-Boot configures UBI in include/ubi_uboot.h instead of Kconfig.]
+---
+ drivers/mtd/ubi/build.c | 12 +++++++++++-
+ drivers/mtd/ubi/ubi.h   |  2 ++
+ include/ubi_uboot.h     |  3 +++
+ 3 files changed, 16 insertions(+), 1 deletion(-)
+
+--- a/drivers/mtd/ubi/build.c
++++ b/drivers/mtd/ubi/build.c
+@@ -565,8 +565,18 @@ static int io_init(struct ubi_device *ub
+ 	ubi->peb_count  = mtd_div_by_eb(ubi->mtd->size, ubi->mtd);
+ 	ubi->flash_size = ubi->mtd->size;
+ 
+-	if (mtd_can_have_bb(ubi->mtd))
++	if (mtd_can_have_bb(ubi->mtd)) {
+ 		ubi->bad_allowed = 1;
++		if (CONFIG_MTD_UBI_BEB_LIMIT > 0) {
++			int percent = CONFIG_MTD_UBI_BEB_LIMIT;
++			int limit = mult_frac(ubi->peb_count, percent, 100);
++
++			/* Round it up */
++			if (mult_frac(limit, 100, percent) < ubi->peb_count)
++				limit += 1;
++			ubi->bad_peb_limit = limit;
++		}
++	}
+ 
+ 	if (ubi->mtd->type == MTD_NORFLASH) {
+ 		ubi_assert(ubi->mtd->writesize == 1);
+--- a/drivers/mtd/ubi/ubi.h
++++ b/drivers/mtd/ubi/ubi.h
+@@ -382,6 +382,7 @@ struct ubi_wl_entry;
+  * @flash_size: underlying MTD device size (in bytes)
+  * @peb_count: count of physical eraseblocks on the MTD device
+  * @peb_size: physical eraseblock size
++ * @bad_peb_limit: top limit of expected bad physical eraseblocks
+  * @bad_peb_count: count of bad physical eraseblocks
+  * @good_peb_count: count of good physical eraseblocks
+  * @corr_peb_count: count of corrupted physical eraseblocks (preserved and not
+@@ -428,6 +429,7 @@ struct ubi_device {
+ 	int avail_pebs;
+ 	int beb_rsvd_pebs;
+ 	int beb_rsvd_level;
++	int bad_peb_limit;
+ 
+ 	int autoresize_vol_id;
+ 	int vtbl_slots;
+--- a/include/ubi_uboot.h
++++ b/include/ubi_uboot.h
+@@ -41,6 +41,9 @@ do {									\
+ /* configurable */
+ #define CONFIG_MTD_UBI_WL_THRESHOLD	4096
+ #define CONFIG_MTD_UBI_BEB_RESERVE	1
++#ifndef CONFIG_MTD_UBI_BEB_LIMIT
++#define CONFIG_MTD_UBI_BEB_LIMIT	2
++#endif
+ #define UBI_IO_DEBUG			0
+ 
+ /* debug options (Linux: drivers/mtd/ubi/Kconfig.debug) */

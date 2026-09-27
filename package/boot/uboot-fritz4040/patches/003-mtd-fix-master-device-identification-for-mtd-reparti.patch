@@ -1,0 +1,57 @@
+From 5415fabf9851d8b437e7c00f6110028bbf4bc638 Mon Sep 17 00:00:00 2001
+From: Roman Tereshonkov <roman.tereshonkov@nokia.com>
+Date: Tue, 23 Nov 2010 14:17:17 +0200
+Subject: [PATCH] mtd: fix master device identification for mtd repartition
+
+Function mtd_has_master renamed as mtd_is_partition to follow the function logic.
+The patch fixes the problem of checking the right mtd device for partition creation.
+To delete partition checking is not needed here so as it is done in mtd_del_partition.
+By master we consider the mtd device which does not belong to any partition.
+
+Signed-off-by: Roman Tereshonkov <roman.tereshonkov@nokia.com>
+Signed-off-by: Artem Bityutskiy <Artem.Bityutskiy@nokia.com>
+Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit a7e93dcd9aacb3ef4acfcc4310577f3ae0741821)
+[There is no mtdchar ioctl in U-Boot.]
+---
+ drivers/mtd/mtdpart.c          | 8 ++++----
+ include/linux/mtd/partitions.h | 2 +-
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+--- a/drivers/mtd/mtdpart.c
++++ b/drivers/mtd/mtdpart.c
+@@ -572,19 +572,19 @@ int add_mtd_partitions(struct mtd_info *
+ 	return 0;
+ }
+ 
+-int mtd_is_master(struct mtd_info *mtd)
++int mtd_is_partition(struct mtd_info *mtd)
+ {
+ 	struct mtd_part *part;
+-	int nopart = 0;
++	int ispart = 0;
+ 
+ 	if (mtd_partitions.next == NULL)
+ 		return 0;
+ 
+ 	list_for_each_entry(part, &mtd_partitions, list)
+ 		if (&part->mtd == mtd) {
+-			nopart = 1;
++			ispart = 1;
+ 			break;
+ 		}
+ 
+-	return nopart;
++	return ispart;
+ }
+--- a/include/linux/mtd/partitions.h
++++ b/include/linux/mtd/partitions.h
+@@ -52,7 +52,7 @@ struct mtd_partition {
+ 
+ int add_mtd_partitions(struct mtd_info *, const struct mtd_partition *, int);
+ int del_mtd_partitions(struct mtd_info *);
+-int mtd_is_master(struct mtd_info *mtd);
++int mtd_is_partition(struct mtd_info *mtd);
+ int mtd_add_partition(struct mtd_info *master, char *name,
+ 		      long long offset, long long length);
+ int mtd_del_partition(struct mtd_info *master, int partno);
