@@ -13,6 +13,8 @@ on:
       - '.github/workflows/tools.yml'
     branches-ignore:
       - master
+      # Built by xrx500.yml instead.
+      - intel-mips-xrx500-ci
 
 permissions:
   contents: read
