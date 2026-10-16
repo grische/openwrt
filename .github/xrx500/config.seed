@@ -1,0 +1,43 @@
+CONFIG_TARGET_intel_mips=y
+CONFIG_TARGET_intel_mips_xrx500=y
+CONFIG_TARGET_MULTI_PROFILE=y
+CONFIG_TARGET_ALL_PROFILES=y
+# Named as well, so that the seed check fails if a board ever stops being built.
+CONFIG_TARGET_DEVICE_intel_mips_xrx500_DEVICE_avm_fritz7560=y
+CONFIG_TARGET_DEVICE_intel_mips_xrx500_DEVICE_avm_fritz7580=y
+CONFIG_TARGET_DEVICE_intel_mips_xrx500_DEVICE_avm_fritz7590=y
+CONFIG_TARGET_DEVICE_intel_mips_xrx500_DEVICE_avm_fritz7590ax=y
+CONFIG_TARGET_DEVICE_intel_mips_xrx500_DEVICE_avm_fritz7590ax-v2=y
+CONFIG_TARGET_PER_DEVICE_ROOTFS=y
+CONFIG_TARGET_ROOTFS_INITRAMFS=y
+# The rootfs tarball of each board tells pick-packages.py which packages the
+# images hold.
+CONFIG_TARGET_ROOTFS_TARGZ=y
+# Every kernel module and every target-specific package. The shared packages
+# are built by the SDK shards.
+CONFIG_ALL_KMODS=y
+CONFIG_ALL_NONSHARED=y
+# A shared package that the shards cannot select, because it needs a hidden
+# kernel module of mt76.
+CONFIG_PACKAGE_mt76-test=m
+CONFIG_SDK=y
+CONFIG_IB=y
+# Without this the ImageBuilder bundles only the packages of this job and has
+# no remote repositories, so nothing from the feeds could be added.
+# CONFIG_IB_STANDALONE is not set
+CONFIG_JSON_OVERVIEW_IMAGE_INFO=y
+CONFIG_SIGNED_PACKAGES=y
+CONFIG_DEVEL=y
+CONFIG_KERNEL_BUILD_USER="builder"
+CONFIG_KERNEL_BUILD_DOMAIN="buildhost"
+# The eBPF packages compile with the runner's clang. Building LLVM here instead
+# would cost hours of the 6 hour job limit. The SDK inherits this choice.
+CONFIG_BPF_TOOLCHAIN_HOST=y
+# VERSION_REPO is only honoured with both of these set. configure-target.sh
+# appends it, together with the host LLVM path.
+CONFIG_IMAGEOPT=y
+CONFIG_VERSIONOPT=y
+# VERSIONOPT turns on version and revision file names. Plain names, as on
+# downloads.openwrt.org, let each run replace the previous one in place.
+# CONFIG_VERSION_FILENAMES is not set
+# CONFIG_VERSION_CODE_FILENAMES is not set

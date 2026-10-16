@@ -1,0 +1,354 @@
+# Builds everything needed to run OpenWrt on the Intel MIPS xRX500 boards
+# (AVM FRITZ!Box 7560, 7580, 7590, 7590 AX and 7590 AX v2) and to install
+# packages on them.
+# .github/xrx500/README.md describes the repository settings and the output.
+
+name: xRX500 release build
+
+on:
+  push:
+    branches:
+      - intel-mips-xrx500-ci
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  XRX500_CI: ${{ github.workspace }}/ci/.github/xrx500
+  BOARD: intel-mips/xrx500
+
+jobs:
+  target:
+    name: Images, kernel modules, SDK and ImageBuilder
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      XRX500_REPO_URL: ${{ vars.XRX500_REPO_URL }}
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      revision: ${{ steps.revision.outputs.revision }}
+
+    steps:
+      - name: Check out the CI scripts
+        uses: actions/checkout@v7
+        with:
+          path: ci
+          sparse-checkout: .github/xrx500
+          persist-credentials: false
+
+      - name: Check the repository settings
+        env:
+          XRX500_APK_KEY: ${{ secrets.XRX500_APK_KEY }}
+        run: |
+          case "$XRX500_REPO_URL" in
+          https://?*|http://?*) ;;
+          *)
+            echo "::error::Set the XRX500_REPO_URL repository variable to the URL the download tree will be served from. See .github/xrx500/README.md."
+            exit 1
+            ;;
+          esac
+          "$XRX500_CI/scripts/setup-key.sh" "$RUNNER_TEMP/key-check"
+          rm -r "$RUNNER_TEMP/key-check"
+
+      - name: Prepare the runner
+        run: '"$XRX500_CI/scripts/prepare-runner.sh" "$GITHUB_WORKSPACE/openwrt"'
+
+      # Full history, because scripts/getver.sh derives the revision from it.
+      - name: Check out OpenWrt
+        uses: actions/checkout@v7
+        with:
+          path: openwrt
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Install the signing key
+        env:
+          XRX500_APK_KEY: ${{ secrets.XRX500_APK_KEY }}
+        run: '"$XRX500_CI/scripts/setup-key.sh" openwrt'
+
+      - name: Update and install the feeds
+        working-directory: openwrt
+        run: |
+          cp "$XRX500_CI/feeds.conf" feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure
+        run: '"$XRX500_CI/scripts/configure-target.sh" openwrt "$XRX500_REPO_URL"'
+
+      - name: Plan the package shards
+        id: plan
+        env:
+          XRX500_SHARDS: ${{ vars.XRX500_SHARDS || '20' }}
+        run: |
+          weights=()
+          if [ -f "$XRX500_CI/weights.tsv" ]; then
+            weights=(--weights "$XRX500_CI/weights.tsv")
+          fi
+          "$XRX500_CI/scripts/plan-shards.py" --shards "$XRX500_SHARDS" "${weights[@]}" \
+            --config "$XRX500_CI/shard.config" openwrt/tmp/.packageinfo plan
+          echo "matrix=$(cat plan/matrix.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Package shards'
+            echo '```'
+            cat plan/plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the shard plan
+        uses: actions/upload-artifact@v7
+        with:
+          name: plan
+          path: plan
+          retention-days: 3
+
+      - name: Download the sources
+        working-directory: openwrt
+        run: make -j16 download IGNORE_ERRORS='n m' || make -j1 download IGNORE_ERRORS='n m' V=s
+
+      - name: Build the host tools
+        working-directory: openwrt
+        run: make -j$(($(nproc) + 1)) BUILD_LOG=1 tools/install
+
+      - name: Build the toolchain
+        working-directory: openwrt
+        run: make -j$(($(nproc) + 1)) BUILD_LOG=1 toolchain/install
+
+      # Kernel modules and other non-default packages may fail without failing
+      # the run, as on the upstream build bots. They are listed below.
+      - name: Build the kernel, packages and images
+        working-directory: openwrt
+        run: make -j$(($(nproc) + 1)) BUILD_LOG=1 IGNORE_ERRORS='n m'
+
+      # The list lands at the top of the target artifact, outside the trees that
+      # assemble publishes, and goes into its build report.
+      - name: Report failed packages
+        if: ${{ !cancelled() }}
+        run: '"$XRX500_CI/scripts/report-errors.sh" openwrt openwrt/bin/failed.txt'
+
+      - name: Check the images
+        run: '"$XRX500_CI/scripts/check-images.sh" "openwrt/bin/targets/$BOARD"'
+
+      - name: Read the revision
+        id: revision
+        run: echo "revision=$(cat "openwrt/bin/targets/$BOARD/version.buildinfo")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the target build
+        uses: actions/upload-artifact@v7
+        with:
+          name: target
+          path: |
+            openwrt/bin
+            !openwrt/bin/targets/${{ env.BOARD }}/openwrt-sdk-*
+          compression-level: 1
+          retention-days: 3
+
+      # upload-artifact keeps the directories after the first wildcard, so the
+      # only wildcard is in the file name and the tarball lands at the root.
+      - name: Upload the SDK
+        uses: actions/upload-artifact@v7
+        with:
+          name: sdk
+          path: openwrt/bin/targets/${{ env.BOARD }}/openwrt-sdk-*.tar.zst
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload the build logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-target
+          path: openwrt/logs
+          retention-days: 7
+          if-no-files-found: ignore
+
+  packages:
+    name: Packages ${{ matrix.name }}
+    needs: target
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.target.outputs.matrix) }}
+
+    steps:
+      - name: Check out the CI scripts
+        uses: actions/checkout@v7
+        with:
+          path: ci
+          sparse-checkout: .github/xrx500
+          persist-credentials: false
+
+      - name: Prepare the runner
+        run: '"$XRX500_CI/scripts/prepare-runner.sh" "$GITHUB_WORKSPACE/build"'
+
+      # package/ of this commit is the SDK's base feed. It sits inside the
+      # SDK, because some packages find their own files through their path
+      # relative to the SDK.
+      - name: Check out OpenWrt
+        uses: actions/checkout@v7
+        with:
+          path: build/sdk/openwrt
+          persist-credentials: false
+
+      - name: Download the SDK
+        uses: actions/download-artifact@v8
+        with:
+          name: sdk
+          path: build/sdk-tarball
+
+      - name: Download the shard plan
+        uses: actions/download-artifact@v8
+        with:
+          name: plan
+          path: plan
+
+      - name: Unpack the SDK
+        run: |
+          mkdir -p build/sdk
+          tar -I zstd -xf build/sdk-tarball/*.tar.zst -C build/sdk --strip-components=1
+          rm -r build/sdk-tarball
+
+      # The script stops make after its budget so the packages built so far
+      # are uploaded before the 6 hour job limit.
+      - name: Build the packages
+        env:
+          SHARD_BUDGET_MINUTES: 300
+        run: '"$XRX500_CI/scripts/build-shard.sh" build/sdk build/sdk/openwrt "plan/shard-${{ matrix.shard }}.packages" out'
+
+      - name: Report failed packages
+        if: ${{ !cancelled() }}
+        run: '"$XRX500_CI/scripts/report-errors.sh" build/sdk'
+
+      - name: Upload the packages
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: shard-${{ matrix.shard }}
+          path: out
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: warn
+
+  assemble:
+    name: Sign and assemble the download tree
+    needs: [target, packages]
+    if: ${{ !cancelled() && needs.target.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      ARTIFACT: openwrt-${{ needs.target.outputs.revision }}-intel-mips-xrx500
+
+    steps:
+      - name: Check out the CI scripts
+        uses: actions/checkout@v7
+        with:
+          path: ci
+          sparse-checkout: .github/xrx500
+          persist-credentials: false
+
+      - name: Prepare the runner
+        run: '"$XRX500_CI/scripts/prepare-runner.sh" "$GITHUB_WORKSPACE/work"'
+
+      - name: Download the target build
+        uses: actions/download-artifact@v8
+        with:
+          name: target
+          path: work/in/target
+
+      - name: Download the SDK
+        uses: actions/download-artifact@v8
+        with:
+          name: sdk
+          path: work/in/sdk-tarball
+
+      - name: Download the shard plan
+        uses: actions/download-artifact@v8
+        with:
+          name: plan
+          path: work/in/plan
+
+      - name: Download the packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: shard-*
+          path: work/in/shards
+
+      - name: Unpack the SDK
+        run: |
+          mkdir work/in/sdk
+          tar -I zstd -xf work/in/sdk-tarball/*.tar.zst -C work/in/sdk --strip-components=1
+
+      - name: Install the signing key
+        env:
+          XRX500_APK_KEY: ${{ secrets.XRX500_APK_KEY }}
+        run: '"$XRX500_CI/scripts/setup-key.sh" work/in/keys'
+
+      - name: Assemble, index and sign
+        run: '"$XRX500_CI/scripts/assemble.sh" work/in work/out'
+
+      - name: Summarise
+        working-directory: work/out
+        run: |
+          count() { find "$1" -maxdepth 1 -name '*.apk' | wc -l; }
+          {
+            echo "### $ARTIFACT"
+            echo
+            echo '| Feed | Packages |'
+            echo '| --- | ---: |'
+            echo "| targets/$BOARD/packages | $(count "targets-root/targets/$BOARD/packages") |"
+            for d in packages-root/packages/*/*/; do
+              echo "| ${d#packages-root/} | $(count "$d") |"
+            done
+            echo
+            if [ -s report/failed.txt ]; then
+              echo "<details><summary>$(wc -l < report/failed.txt) failed package builds</summary>"
+              echo
+              echo '```'
+              cat report/failed.txt
+              echo '```'
+              echo '</details>'
+            else
+              echo 'No package failed to build.'
+            fi
+            echo
+            echo 'Images and feeds trust this public key.'
+            echo '```'
+            cat report/public-key.pem
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the targets tree
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT }}-targets
+          path: work/out/targets-root
+          compression-level: 0
+
+      - name: Upload the packages tree
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT }}-packages
+          path: work/out/packages-root
+          compression-level: 0
+
+      - name: Upload the build report
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT }}-report
+          path: work/out/report
+
+      # After the uploads, so a failure here still leaves the artifacts.
+      - name: Build images with the ImageBuilder
+        env:
+          XRX500_REPO_URL: ${{ vars.XRX500_REPO_URL }}
+        run: |
+          "$XRX500_CI/scripts/ib-smoke.sh" \
+            work/out/targets-root/targets/"$BOARD"/openwrt-imagebuilder-*.tar.zst \
+            "$XRX500_REPO_URL" work/out
