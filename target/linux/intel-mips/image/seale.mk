@@ -28,15 +28,6 @@ define Device/avm_fritz7560
   DEVICE_VENDOR := AVM
   DEVICE_MODEL := FRITZ!Box 7560
   SOC := xrx500
-  # Not for a build-plumbing reason any more. That reason was an out-of-tree
-  # bootcore blob, fetched from a repository the buildbots cannot reach and
-  # packed as a second kernel record; the single-kernel chain below drops the
-  # record entirely, so this device no longer depends on anything fetched from
-  # outside the tree and a buildbot could now build it. Kept n deliberately
-  # rather than by inheritance: the board is still hardware-gated and this
-  # target is not upstream. Flipping it is a decision about release readiness,
-  # not a leftover.
-  DEFAULT := n
   # Explicit DEVICE_DTS override. The Device/Default block in image/Makefile
   # sets DEVICE_DTS = $$(SOC)_$(1) which would auto-resolve to
   # xrx500_avm_fritz7560, but the board DTS lives at
@@ -240,9 +231,6 @@ define Device/avm_fritz7590
   $(Device/NAND)
   DEVICE_MODEL := FRITZ!Box 7590
   SOC := xrx500
-  # n for the same reason as the 7560 above, and for no build-plumbing reason
-  # either: hardware-gated board, target not upstream.
-  DEFAULT := n
   # Bare name, for the reasons spelled out on the 7560; the intel-mips/ subdir
   # comes from DTS_DIR in ../Makefile.
   DEVICE_DTS := seale_avm_fritz7590
@@ -353,9 +341,6 @@ define Device/avm_fritz7580
   $(Device/NAND)
   DEVICE_MODEL := FRITZ!Box 7580
   SOC := xrx500
-  # n for the same reason as the two boards above: hardware-gated, target not
-  # upstream. Nothing here needs fetching from outside the tree.
-  DEFAULT := n
   # Bare name, for the reasons spelled out on the 7560; the intel-mips/ subdir
   # comes from DTS_DIR in ../Makefile.
   DEVICE_DTS := seale_avm_fritz7580
@@ -427,8 +412,6 @@ define Device/avm_fritz7590ax-common
   $(Device/NAND)
   DEVICE_MODEL := FRITZ!Box 7590 AX
   SOC := xrx500
-  # n for the same reason as the three boards above.
-  DEFAULT := n
   # The 7590's chain, restated for the reasons given there.
   KERNEL := kernel-bin | append-dtb | append-sacrificial-dtb | avm-preamble | eva-single-kernel
   KERNEL_INITRAMFS := kernel-bin | append-dtb | append-sacrificial-dtb | avm-preamble | eva-single-kernel
