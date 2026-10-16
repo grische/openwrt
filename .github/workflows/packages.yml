@@ -19,6 +19,8 @@ on:
       - 'toolchain/**'
     branches-ignore:
       - master
+      # Built by xrx500.yml instead.
+      - intel-mips-xrx500-ci
   workflow_dispatch:
 
 permissions:
