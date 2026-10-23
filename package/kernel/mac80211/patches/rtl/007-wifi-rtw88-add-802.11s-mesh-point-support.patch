@@ -1,0 +1,260 @@
+From: Grische <github@grische.xyz>
+Date: Fri, 23 Oct 2026 16:00:28 +0200
+Subject: [PATCH] wifi: rtw88: add 802.11s mesh point support
+
+Commit 2ccb8e6ce8a4 ("wifi: rtw88: remove unsupported interface type
+of mesh point") removed the mesh point interface type from rtw88. The
+mesh code had never been made to work. Parts of the mesh setup are still
+in place. A mesh interface gets the AP net type, the beacon function and
+a beacon in the reserved page, just like an AP interface. Several pieces
+are missing.
+
+mac80211 does not call start_ap and stop_ap for a mesh interface. It
+only enables and disables the beacon. The driver therefore never sets
+ap_active for mesh, never widens the ATIM window and never runs the
+calibration. The reserved page code also gathers the beacon of a mesh
+interface before it joins a mesh. mac80211 has no beacon for it at that
+point, so the reserved page download fails.
+
+Only port 0 sends beacons. The driver moves an AP interface to port 0,
+but it leaves a mesh interface on the port it got.
+
+A mesh peer puts its own address into the BSSID field of its beacons.
+The driver sets BIT_CBSSID_BCN after every scan. The hardware then drops
+the beacons of the peers. mac80211 needs them to discover peers and to
+learn their capabilities. mac80211 sets FIF_OTHER_BSS while a mesh
+interface is up. The Realtek vendor driver
+clears the BSSID check while a mesh interface is up as well.
+
+The RX path updates the RSSI of a station only for frames that carry
+the BSSID of the interface. A mesh interface has no BSSID, so the RSSI
+of every peer stays at zero. The firmware rate adaptation and DIG work
+with that value.
+
+The security CAM finds group keys only by their key index. Each mesh
+peer protects its group frames with its own group key. mac80211 already
+handles these peer keys in software, because rtw88 does not support per
+station group keys. The group key of the local interface would still
+sit in the CAM, and the hardware would apply it to the group frames of
+the peers.
+
+Advertise NL80211_IFTYPE_MESH_POINT. In the 8822C interface combination
+allow a mesh interface in place of the AP interface, so one station and
+one AP or mesh interface can run together. Guard that entry with
+CONFIG_MAC80211_MESH, because mac80211 removes the mesh type when mesh
+support is not built. Run the AP start and stop code when mac80211
+enables or disables the beacon of a mesh interface. Treat a mesh
+interface like an AP interface for the port switch and the reserved
+page. Keep the BSSID check off while FIF_OTHER_BSS is set. Do not turn
+it back on at the end of a hardware scan in that case. Match mesh peers
+by address when updating the RSSI. Use software crypto for all keys of a
+mesh interface.
+
+This makes 802.11s mesh point available on rtw88. A mesh interface and
+an AP interface on the same radio are still not possible. The driver
+keeps a single beacon in the reserved page and beacons only on port 0.
+Chips other than the 8822C have no interface combination, so they get
+mesh as their only interface. They were not tested.
+
+Tested on a NanoPi R2S Plus with an RTL8822CS on SDIO at 50 MHz, in an
+open mesh with an ath10k peer on channel 36 at 80 MHz. Peering reaches
+ESTAB on both sides, also after the peer entry is deleted and after
+scans. Ping takes 4 to 7 ms. iperf3 reaches about 60 Mbit/s towards the
+board and 31 Mbit/s from it, the same split as in station mode on this
+board. Floods of 50 and 200 broadcast frames per second and a 10 minute
+soak caused no TX page shortage, no reserved page or beacon download
+failure and no lost peering. batman-adv with BATMAN_V runs over the mesh
+interface. AP and station mode perform as without this patch.
+
+The analysis and the first draft of this patch and its changelog were
+produced in Claude Code sessions with the Claude model claude-opus-5-5.
+The same sessions ran the hardware tests. The author reviewed the
+change and the results.
+
+Signed-off-by: Grische <github@grische.xyz>
+---
+ drivers/net/wireless/realtek/rtw88/fw.c       | 11 +++-
+ drivers/net/wireless/realtek/rtw88/mac80211.c | 58 +++++++++++++++----
+ drivers/net/wireless/realtek/rtw88/main.c     | 12 +++-
+ drivers/net/wireless/realtek/rtw88/rx.c       |  4 +-
+ 4 files changed, 67 insertions(+), 18 deletions(-)
+
+--- a/drivers/net/wireless/realtek/rtw88/fw.c
++++ b/drivers/net/wireless/realtek/rtw88/fw.c
+@@ -1576,8 +1576,9 @@ static void rtw_build_rsvd_page_iter(voi
+ 	struct rtw_vif *rtwvif = (struct rtw_vif *)vif->drv_priv;
+ 	struct rtw_rsvd_page *rsvd_pkt;
+ 
+-	/* AP not yet started, don't gather its rsvd pages */
+-	if (vif->type == NL80211_IFTYPE_AP && !rtwdev->ap_active)
++	/* AP or mesh not yet started, don't gather its rsvd pages */
++	if ((vif->type == NL80211_IFTYPE_AP ||
++	     vif->type == NL80211_IFTYPE_MESH_POINT) && !rtwdev->ap_active)
+ 		return;
+ 
+ 	list_for_each_entry(rsvd_pkt, &rtwvif->rsvd_page_list, vif_list) {
+@@ -2278,7 +2279,11 @@ void rtw_hw_scan_complete(struct rtw_dev
+ 	if (!vif)
+ 		return;
+ 
+-	rtwdev->hal.rcr |= BIT_CBSSID_BCN;
++	/* BIT_AAP is set while mac80211 asks for FIF_OTHER_BSS, which
++	 * a mesh interface does to receive the beacons of its peers.
++	 */
++	if (!(rtwdev->hal.rcr & BIT_AAP))
++		rtwdev->hal.rcr |= BIT_CBSSID_BCN;
+ 	rtw_write32(rtwdev, REG_RCR, rtwdev->hal.rcr);
+ 
+ 	rtw_core_scan_complete(rtwdev, vif, true);
+--- a/drivers/net/wireless/realtek/rtw88/mac80211.c
++++ b/drivers/net/wireless/realtek/rtw88/mac80211.c
+@@ -311,6 +311,11 @@ static void rtw_ops_configure_filter(str
+ 		else
+ 			rtwdev->hal.rcr |= BIT_CBSSID_BCN;
+ 	}
++	/* mac80211 sets FIF_OTHER_BSS for mesh. Mesh peers put their own
++	 * address into the BSSID field, so do not filter by BSSID.
++	 */
++	if (*new_flags & FIF_OTHER_BSS)
++		rtwdev->hal.rcr &= ~(BIT_CBSSID_BCN | BIT_CBSSID_DATA);
+ 
+ 	rtw_dbg(rtwdev, RTW_DBG_RX,
+ 		"config rx filter, changed=0x%08x, new=0x%08x, rcr=0x%08x\n",
+@@ -369,6 +374,26 @@ static void rtw_conf_tx(struct rtw_dev *
+ 		__rtw_conf_tx(rtwdev, rtwvif, ac);
+ }
+ 
++static void __rtw_start_ap(struct rtw_dev *rtwdev)
++{
++	const struct rtw_chip_info *chip = rtwdev->chip;
++
++	rtw_write32_set(rtwdev, REG_TCR, BIT_TCR_UPDATE_HGQMD);
++	rtw_write16(rtwdev, REG_ATIMWND, ATIMWND_AP);
++	rtwdev->ap_active = true;
++	rtw_store_op_chan(rtwdev, true);
++	chip->ops->phy_calibration(rtwdev);
++}
++
++static void __rtw_stop_ap(struct rtw_dev *rtwdev)
++{
++	rtw_write32_clr(rtwdev, REG_TCR, BIT_TCR_UPDATE_HGQMD);
++	rtw_write16(rtwdev, REG_ATIMWND, ATIMWND_DEFAULT);
++	rtwdev->ap_active = false;
++	if (!rtw_core_check_sta_active(rtwdev))
++		rtw_clear_op_chan(rtwdev);
++}
++
+ static void rtw_ops_bss_info_changed(struct ieee80211_hw *hw,
+ 				     struct ieee80211_vif *vif,
+ 				     struct ieee80211_bss_conf *conf,
+@@ -384,6 +409,18 @@ static void rtw_ops_bss_info_changed(str
+ 
+ 	rtw_leave_lps_deep(rtwdev);
+ 
++	/* mac80211 does not call start_ap and stop_ap for mesh. It only
++	 * enables and disables the beacon. Do the AP setup here, before
++	 * the beacon is downloaded below.
++	 */
++	if (vif->type == NL80211_IFTYPE_MESH_POINT &&
++	    changed & BSS_CHANGED_BEACON_ENABLED) {
++		if (conf->enable_beacon)
++			__rtw_start_ap(rtwdev);
++		else
++			__rtw_stop_ap(rtwdev);
++	}
++
+ 	if (changed & BSS_CHANGED_ASSOC) {
+ 		rtw_vif_assoc_changed(rtwvif, conf);
+ 		if (vif->cfg.assoc) {
+@@ -464,14 +501,9 @@ static int rtw_ops_start_ap(struct ieee8
+ 			    struct ieee80211_bss_conf *link_conf)
+ {
+ 	struct rtw_dev *rtwdev = hw->priv;
+-	const struct rtw_chip_info *chip = rtwdev->chip;
+ 
+ 	mutex_lock(&rtwdev->mutex);
+-	rtw_write32_set(rtwdev, REG_TCR, BIT_TCR_UPDATE_HGQMD);
+-	rtw_write16(rtwdev, REG_ATIMWND, ATIMWND_AP);
+-	rtwdev->ap_active = true;
+-	rtw_store_op_chan(rtwdev, true);
+-	chip->ops->phy_calibration(rtwdev);
++	__rtw_start_ap(rtwdev);
+ 	mutex_unlock(&rtwdev->mutex);
+ 
+ 	return 0;
+@@ -484,11 +516,7 @@ static void rtw_ops_stop_ap(struct ieee8
+ 	struct rtw_dev *rtwdev = hw->priv;
+ 
+ 	mutex_lock(&rtwdev->mutex);
+-	rtw_write32_clr(rtwdev, REG_TCR, BIT_TCR_UPDATE_HGQMD);
+-	rtw_write16(rtwdev, REG_ATIMWND, ATIMWND_DEFAULT);
+-	rtwdev->ap_active = false;
+-	if (!rtw_core_check_sta_active(rtwdev))
+-		rtw_clear_op_chan(rtwdev);
++	__rtw_stop_ap(rtwdev);
+ 	mutex_unlock(&rtwdev->mutex);
+ }
+ 
+@@ -560,6 +588,14 @@ static int rtw_ops_set_key(struct ieee80
+ 	u8 hw_key_idx;
+ 	int ret = 0;
+ 
++	/* The CAM finds group keys by key index only. On a mesh
++	 * interface our own group key would be used to decrypt the
++	 * group frames of the peers, which use their own group keys.
++	 * Leave all mesh keys to software crypto.
++	 */
++	if (vif->type == NL80211_IFTYPE_MESH_POINT)
++		return -EOPNOTSUPP;
++
+ 	switch (key->cipher) {
+ 	case WLAN_CIPHER_SUITE_WEP40:
+ 		hw_key_type = RTW_CAM_WEP40;
+--- a/drivers/net/wireless/realtek/rtw88/main.c
++++ b/drivers/net/wireless/realtek/rtw88/main.c
+@@ -111,7 +111,10 @@ static const struct ieee80211_iface_limi
+ 	},
+ 	{
+ 		.max = 1,
+-		.types = BIT(NL80211_IFTYPE_AP),
++		.types = BIT(NL80211_IFTYPE_AP)
++#ifdef CPTCFG_MAC80211_MESH
++			 | BIT(NL80211_IFTYPE_MESH_POINT)
++#endif
+ 	}
+ };
+ 
+@@ -2285,7 +2288,8 @@ int rtw_register_hw(struct rtw_dev *rtwd
+ 
+ 	hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION) |
+ 				     BIT(NL80211_IFTYPE_AP) |
+-				     BIT(NL80211_IFTYPE_ADHOC);
++				     BIT(NL80211_IFTYPE_ADHOC) |
++				     BIT(NL80211_IFTYPE_MESH_POINT);
+ 	hw->wiphy->available_antennas_tx = hal->antenna_tx;
+ 	hw->wiphy->available_antennas_rx = hal->antenna_rx;
+ 
+@@ -2431,7 +2435,9 @@ void rtw_core_port_switch(struct rtw_dev
+ 	struct rtw_vif *rtwvif = (struct rtw_vif *)vif->drv_priv;
+ 	struct rtw_iter_port_switch_data iter_data;
+ 
+-	if (vif->type != NL80211_IFTYPE_AP || rtwvif->port == RTW_PORT_0)
++	if ((vif->type != NL80211_IFTYPE_AP &&
++	     vif->type != NL80211_IFTYPE_MESH_POINT) ||
++	    rtwvif->port == RTW_PORT_0)
+ 		return;
+ 
+ 	iter_data.rtwdev = rtwdev;
+--- a/drivers/net/wireless/realtek/rtw88/rx.c
++++ b/drivers/net/wireless/realtek/rtw88/rx.c
+@@ -111,7 +111,9 @@ static void rtw_rx_addr_match_iter(void
+ 	struct rtw_rx_pkt_stat *pkt_stat = iter_data->pkt_stat;
+ 	u8 *bssid = iter_data->bssid;
+ 
+-	if (!ether_addr_equal(vif->bss_conf.bssid, bssid))
++	/* A mesh interface has no BSSID. Match its peers by address. */
++	if (vif->type != NL80211_IFTYPE_MESH_POINT &&
++	    !ether_addr_equal(vif->bss_conf.bssid, bssid))
+ 		return;
+ 
+ 	if (!(ether_addr_equal(vif->addr, hdr->addr1) ||
