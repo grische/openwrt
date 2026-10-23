@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 22 Oct 2026 09:48:14 +0200
+Subject: [PATCH] arm64: dts: rockchip: add Wi-Fi to NanoPi R2S Plus
+
+The NanoPi R2S Plus has an M.2 E-key slot that FriendlyElec populates
+with an RTL8822CS SDIO Wi-Fi module on the Wi-Fi variant of the board.
+The slot is wired to the sdmmc_ext controller with 1.8 V signalling.
+WL_REG_ON is on GPIO3_B0, WL_HOST_WAKE on GPIO3_A1 and SUSCLK is fed
+by the 32.768 kHz clock output of the RK805. A dedicated buck converter
+powers the module with 3.3 V whenever vcc_io_33 is up.
+
+Signed-off-by: Grische <github@grische.xyz>
+---
+ .../dts/rockchip/rk3328-nanopi-r2s-plus.dts   | 59 +++++++++++++++++++
+ 1 file changed, 59 insertions(+)
+
+--- a/arch/arm64/boot/dts/rockchip/rk3328-nanopi-r2s-plus.dts
++++ b/arch/arm64/boot/dts/rockchip/rk3328-nanopi-r2s-plus.dts
+@@ -17,6 +17,25 @@
+ 	aliases {
+ 		mmc1 = &emmc;
+ 	};
++
++	sdio_pwrseq: sdio-pwrseq {
++		compatible = "mmc-pwrseq-simple";
++		clocks = <&rk805 1>;
++		clock-names = "ext_clock";
++		pinctrl-names = "default";
++		pinctrl-0 = <&wifi_reg_on_h>;
++		reset-gpios = <&gpio3 RK_PB0 GPIO_ACTIVE_LOW>;
++	};
++
++	vdd_wifi_3v3: regulator-vdd-wifi-3v3 {
++		compatible = "regulator-fixed";
++		regulator-name = "vdd_wifi_3v3";
++		regulator-always-on;
++		regulator-boot-on;
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		vin-supply = <&vdd_5v>;
++	};
+ };
+ 
+ &emmc {
+@@ -51,3 +70,43 @@
+ 	vccio4-supply = <&vcc_io_33>;
+ 	vccio6-supply = <&vcc_18>;
+ };
++
++&pinctrl {
++	wifi {
++		wifi_host_wake_h: wifi-host-wake-h {
++			rockchip,pins = <3 RK_PA1 RK_FUNC_GPIO &pcfg_pull_down>;
++		};
++
++		wifi_reg_on_h: wifi-reg-on-h {
++			rockchip,pins = <3 RK_PB0 RK_FUNC_GPIO &pcfg_pull_none>;
++		};
++	};
++};
++
++&sdmmc_ext {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	bus-width = <4>;
++	cap-sd-highspeed;
++	cap-sdio-irq;
++	keep-power-in-suspend;
++	mmc-pwrseq = <&sdio_pwrseq>;
++	no-mmc;
++	no-sd;
++	non-removable;
++	pinctrl-names = "default";
++	pinctrl-0 = <&sdmmc0ext_clk &sdmmc0ext_cmd &sdmmc0ext_bus4>;
++	sd-uhs-sdr104;
++	vmmc-supply = <&vdd_wifi_3v3>;
++	vqmmc-supply = <&vcc_18>;
++	status = "okay";
++
++	rtl8822cs: wifi@1 {
++		reg = <1>;
++		interrupt-parent = <&gpio3>;
++		interrupts = <RK_PA1 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-names = "host-wake";
++		pinctrl-names = "default";
++		pinctrl-0 = <&wifi_host_wake_h>;
++	};
++};
