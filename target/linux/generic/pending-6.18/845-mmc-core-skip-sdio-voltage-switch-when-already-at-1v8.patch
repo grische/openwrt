@@ -1,0 +1,68 @@
+From: Grische <github@grische.xyz>
+Date: Thu, 22 Oct 2026 19:30:00 +0200
+Subject: [PATCH] mmc: core: Skip the SDIO voltage switch when already at 1.8V
+
+The NanoPi R2S Plus has an RTL8822CS SDIO Wi-Fi module on the sdmmc_ext
+controller of the RK3328. The I/O supply of the slot is a fixed 1.8V
+regulator. So the host already signals at 1.8V when it powers up the
+card. The host is described with sd-uhs-sdr104.
+
+Per SDIO Simplified Specification Version 3.00, section 3.1.2, a card
+that already runs at 1.8V signaling sets S18A to 0 in the R4 response.
+The RTL8822CS sets S18A to 1 anyway. The core then sends CMD11 to start
+the voltage switch. Per Physical Layer Simplified Specification Version
+3.01, section 4.2.4.4, a card whose signaling level is already 1.8V
+treats CMD11 as an illegal command and does not respond to it. The
+dw_mmc host reports "Unexpected CMD11 timeout". The core treats the
+failed voltage switch as missing UHS-I support and initializes the card
+in high speed mode at 50 MHz.
+
+There is nothing to switch when the host already signals at 1.8V. So
+skip the voltage switch in that case, regardless of S18A. The following
+CCCR read still decides which UHS-I modes the card supports. This is
+the same path that a card takes which correctly reports S18A as 0.
+
+Hosts with a switchable I/O supply power up at 3.3V and still send
+CMD11. Hosts with a fixed 1.8V supply no longer send CMD11 to cards
+that set S18A. Cards that set S18A at 1.8V and relied on the CMD11
+handshake now have to run UHS-I from the CCCR without it. Tests on
+such hosts are welcome.
+
+With this change the RTL8822CS on the NanoPi R2S Plus initializes in
+SDR104 mode at 150 MHz. The Wi-Fi throughput roughly doubles. The NanoPi
+R76S and the LincStation E1 use the same module on a fixed 1.8V supply
+with sd-uhs-sdr104 as well.
+
+The analysis and the first draft of this patch and of its changelog
+were produced in Claude Code sessions with the Claude model
+claude-fable-5-1. The same sessions ran the tests on an RTL8822CS on
+the sdmmc_ext controller of a NanoPi R2S Plus. The card then
+initializes in SDR104 mode at 150 MHz without sending CMD11, and tuning
+succeeds. In station mode the throughput rises from 30 to 61 Mbit/s for
+transmit and from about 70 to 126 Mbit/s for receive. The author
+reviewed the change and the results.
+
+Signed-off-by: Grische <github@grische.xyz>
+---
+ drivers/mmc/core/sdio.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+--- a/drivers/mmc/core/sdio.c
++++ b/drivers/mmc/core/sdio.c
+@@ -738,8 +738,15 @@
+ 	 * fails to check rocr & R4_18V_PRESENT,  but we still need to
+ 	 * try to init uhs card. sdio_read_cccr will take over this task
+ 	 * to make sure which speed mode should work.
++	 *
++	 * Some cards, like the Realtek RTL8822CS, set S18A even if the
++	 * signal voltage is already 1.8V. Per SD spec v3.01, section
++	 * 4.2.4.4, such a card treats CMD11 as an illegal command and does
++	 * not respond to it. There is nothing to switch in that case, so
++	 * skip the voltage switch if the host already signals at 1.8V.
+ 	 */
+-	if (rocr & ocr & R4_18V_PRESENT) {
++	if (rocr & ocr & R4_18V_PRESENT &&
++	    host->ios.signal_voltage != MMC_SIGNAL_VOLTAGE_180) {
+ 		err = mmc_set_uhs_voltage(host, ocr_card);
+ 		if (err == -EAGAIN) {
+ 			mmc_sdio_pre_init(host, ocr_card, card);
