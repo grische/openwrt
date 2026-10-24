@@ -61,7 +61,7 @@ KERNEL_PATCHVER:=6.18
 define Target/Description
 	Build firmware images for Intel/Lantiq xRX500 (GRX350/GRX550) SoCs.
 	Devices: AVM FRITZ!Box 7560 (GRX350), AVM FRITZ!Box 7580 (GRX550),
-	AVM FRITZ!Box 7590 (GRX550).
+	AVM FRITZ!Box 7590 (GRX550), AVM FRITZ!Box 7590 AX and 7590 AX v2 (GRX550).
 endef
 
 include $(INCLUDE_DIR)/target.mk

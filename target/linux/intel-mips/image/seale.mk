@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Image rules for the AVM "Seale" boards: the FRITZ!Box 7560 (GRX350) and the
-# FRITZ!Box 7580 and 7590 (both GRX550), all three devices of the single xrx500
-# subtarget. They share a file because they share the whole EVA image pipeline
-# and the load addresses below; what differs is per-device and lives in the
-# device blocks.
+# Image rules for the AVM "Seale" boards, all five devices of the single xrx500
+# subtarget. The FRITZ!Box 7560 is a GRX350 board. The FRITZ!Box 7580, the 7590
+# and the two variants of the 7590 AX are GRX550 boards. They share a file
+# because they share the whole EVA image pipeline and the load addresses below;
+# what differs is per-device and lives in the device blocks.
 #
 # KERNEL_LOADADDR / KERNEL_ENTRY. There is no target-wide default to inherit,
 # and the generic MIPS value is wrong for this family under EVA in any case.
@@ -415,11 +415,71 @@ define Device/avm_fritz7580
 	kmod-leds-lgm-sso
 endef
 
-# All three devices, in the one subtarget. This used to be a guarded block per
+# AVM FRITZ!Box 7590 AX, hardware revision HW259 on the GRX550. AVM's device
+# tree for it is the 7590's with other radios, and its flash map has a larger
+# TFFS. This template therefore takes the 7590's values, and every comment in
+# the 7590 block above applies to it unless one here says otherwise. The
+# template is not a device of its own. The two variant blocks below are. AVM
+# sells the later variant as the 7590 AX v2 and the first under the bare name,
+# so the device names follow that.
+define Device/avm_fritz7590ax-common
+  $(Device/AVM)
+  $(Device/NAND)
+  DEVICE_MODEL := FRITZ!Box 7590 AX
+  SOC := xrx500
+  # n for the same reason as the three boards above.
+  DEFAULT := n
+  # The 7590's chain, restated for the reasons given there.
+  KERNEL := kernel-bin | append-dtb | append-sacrificial-dtb | avm-preamble | eva-single-kernel
+  KERNEL_INITRAMFS := kernel-bin | append-dtb | append-sacrificial-dtb | avm-preamble | eva-single-kernel
+  # Both kernel slots are 8 MiB, as on the 7590.
+  KERNEL_SIZE := 8192k
+  # The TFFS is 8 MiB on this board rather than the 7590's 4 MiB. Both kernel
+  # slots and the ubi partition therefore sit 4 MiB higher than on the 7590.
+  # The ubi partition runs from 0x1900000 to the end of the 512 MiB chip, which
+  # makes it 0x1e700000 bytes or 498688 KiB.
+  IMAGE_SIZE := 498688k
+  # The flash part is the 7590's Toshiba chip with a 4 KiB page, so the
+  # geometry is the 7590's.
+  BLOCKSIZE := 256k
+  PAGESIZE := 4096
+  SUBPAGESIZE := 1024
+  MKUBIFS_OPTS := -m 4096 -e 252KiB -c 4096
+  UBINIZE_OPTS := -E 5
+  # The 7590's list without its radio packages. Both radios are Intel/MaxLinear
+  # WAV600 parts with the PCI ID 8086:09d0, and OpenWrt has no driver for them.
+  # So there is no kmod-ath10k, no ath10k firmware and no wpad. fritz-caldata
+  # goes as well, because nothing on this board would consume the calibration
+  # data it extracts.
+  DEVICE_PACKAGES := fritz-tffs-nand kmod-dsa-lantiq-gswip-xrx500 \
+	xrx500-phy11g-firmware \
+	pciutils \
+	kmod-usb-storage kmod-usb-storage-uas kmod-fs-vfat kmod-fs-ext4 block-mount usbutils \
+	kmod-leds-lgm-sso
+endef
+
+# The two variants differ only in their device trees. The boot loader carries a
+# table of device-tree blobs keyed by hardware sub-revision. Each tree carries
+# its own key. Each also sets the front-panel controller's rates, which the
+# vendor's sources tie to whether the board carries an FPGA. The kernel patches
+# that add the two trees give the derivation.
+define Device/avm_fritz7590ax
+  $(Device/avm_fritz7590ax-common)
+  DEVICE_DTS := seale_avm_fritz7590ax
+endef
+
+define Device/avm_fritz7590ax-v2
+  $(Device/avm_fritz7590ax-common)
+  DEVICE_VARIANT := v2
+  DEVICE_DTS := seale_avm_fritz7590ax_v2
+endef
+
+# All five devices, in the one subtarget. This used to be a guarded block per
 # board, because the kernel carried a built-in DTB chosen at compile time:
 # naming more than one would have let a build produce one board's image on top
 # of a kernel holding another board's device tree, which assembles cleanly and
 # fails only on hardware. The DTB now arrives appended to each device's own
 # image, so the kernel binary is board-agnostic and that failure no longer has
-# a mechanism — which is also what makes adding a third device here free.
+# a mechanism — which is also what makes adding a device here free.
 TARGET_DEVICES += avm_fritz7560 avm_fritz7580 avm_fritz7590
+TARGET_DEVICES += avm_fritz7590ax avm_fritz7590ax-v2

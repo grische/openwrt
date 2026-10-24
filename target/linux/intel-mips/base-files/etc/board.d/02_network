@@ -133,17 +133,18 @@ avm,fritz7560)
 	ucidef_add_wlan 18900000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0
 	ucidef_add_wlan 18400000.pcie/pci0001:00/0001:00:00.0/0001:01:00.0
 	;;
-avm,fritz7580|avm,fritz7590)
+avm,fritz7580|avm,fritz7590|avm,fritz7590ax|avm,fritz7590ax-v2)
 	#
 	# Unlike the 7560, these boards have a dedicated WAN jack, so they
 	# can declare a real lan/wan split rather than shipping every socket
-	# as LAN and asking the user to nominate an uplink at runtime. Both
-	# wire it the same way, which is why one arm serves them: it is the
-	# GRX550 die's fifth port, and everything below follows from that
-	# rather than from either chassis.
+	# as LAN and asking the user to nominate an uplink at runtime. All
+	# four wire it the same way, which is why one arm serves them. It is
+	# the GRX550 die's fifth port, and everything below follows from
+	# that rather than from any one chassis. The 7590 AX has the 7590's
+	# jacks and the 7590's wiring behind them.
 	#
 	# The names are DSA port labels out of the device tree, so they are
-	# the same five names on both boards and on every boot.
+	# the same five names on all four boards and on every boot.
 	#
 	# The LAN four are chassis order left to right, because the dtsi
 	# already undoes the board's reversed wiring: front-panel LAN-N goes
@@ -195,7 +196,16 @@ avm,fritz7580|avm,fritz7590)
 		ucidef_set_interface_macaddr "wan" "$macdsl"
 		;;
 	esac
+	;;
+esac
 
+#
+# The radios of the 7580 and the 7590. The 7590 AX has no arm here. Its
+# WAV600 radios have no OpenWrt driver, so no phy will ever appear at
+# these paths on it, and a country would have nothing to apply to.
+#
+case "$(board_name)" in
+avm,fritz7580|avm,fritz7590)
 	#
 	# Same reasoning as the 7560: an empty country nulls the defaults
 	# block for every band above 2.4 GHz, which brings the 5 GHz radio up

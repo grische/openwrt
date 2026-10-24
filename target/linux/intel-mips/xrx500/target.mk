@@ -28,5 +28,5 @@ CPU_TYPE:=24kc
 DEFAULT_PACKAGES+=kmod-gpio-button-hotplug
 
 define Target/Description
-	Intel/Lantiq xRX500 family (GRX350, GRX550) -- AVM FRITZ!Box 7560, 7580 and 7590
+	Intel/Lantiq xRX500 family (GRX350, GRX550) -- AVM FRITZ!Box 7560, 7580, 7590 and 7590 AX
 endef
