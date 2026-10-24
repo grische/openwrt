@@ -3,8 +3,10 @@
 # Sysupgrade platform hooks for intel-mips.
 #
 # NAND layout (seale_avm_fritz7560.dts, seale_avm_fritz7580.dts,
-# seale_avm_fritz7590.dts): two raw 8 MiB kernel slots, each holding a bare EVA
-# container, plus a "ubi" partition holding the rootfs and rootfs_data volumes.
+# seale_avm_fritz7590.dts, seale_avm_fritz7590ax.dts,
+# seale_avm_fritz7590ax_v2.dts): two raw 8 MiB kernel slots, each holding a
+# bare EVA container, plus a "ubi" partition holding the rootfs and rootfs_data
+# volumes.
 #
 # BOTH kernel slots are written, with the same container, and that is the whole
 # point of this file. Which slot EVA boots is chosen by linux_fs_start in the
@@ -108,7 +110,8 @@ platform_do_upgrade() {
 	local cmd kernel=/tmp/kernel.eva
 
 	case "$(board_name)" in
-	avm,fritz7560|avm,fritz7580|avm,fritz7590)
+	avm,fritz7560|avm,fritz7580|avm,fritz7590|\
+	avm,fritz7590ax|avm,fritz7590ax-v2)
 		cmd="$(identify_if_gzip "$1")cat"
 		# Verify the tar before anything below erases flash.
 		# platform_check_image() is skipped by "sysupgrade -F", so without

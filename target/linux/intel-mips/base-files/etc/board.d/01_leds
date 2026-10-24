@@ -99,12 +99,15 @@ avm,fritz7580)
 	#
 	ucidef_set_led_netdev "wan" "WAN" "green:internet" "wan"
 	;;
-avm,fritz7590)
+avm,fritz7590|avm,fritz7590ax|avm,fritz7590ax-v2)
 	#
 	# The wifi lamp is handled above and needs nothing special here even
 	# though it hangs off the SSO controller rather than off a GPIO: a
 	# populated /sys/class/leds/<name>/ is the whole contract, and
 	# leds-lgm-sso registers the same class devices gpio-leds would.
+	#
+	# On the 7590 AX the led-wifi alias resolves to a lamp that no radio
+	# will drive until a driver for its radios exists.
 	#
 	# Fon follows the wan interface, the trigger the 7560 takes above --
 	# and here there is a real WAN jack behind it rather than a LAN port
