@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 9 Nov 2026 16:38:21 +0100
+Subject: irqchip/mips-gic: Fix local timer/perfctr/fdc on single-cluster
+ systems
+
+Commit d1cb1437b785 ("irqchip/mips-gic: Prevent indirect access to
+clusters without CPU cores") made gic_mask_local_irq_all_vpes() and
+gic_unmask_local_irq_all_vpes() return early when all CPUs are in one
+cluster, and it made gic_irq_domain_map() skip the map register write
+for local interrupts in that case.
+
+On a single-cluster system, the CP0 timer, performance counter and FDC
+interrupts therefore stay masked on every CPU if the GIC routes them.
+The boot CPU runs gic_cpu_startup() before any of these interrupts is
+mapped, and since gic_irq_domain_map() and
+gic_unmask_local_irq_all_vpes() no longer write the map and mask
+registers, the interrupts remain unmapped and masked on the boot CPU.
+The secondary CPUs keep the interrupts masked because
+gic_unmask_local_irq_all_vpes() returns before it sets cd->mask, which
+gic_all_vpes_irq_cpu_online() checks when a CPU comes online.
+
+If the CP0 timer is the clock event device, the boot hangs in
+calibrate_delay() and the console output stops before the "Calibrating
+delay loop..." line.
+
+Drop the three single-cluster checks, so that the driver writes these
+registers on every online CPU again. for_each_online_cpu_gic() only
+visits online CPUs, and an online CPU is never in a cluster without CPU
+cores, so the loop never accesses such a cluster.
+
+Fixes: d1cb1437b785 ("irqchip/mips-gic: Prevent indirect access to clusters without CPU cores")
+Cc: stable@vger.kernel.org
+Assisted-by: Claude:claude-opus-4-7
+Assisted-by: Claude:claude-fable-5
+Assisted-by: Claude:claude-opus-5-5
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/irqchip/irq-mips-gic.c b/drivers/irqchip/irq-mips-gic.c
+index 19a57c5e2b2e..8e6710857e5c 100644
+--- a/drivers/irqchip/irq-mips-gic.c
++++ b/drivers/irqchip/irq-mips-gic.c
+@@ -512,9 +512,6 @@ static void gic_mask_local_irq_all_vpes(struct irq_data *d)
+ 	struct gic_all_vpes_chip_data *cd;
+ 	int intr, cpu;
+ 
+-	if (!mips_cps_multicluster_cpus())
+-		return;
+-
+ 	intr = GIC_HWIRQ_TO_LOCAL(d->hwirq);
+ 	cd = irq_data_get_irq_chip_data(d);
+ 	cd->mask = false;
+@@ -528,9 +525,6 @@ static void gic_unmask_local_irq_all_vpes(struct irq_data *d)
+ 	struct gic_all_vpes_chip_data *cd;
+ 	int intr, cpu;
+ 
+-	if (!mips_cps_multicluster_cpus())
+-		return;
+-
+ 	intr = GIC_HWIRQ_TO_LOCAL(d->hwirq);
+ 	cd = irq_data_get_irq_chip_data(d);
+ 	cd->mask = true;
+@@ -698,10 +692,8 @@ static int gic_irq_domain_map(struct irq_domain *d, unsigned int virq,
+ 	if (!gic_local_irq_is_routable(intr))
+ 		return -EPERM;
+ 
+-	if (mips_cps_multicluster_cpus()) {
+-		for_each_online_cpu_gic(cpu, &gic_lock)
+-			write_gic_vo_map(mips_gic_vx_map_reg(intr), map);
+-	}
++	for_each_online_cpu_gic(cpu, &gic_lock)
++		write_gic_vo_map(mips_gic_vx_map_reg(intr), map);
+ 
+ 	return 0;
+ }
