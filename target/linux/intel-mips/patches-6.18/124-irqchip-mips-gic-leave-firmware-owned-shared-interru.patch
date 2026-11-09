@@ -61,7 +61,7 @@ index 91bb3c2307a7..e898da702ea1 100644
      type: object
      description: |
 diff --git a/drivers/irqchip/irq-mips-gic.c b/drivers/irqchip/irq-mips-gic.c
-index d9405c7dfff2..16767bad0142 100644
+index 8e6710857e5c..bbd440d92c14 100644
 --- a/drivers/irqchip/irq-mips-gic.c
 +++ b/drivers/irqchip/irq-mips-gic.c
 @@ -61,6 +61,15 @@ static DECLARE_BITMAP(ipi_resrv, GIC_MAX_INTRS);
@@ -80,7 +80,7 @@ index d9405c7dfff2..16767bad0142 100644
  static struct gic_all_vpes_chip_data {
  	u32	map;
  	bool	mask;
-@@ -651,6 +660,9 @@ static int gic_irq_domain_map(struct irq_domain *d, unsigned int virq,
+@@ -634,6 +643,9 @@ static int gic_irq_domain_map(struct irq_domain *d, unsigned int virq,
  	u32 map;
  
  	if (hwirq >= GIC_SHARED_HWIRQ_BASE) {
@@ -90,7 +90,7 @@ index d9405c7dfff2..16767bad0142 100644
  #ifdef CONFIG_GENERIC_IRQ_IPI
  		/* verify that shared irqs don't conflict with an IPI irq */
  		if (test_bit(GIC_HWIRQ_TO_SHARED(hwirq), ipi_resrv))
-@@ -888,6 +900,13 @@ static int gic_register_ipi_domain(struct device_node *node)
+@@ -862,6 +874,13 @@ static int gic_register_ipi_domain(struct device_node *node)
  
  	bitmap_copy(ipi_available, ipi_resrv, GIC_MAX_INTRS);
  
@@ -104,7 +104,7 @@ index d9405c7dfff2..16767bad0142 100644
  	return 0;
  }
  
-@@ -900,6 +919,22 @@ static inline int gic_register_ipi_domain(struct device_node *node)
+@@ -874,6 +893,22 @@ static inline int gic_register_ipi_domain(struct device_node *node)
  
  #endif /* !CONFIG_GENERIC_IRQ_IPI */
  
@@ -127,7 +127,7 @@ index d9405c7dfff2..16767bad0142 100644
  static int gic_cpu_startup(unsigned int cpu)
  {
  	/* Enable or disable EIC */
-@@ -974,6 +1009,8 @@ static int __init gic_of_init(struct device_node *node,
+@@ -948,6 +983,8 @@ static int __init gic_of_init(struct device_node *node,
  	gic_shared_intrs = FIELD_GET(GIC_CONFIG_NUMINTERRUPTS, gicconfig);
  	gic_shared_intrs = (gic_shared_intrs + 1) * 8;
  
@@ -136,7 +136,7 @@ index d9405c7dfff2..16767bad0142 100644
  	if (cpu_has_veic) {
  		/* Always use vector 1 in EIC mode */
  		gic_cpu_pin = 0;
-@@ -1010,6 +1047,8 @@ static int __init gic_of_init(struct device_node *node,
+@@ -984,6 +1021,8 @@ static int __init gic_of_init(struct device_node *node,
  	for (cl = 0; cl < nclusters; cl++) {
  		if (cl == cpu_cluster(&current_cpu_data)) {
  			for (i = 0; i < gic_shared_intrs; i++) {
@@ -145,7 +145,7 @@ index d9405c7dfff2..16767bad0142 100644
  				change_gic_pol(i, GIC_POL_ACTIVE_HIGH);
  				change_gic_trig(i, GIC_TRIG_LEVEL);
  				write_gic_rmask(i);
-@@ -1017,6 +1056,8 @@ static int __init gic_of_init(struct device_node *node,
+@@ -991,6 +1030,8 @@ static int __init gic_of_init(struct device_node *node,
  		} else if (mips_cps_numcores(cl) != 0) {
  			mips_cm_lock_other(cl, 0, 0, CM_GCR_Cx_OTHER_BLOCK_GLOBAL);
  			for (i = 0; i < gic_shared_intrs; i++) {
