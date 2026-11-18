@@ -3,37 +3,43 @@ Date: Fri, 25 Sep 2026 20:21:11 +0200
 Subject: wifi: ath10k: clear the HTT tx queue state of a removed peer
 
 In push-pull mode the firmware fetches a host queue whenever its peer
-bit is set in htt_q_state.map. The only writer of a peer's count and map
-bit is __ath10k_htt_tx_txq_recalc(), which runs for a live queue, so a
-station or vif that goes away with frames queued leaves its entries set.
-The firmware does not reuse peer ids while it runs, so the stale entry
-stays set for the rest of the boot.
+bit is set in htt_q_state.map. __ath10k_htt_tx_txq_recalc() is the only
+writer of the count and map bit of a peer, and it runs only for a queue
+that still exists. A station or vif that is removed with frames queued
+therefore leaves its entries set.
 
-This causes the firmware to see queued frames for a peer that no longer
-exists. If it then fetches that peer, the host finds no queue for it
-and skips the record with the log
+If the firmware fetches such a peer, the host finds no queue for it and
+skips the record with the log
   "failed to lookup txq for peer_id N tid T"
 
-On a big-endian host with the byte-swapped map, the firmware reads such
-a stale bit as the bit of another peer.
-
-Which clients were starved depends on which stations had left before,
-so the stall appeared to move randomly between clients.
-
 Zero the count and clear the map bit in every TID of the peer when the
-station or the vif is removed, and publish the change with a new
-sequence number.
+station or the vif is removed, and sync the change to the device with a
+new sequence number.
+
+mac80211 can still queue frames for a station after drv_sta_state()
+moved it to NOTEXIST. On a mesh interface, a mesh path keeps the station
+as its next hop until mesh_sta_cleanup(), and a frame sent on that path
+wakes the txq of the station. ath10k_mac_op_wake_tx_queue() would then
+recalc the entries with the old peer id and set them again. Therefore
+set the peer id to HTT_INVALID_PEERID in the same tx_lock section that
+clears the entries, and let __ath10k_htt_tx_txq_recalc() skip a queue
+whose peer id is invalid. The queue of a vif without a peer of its own
+has always had that peer id, so it is now skipped without the warning
+  "refusing to update txq for peer_id 65535 tid T due to out of bounds"
+
+Clear the entries of the vif before the vdev is deleted, so the clear
+does not depend on the firmware confirming the deletion.
 
 Tested-on: QCA9984 hw1.0 PCI 10.4-3.9.0.2-00157
 
 Fixes: c1a43d9720d8 ("ath10k: implement updating shared htt txq state")
-Assisted-by: LLM sparse
+Assisted-by: Claude:claude-opus-5-5 sparse
 Signed-off-by: Grische <opensource@grische.xyz>
 ---
  drivers/net/wireless/ath/ath10k/htt.h    |  1 +
- drivers/net/wireless/ath/ath10k/htt_tx.c | 25 ++++++++++++++++++++++++
- drivers/net/wireless/ath/ath10k/mac.c    |  3 +++
- 3 files changed, 29 insertions(+)
+ drivers/net/wireless/ath/ath10k/htt_tx.c | 41 ++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath10k/mac.c    |  4 +++
+ 3 files changed, 46 insertions(+)
 
 --- a/drivers/net/wireless/ath/ath10k/htt.h
 +++ b/drivers/net/wireless/ath/ath10k/htt.h
@@ -41,35 +47,58 @@ Signed-off-by: Grische <opensource@grische.xyz>
  void ath10k_htt_tx_txq_recalc(struct ieee80211_hw *hw,
  			      struct ieee80211_txq *txq);
  void ath10k_htt_tx_txq_sync(struct ath10k *ar);
-+void ath10k_htt_tx_txq_clear_peer(struct ath10k *ar, u16 peer_id);
++void ath10k_htt_tx_txq_clear_peer(struct ath10k *ar, u16 *peer_id);
  void ath10k_htt_tx_dec_pending(struct ath10k_htt *htt);
  int ath10k_htt_tx_inc_pending(struct ath10k_htt *htt);
  void ath10k_htt_tx_mgmt_dec_pending(struct ath10k_htt *htt);
 --- a/drivers/net/wireless/ath/ath10k/htt_tx.c
 +++ b/drivers/net/wireless/ath/ath10k/htt_tx.c
-@@ -141,6 +141,31 @@ void ath10k_htt_tx_txq_update(struct iee
+@@ -64,6 +64,10 @@ static void __ath10k_htt_tx_txq_recalc(s
+ 		peer_id = arvif->peer_id;
+ 	}
+ 
++	/* The peer was removed, or the vif has no peer of its own */
++	if (peer_id == HTT_INVALID_PEERID)
++		return;
++
+ 	tid = txq->tid;
+ 	bit = BIT(peer_id % 32);
+ 	idx = peer_id / 32;
+@@ -141,6 +145,43 @@ void ath10k_htt_tx_txq_update(struct iee
  	spin_unlock_bh(&ar->htt.tx_lock);
  }
  
-+void ath10k_htt_tx_txq_clear_peer(struct ath10k *ar, u16 peer_id)
++/* Clear the queue state of a peer that goes away and invalidate the peer id
++ * that __ath10k_htt_tx_txq_recalc() uses for its queues. mac80211 can still
++ * queue frames for a removed station, and a recalc must not set the entries
++ * again.
++ */
++void ath10k_htt_tx_txq_clear_peer(struct ath10k *ar, u16 *peer_id)
 +{
-+	__le32 bit = cpu_to_le32(BIT(peer_id % 32));
-+	int idx = peer_id / 32;
++	__le32 bit;
++	int idx;
++	u16 id;
 +	u8 tid;
 +
 +	spin_lock_bh(&ar->htt.tx_lock);
 +
++	id = *peer_id;
++	*peer_id = HTT_INVALID_PEERID;
++
 +	if (!ar->htt.tx_q_state.enabled ||
-+	    peer_id >= ar->htt.tx_q_state.num_peers)
++	    id >= ar->htt.tx_q_state.num_peers)
 +		goto unlock;
 +
++	bit = cpu_to_le32(BIT(id % 32));
++	idx = id / 32;
++
 +	for (tid = 0; tid < ar->htt.tx_q_state.num_tids; tid++) {
-+		ar->htt.tx_q_state.vaddr->count[tid][peer_id] = 0;
++		ar->htt.tx_q_state.vaddr->count[tid][id] = 0;
 +		ar->htt.tx_q_state.vaddr->map[tid][idx] &= ~bit;
 +	}
 +
 +	ath10k_dbg(ar, ATH10K_DBG_HTT, "htt tx txq state clear peer_id %u\n",
-+		   peer_id);
++		   id);
 +
 +	__ath10k_htt_tx_txq_sync(ar);
 +unlock:
@@ -81,19 +110,20 @@ Signed-off-by: Grische <opensource@grische.xyz>
  	lockdep_assert_held(&htt->tx_lock);
 --- a/drivers/net/wireless/ath/ath10k/mac.c
 +++ b/drivers/net/wireless/ath/ath10k/mac.c
-@@ -6113,6 +6113,7 @@ static void ath10k_remove_interface(stru
- 	spin_unlock_bh(&ar->htt.tx_lock);
+@@ -6045,6 +6045,8 @@ static void ath10k_remove_interface(stru
+ 		kfree(arvif->u.ap.noa_data);
+ 	}
  
- 	ath10k_mac_txq_unref(ar, vif->txq);
-+	ath10k_htt_tx_txq_clear_peer(ar, arvif->peer_id);
++	ath10k_htt_tx_txq_clear_peer(ar, &arvif->peer_id);
++
+ 	ath10k_dbg(ar, ATH10K_DBG_MAC, "mac vdev %i delete (remove interface)\n",
+ 		   arvif->vdev_id);
  
- out:
- 	mutex_unlock(&ar->conf_mutex);
-@@ -7761,6 +7762,8 @@ static int ath10k_sta_state(struct ieee8
+@@ -7761,6 +7763,8 @@ static int ath10k_sta_state(struct ieee8
  		for (i = 0; i < ARRAY_SIZE(sta->txq); i++)
  			ath10k_mac_txq_unref(ar, sta->txq[i]);
  
-+		ath10k_htt_tx_txq_clear_peer(ar, arsta->peer_id);
++		ath10k_htt_tx_txq_clear_peer(ar, &arsta->peer_id);
 +
  		if (!sta->tdls)
  			goto exit;

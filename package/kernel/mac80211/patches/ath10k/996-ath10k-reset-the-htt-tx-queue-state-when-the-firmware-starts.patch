@@ -1,0 +1,80 @@
+From: Grische <opensource@grische.xyz>
+Date: Sat, 26 Sep 2026 10:07:01 +0200
+Subject: wifi: ath10k: reset the HTT tx queue state when the firmware starts
+
+Since commit 426e10eaf76d ("ath10k: implement push-pull tx"), the
+firmware reports its tx mode in HTT tx mode switch indications, and the
+host keeps the reported mode in htt->tx_q_state. Nothing resets this tx
+mode when the firmware stops, so a firmware booted by
+ath10k_core_restart() or by a later ath10k_start() inherits the tx mode
+of the previous firmware.
+
+In push-pull mode the host sends data frames only when the firmware
+asks for them with a fetch indication. If the old firmware was in
+push-pull mode, the host stays in push-pull mode when the new firmware
+starts. On a QCA9984 the new firmware started in push mode and sent no
+fetch indication before its first tx mode switch indication. That
+indication arrived 2.2 s to 2.4 s after "device successfully recovered"
+in three runs. In one of these runs, pings sent during that time got no
+reply.
+
+Since commit 9ec34a86195a ("ath10k: fix Tx DMA alloc failure during
+continuous wifi down/up"), the queue state buffer, struct htt_q_state,
+is kept across firmware starts as well. The host therefore passes the
+new firmware a buffer that still holds the count and map entries of the
+peers of the old firmware.
+
+Reset the tx mode fields and zero the queue state buffer at every start
+in ath10k_htt_tx_start(), and sync the buffer to the device.
+
+Tested-on: QCA9984 hw1.0 PCI 10.4-3.9.0.2-00157
+
+Fixes: 426e10eaf76d ("ath10k: implement push-pull tx")
+Fixes: 9ec34a86195a ("ath10k: fix Tx DMA alloc failure during continuous wifi down/up")
+Assisted-by: Claude:claude-opus-5-5 sparse
+---
+ drivers/net/wireless/ath/ath10k/htt_tx.c | 26 ++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath10k/htt_tx.c
++++ b/drivers/net/wireless/ath/ath10k/htt_tx.c
+@@ -459,6 +459,26 @@ static int ath10k_htt_tx_alloc_txq(struc
+ 	return 0;
+ }
+ 
++static void ath10k_htt_tx_txq_reset(struct ath10k_htt *htt)
++{
++	struct ath10k *ar = htt->ar;
++	size_t size = sizeof(*htt->tx_q_state.vaddr);
++
++	spin_lock_bh(&htt->tx_lock);
++
++	htt->tx_q_state.enabled = false;
++	htt->tx_q_state.mode = HTT_TX_MODE_SWITCH_PUSH;
++	htt->tx_q_state.num_push_allowed = 0;
++
++	if (htt->tx_q_state.vaddr) {
++		memset(htt->tx_q_state.vaddr, 0, size);
++		dma_sync_single_for_device(ar->dev, htt->tx_q_state.paddr,
++					   size, DMA_TO_DEVICE);
++	}
++
++	spin_unlock_bh(&htt->tx_lock);
++}
++
+ static void ath10k_htt_tx_free_txdone_fifo(struct ath10k_htt *htt)
+ {
+ 	WARN_ON(!kfifo_is_empty(&htt->txdone_fifo));
+@@ -529,6 +549,12 @@ int ath10k_htt_tx_start(struct ath10k_ht
+ 	spin_lock_init(&htt->tx_lock);
+ 	idr_init(&htt->pending_tx);
+ 
++	/* The queue state buffer and the push-pull mode outlive the
++	 * firmware. Reset them, so a new firmware does not inherit those
++	 * of the old one.
++	 */
++	ath10k_htt_tx_txq_reset(htt);
++
+ 	if (htt->tx_mem_allocated) {
+ 		/* The tx memory can come from the start of a firmware that
+ 		 * did not need the queue state buffer.

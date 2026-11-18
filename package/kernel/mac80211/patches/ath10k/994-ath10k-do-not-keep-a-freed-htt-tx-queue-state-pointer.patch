@@ -1,0 +1,101 @@
+From: Grische <opensource@grische.xyz>
+Date: Wed, 18 Nov 2026 22:28:32 +0100
+Subject: wifi: ath10k: do not keep a freed HTT tx queue state pointer
+
+Since commit 9ec34a86195a ("ath10k: fix Tx DMA alloc failure during
+continuous wifi down/up"), ath10k allocates the HTT tx memory once and
+reuses it for every later firmware start, even when that start boots a
+different firmware. The tx memory includes the queue state buffer,
+struct htt_q_state. ath10k_htt_tx_alloc_txq() and
+ath10k_htt_tx_free_txq() allocate and free this buffer only if the
+firmware that is running at that moment has the PEER_FLOW_CONTROL
+feature. ath10k_htt_tx_free_txq() frees the buffer but leaves
+tx_q_state.vaddr and tx_q_state.paddr pointing to it.
+
+The UTF firmware that testmode boots can lack PEER_FLOW_CONTROL, for
+example an API 1 utf.bin, which advertises no firmware features at all.
+This allows the following sequence:
+
+1. A start of the normal firmware fails after ath10k_htt_tx_start().
+   The error path of ath10k_core_start() calls ath10k_htt_tx_free(),
+   which frees the queue state buffer.
+
+2. Testmode starts the UTF firmware. ath10k_htt_tx_start() allocates
+   the tx memory again and sets tx_mem_allocated.
+   ath10k_htt_tx_alloc_txq() returns before it allocates a queue state
+   buffer, so vaddr and paddr still point to the freed buffer.
+
+3. Every later start of the normal firmware reuses this tx memory.
+
+Once the firmware switches to push-pull mode, the host writes the queue
+state into the freed buffer. The next failed start of the normal
+firmware frees the buffer a second time.
+
+ath10k_htt_tx_free_txq() also skips the queue state buffer if the UTF
+firmware is the running firmware when the tx memory is freed, so the
+buffer and its DMA mapping leak.
+
+Free the queue state buffer in ath10k_htt_tx_free_txq() whenever vaddr
+is set, independent of the running firmware. Clear vaddr and paddr
+after every free of the buffer.
+
+With these changes, a start of the normal firmware after step 2 would
+dereference a NULL vaddr in push-pull mode. Therefore allocate the
+queue state buffer in ath10k_htt_tx_start() when it reuses tx memory
+without one and the running firmware has PEER_FLOW_CONTROL.
+
+Fixes: 9ec34a86195a ("ath10k: fix Tx DMA alloc failure during continuous wifi down/up")
+Assisted-by: Claude:claude-opus-5-5 sparse
+---
+ drivers/net/wireless/ath/ath10k/htt_tx.c | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath10k/htt_tx.c
++++ b/drivers/net/wireless/ath/ath10k/htt_tx.c
+@@ -415,14 +415,15 @@ static void ath10k_htt_tx_free_txq(struc
+ 	struct ath10k *ar = htt->ar;
+ 	size_t size;
+ 
+-	if (!test_bit(ATH10K_FW_FEATURE_PEER_FLOW_CONTROL,
+-		      ar->running_fw->fw_file.fw_features))
++	if (!htt->tx_q_state.vaddr)
+ 		return;
+ 
+ 	size = sizeof(*htt->tx_q_state.vaddr);
+ 
+ 	dma_unmap_single(ar->dev, htt->tx_q_state.paddr, size, DMA_TO_DEVICE);
+ 	kfree(htt->tx_q_state.vaddr);
++	htt->tx_q_state.vaddr = NULL;
++	htt->tx_q_state.paddr = 0;
+ }
+ 
+ static int ath10k_htt_tx_alloc_txq(struct ath10k_htt *htt)
+@@ -450,6 +451,8 @@ static int ath10k_htt_tx_alloc_txq(struc
+ 	if (ret) {
+ 		ath10k_warn(ar, "failed to dma map tx_q_state: %d\n", ret);
+ 		kfree(htt->tx_q_state.vaddr);
++		htt->tx_q_state.vaddr = NULL;
++		htt->tx_q_state.paddr = 0;
+ 		return -EIO;
+ 	}
+ 
+@@ -526,8 +529,18 @@ int ath10k_htt_tx_start(struct ath10k_ht
+ 	spin_lock_init(&htt->tx_lock);
+ 	idr_init(&htt->pending_tx);
+ 
+-	if (htt->tx_mem_allocated)
++	if (htt->tx_mem_allocated) {
++		/* The tx memory can come from the start of a firmware that
++		 * did not need the queue state buffer.
++		 */
++		if (!htt->tx_q_state.vaddr) {
++			ret = ath10k_htt_tx_alloc_txq(htt);
++			if (ret)
++				goto free_idr_pending_tx;
++		}
++
+ 		return 0;
++	}
+ 
+ 	if (ar->bus_param.dev_type == ATH10K_DEV_TYPE_HL)
+ 		return 0;
