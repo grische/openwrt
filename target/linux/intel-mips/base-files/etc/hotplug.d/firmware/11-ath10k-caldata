@@ -1,13 +1,14 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Per-unit ath10k calibration data for the AVM FRITZ!Box 7560, 7580 and 7590.
+# Per-unit ath10k calibration data for the AVM FRITZ!Box 7560, 7580, 7583 VDSL
+# and 7590.
 #
-# No board here ships an on-card EEPROM. On the 7560 and the 7590 the
-# calibration blobs live zlib-compressed in the urlader (mtd "urlader", the
-# first NAND partition) and have to be handed to the driver through the
-# firmware loader. The 7580 is the exception and carries no blob at all; its
-# arms below are deliberately empty and say why.
+# No board here ships an on-card EEPROM. On the 7560, the 7583 VDSL and the
+# 7590 the calibration blobs live zlib-compressed in the urlader (mtd
+# "urlader", the first NAND partition) and have to be handed to the driver
+# through the firmware loader. The 7580 is the exception and carries no blob
+# at all; its arms below are deliberately empty and say why.
 #
 # 7560: one QCA9882 (168c:003c, QCA988X hw2.0) behind the PCIe root
 # complex at 0x18900000, which xrx500.dtsi pins to PCI domain 0 via
@@ -24,6 +25,9 @@
 #
 # 7580: two QCA9984 as well, on the same two root complexes and therefore
 # asking under the same two names. It is answered with nothing, on purpose.
+#
+# 7583 VDSL: two QCA9984 at the 7590's two names, 5 GHz on domain 0 and
+# 2.4 GHz on domain 1. It takes the 7590's arms.
 #
 # What is in the urlader is AVM's prom_config record area, defined in the
 # GPL drops at drivers/char/avm_new/include/uapi/avm/enh/prom_uapi.h: a
@@ -45,7 +49,7 @@ case "$FIRMWARE" in
 	board=$(board_name)
 
 	case "$board" in
-	avm,fritz7590)
+	avm,fritz7583-vdsl|avm,fritz7590)
 		#
 		# Type 7 is the 5 GHz radio's blob and type 8 the 2.4 GHz one,
 		# the same pairing the 7560 uses — but here both are QCA9984
@@ -143,7 +147,7 @@ case "$FIRMWARE" in
 	board=$(board_name)
 
 	case "$board" in
-	avm,fritz7590)
+	avm,fritz7583-vdsl|avm,fritz7590)
 		#
 		# The 2.4 GHz radio: prom_config type 8. Everything else, the
 		# scan rationale and the failure cleanup included, as in the

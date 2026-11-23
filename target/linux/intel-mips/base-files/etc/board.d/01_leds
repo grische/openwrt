@@ -73,13 +73,14 @@ avm,fritz7560)
 	#
 	ucidef_set_led_netdev "wan" "WAN" "green:fon" "wan"
 	;;
-avm,fritz7580)
+avm,fritz7580|avm,fritz7583-vdsl)
 	#
-	# This board is the one of the three with a lamp that already means
-	# what the trigger says, so it does not borrow Fon the way the other
-	# two do: AVM's device tree gives SSO pin 6 the name "internet", and
-	# an Internet lamp following the wan interface is the mapping the
-	# silkscreen already promises. Fon is left alone here as a result.
+	# The 7580 is the one of the first three boards with a lamp that
+	# already means what the trigger says, so it does not borrow Fon the
+	# way the other two do: AVM's device tree gives SSO pin 6 the name
+	# "internet", and an Internet lamp following the wan interface is the
+	# mapping the silkscreen already promises. Fon is left alone here as a
+	# result.
 	#
 	# Unlike the 7560 and like the 7590, this board has a real WAN
 	# jack behind the fifth GSWIP port, so 02_network declares a wan
@@ -96,6 +97,11 @@ avm,fritz7580)
 	# calls it "internet"; the panel of a 7580 carries such a lamp. The
 	# DTS follows that file and so does this line. Were a name ever to
 	# turn out wrong, the fix is a rename here and in the DTS.
+	#
+	# The 7583 VDSL has an internet lamp as well, on SSO pin 4. AVM's lamp
+	# file for that board names it, and seale_avm_fritz7583_vdsl.dts
+	# follows the file. The LED name is the same, so the same line serves
+	# both boards.
 	#
 	ucidef_set_led_netdev "wan" "WAN" "green:internet" "wan"
 	;;

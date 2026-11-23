@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Image rules for the AVM "Seale" boards, all five devices of the single xrx500
-# subtarget. The FRITZ!Box 7560 is a GRX350 board. The FRITZ!Box 7580, the 7590
-# and the two variants of the 7590 AX are GRX550 boards. They share a file
-# because they share the whole EVA image pipeline and the load addresses below;
-# what differs is per-device and lives in the device blocks.
+# Image rules for the AVM "Seale" boards, all six devices of the single xrx500
+# subtarget. The FRITZ!Box 7560 is a GRX350 board. The FRITZ!Box 7580, the 7583
+# VDSL, the 7590 and the two variants of the 7590 AX are GRX550 boards. They
+# share a file because they share the whole EVA image pipeline and the load
+# addresses below; what differs is per-device and lives in the device blocks.
 #
 # KERNEL_LOADADDR / KERNEL_ENTRY. There is no target-wide default to inherit,
 # and the generic MIPS value is wrong for this family under EVA in any case.
@@ -415,6 +415,45 @@ define Device/avm_fritz7580
 	kmod-leds-lgm-sso
 endef
 
+# AVM FRITZ!Box 7583 VDSL, hardware revision HW260 on the GRX550. AVM composes
+# its device tree from the shared GRX550 layer and the FRITZ!Box 7583's lamp
+# file. Its flash map, its memory size and its radios are the 7590's. This
+# block therefore takes the 7590's values, and every comment in the 7590 block
+# above applies to it unless one here says otherwise.
+define Device/avm_fritz7583-vdsl
+  $(Device/AVM)
+  $(Device/NAND)
+  DEVICE_MODEL := FRITZ!Box 7583
+  DEVICE_VARIANT := VDSL
+  SOC := xrx500
+  # n for the same reason as the boards above.
+  DEFAULT := n
+  DEVICE_DTS := seale_avm_fritz7583_vdsl
+  # The 7590's chain, restated for the reasons given there.
+  KERNEL := kernel-bin | append-dtb | append-sacrificial-dtb | avm-preamble | eva-single-kernel
+  KERNEL_INITRAMFS := kernel-bin | append-dtb | append-sacrificial-dtb | avm-preamble | eva-single-kernel
+  # Both kernel slots are 8 MiB, as on the 7590.
+  KERNEL_SIZE := 8192k
+  # The ubi partition runs from 0x1500000 to the end of the 512 MiB chip, as on
+  # the 7590. That makes it 0x1eb00000 bytes or 502784 KiB.
+  IMAGE_SIZE := 502784k
+  # The flash is a Toshiba BENAND part of 512 MiB with a 4 KiB page. UBI uses
+  # a LEB of 258048 bytes and a sub-page of 1024 on it, which is the 7590's
+  # geometry.
+  BLOCKSIZE := 256k
+  PAGESIZE := 4096
+  SUBPAGESIZE := 1024
+  MKUBIFS_OPTS := -m 4096 -e 252KiB -c 4096
+  UBINIZE_OPTS := -E 5
+  # The 7590's list. Both radios are QCA9984 parts, and 11-ath10k-caldata
+  # extracts their calibration records as on the 7590, so fritz-caldata stays.
+  DEVICE_PACKAGES := fritz-tffs-nand fritz-caldata kmod-dsa-lantiq-gswip-xrx500 \
+	xrx500-phy11g-firmware \
+	pciutils kmod-ath10k ath10k-firmware-qca9984 wpad-basic-mbedtls \
+	kmod-usb-storage kmod-usb-storage-uas kmod-fs-vfat kmod-fs-ext4 block-mount usbutils \
+	kmod-leds-lgm-sso
+endef
+
 # AVM FRITZ!Box 7590 AX, hardware revision HW259 on the GRX550. AVM's device
 # tree for it is the 7590's with other radios, and its flash map has a larger
 # TFFS. This template therefore takes the 7590's values, and every comment in
@@ -474,7 +513,7 @@ define Device/avm_fritz7590ax-v2
   DEVICE_DTS := seale_avm_fritz7590ax_v2
 endef
 
-# All five devices, in the one subtarget. This used to be a guarded block per
+# All six devices, in the one subtarget. This used to be a guarded block per
 # board, because the kernel carried a built-in DTB chosen at compile time:
 # naming more than one would have let a build produce one board's image on top
 # of a kernel holding another board's device tree, which assembles cleanly and
@@ -482,4 +521,5 @@ endef
 # image, so the kernel binary is board-agnostic and that failure no longer has
 # a mechanism — which is also what makes adding a device here free.
 TARGET_DEVICES += avm_fritz7560 avm_fritz7580 avm_fritz7590
+TARGET_DEVICES += avm_fritz7583-vdsl
 TARGET_DEVICES += avm_fritz7590ax avm_fritz7590ax-v2
