@@ -28,7 +28,7 @@ Assisted-by: Claude:claude-fable-5
 Signed-off-by: Grische <github@grische.xyz>
 
 diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
-index 83a6b68d8a39..a14646db07b3 100644
+index fadaeafae98e..78acdb02fd42 100644
 --- a/arch/mips/Kconfig
 +++ b/arch/mips/Kconfig
 @@ -468,7 +468,6 @@ config LANTIQ

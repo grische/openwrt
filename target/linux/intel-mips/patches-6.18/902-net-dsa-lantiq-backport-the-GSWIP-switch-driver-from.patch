@@ -14,14 +14,18 @@ port_setup were added. New SoC variants are meant to be written against
 that shape, so replace the v6.18 files with the net-next ones wholesale
 rather than forward-porting a variant onto the older layout later.
 
-Take the following byte for byte from net-next at c23807ef397c, where
-drivers/net/dsa/lantiq is tree
-c5b91afe67ba412d28200c883d986942553a042e:
+Take the following byte for byte from net-next at e6a5d573d24c ("net:
+dsa: drop explicit NULL comparisons"), where drivers/net/dsa/lantiq is
+tree c5b91afe67ba412d28200c883d986942553a042e:
 
   drivers/net/dsa/lantiq/lantiq_gswip_common.c  (new, 1727 lines)
   drivers/net/dsa/lantiq/lantiq_gswip.c
   drivers/net/dsa/lantiq/lantiq_gswip.h
   drivers/net/dsa/lantiq/lantiq_pce.h           (unchanged content)
+
+The one exception is GSWIP_MDIO_PHY_FCONTX_EN in lantiq_gswip.h, which
+keeps the value from commit 59fb389ad6bf ("net: dsa: lantiq_gswip: fix
+GSWIP_MDIO_PHY_FCONTX_EN value") in net, already part of v6.18.y.
 
 tag_gswip.c is taken with one change, which the two cores make
 necessary. It gains the FIELD_PREP(GSWIP_TX_PORT_MAP,

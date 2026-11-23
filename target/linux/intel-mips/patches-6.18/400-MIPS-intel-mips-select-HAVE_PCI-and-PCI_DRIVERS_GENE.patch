@@ -42,7 +42,7 @@ Assisted-by: Claude:claude-opus-5
 Signed-off-by: Grische <github@grische.xyz>
 
 diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
-index c1757c30a2aa..eddfc62918d9 100644
+index a36b39db7a79..b19b3eae1019 100644
 --- a/arch/mips/Kconfig
 +++ b/arch/mips/Kconfig
 @@ -488,11 +488,13 @@ config INTEL_MIPS

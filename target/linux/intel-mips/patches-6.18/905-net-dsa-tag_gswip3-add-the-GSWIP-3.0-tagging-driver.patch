@@ -48,7 +48,7 @@ Assisted-by: Claude:claude-fable-5-1
 Signed-off-by: Grische <github@grische.xyz>
 
 diff --git a/MAINTAINERS b/MAINTAINERS
-index d4fa41fb387f..0804a1898c19 100644
+index 737123787151..53afc8b9567d 100644
 --- a/MAINTAINERS
 +++ b/MAINTAINERS
 @@ -14090,6 +14090,7 @@ F:	Documentation/devicetree/bindings/net/dsa/lantiq,gswip.yaml
@@ -60,27 +60,27 @@ index d4fa41fb387f..0804a1898c19 100644
  LANTIQ MIPS ARCHITECTURE
  M:	John Crispin <john@phrozen.org>
 diff --git a/include/net/dsa.h b/include/net/dsa.h
-index 60f1aec0e697..6cd8ed180ffd 100644
+index d6dafebacc7a..7707b2e81488 100644
 --- a/include/net/dsa.h
 +++ b/include/net/dsa.h
-@@ -57,6 +57,7 @@ struct tc_action;
- #define DSA_TAG_PROTO_BRCM_LEGACY_FCS_VALUE	29
- #define DSA_TAG_PROTO_MXL862_VALUE		30
- #define DSA_TAG_PROTO_MXL862_8021Q_VALUE	31
+@@ -60,6 +60,7 @@ struct tc_action;
+ #define DSA_TAG_PROTO_YT921X_VALUE		32
+ #define DSA_TAG_PROTO_YT922X_VALUE		33
+ #define DSA_TAG_PROTO_YT922X_4B_VALUE		34
 +#define DSA_TAG_PROTO_GSWIP3_VALUE		35
  
  enum dsa_tag_protocol {
  	DSA_TAG_PROTO_NONE		= DSA_TAG_PROTO_NONE_VALUE,
-@@ -91,6 +92,7 @@ enum dsa_tag_protocol {
- 	DSA_TAG_PROTO_VSC73XX_8021Q	= DSA_TAG_PROTO_VSC73XX_8021Q_VALUE,
- 	DSA_TAG_PROTO_MXL862		= DSA_TAG_PROTO_MXL862_VALUE,
- 	DSA_TAG_PROTO_MXL862_8021Q	= DSA_TAG_PROTO_MXL862_8021Q_VALUE,
+@@ -97,6 +98,7 @@ enum dsa_tag_protocol {
+ 	DSA_TAG_PROTO_YT921X		= DSA_TAG_PROTO_YT921X_VALUE,
+ 	DSA_TAG_PROTO_YT922X		= DSA_TAG_PROTO_YT922X_VALUE,
+ 	DSA_TAG_PROTO_YT922X_4B		= DSA_TAG_PROTO_YT922X_4B_VALUE,
 +	DSA_TAG_PROTO_GSWIP3		= DSA_TAG_PROTO_GSWIP3_VALUE,
  };
  
  struct dsa_switch;
 diff --git a/net/dsa/Kconfig b/net/dsa/Kconfig
-index 2a37bee623e8..fbc4226f4f15 100644
+index 1b2b351847ce..6014a34c03c9 100644
 --- a/net/dsa/Kconfig
 +++ b/net/dsa/Kconfig
 @@ -81,6 +81,17 @@ config NET_DSA_TAG_GSWIP
@@ -102,7 +102,7 @@ index 2a37bee623e8..fbc4226f4f15 100644
  	tristate
  
 diff --git a/net/dsa/Makefile b/net/dsa/Makefile
-index ad86a82f1b5f..a2fad2fc74cd 100644
+index b40352a42137..592c7a846ed3 100644
 --- a/net/dsa/Makefile
 +++ b/net/dsa/Makefile
 @@ -24,6 +24,7 @@ obj-$(CONFIG_NET_DSA_TAG_AR9331) += tag_ar9331.o

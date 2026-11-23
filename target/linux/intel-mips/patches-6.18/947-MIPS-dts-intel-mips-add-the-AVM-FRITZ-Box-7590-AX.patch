@@ -36,7 +36,7 @@ them has an in-tree driver. The vendor's grx_common.dtsi gives RC2 the
 them.
 
 The front-panel controller changes in one place. The update rate is
-10 Hz, for the reason given in commit 88adfeba8894 ("MIPS: dts:
+10 Hz, for the reason given in commit eac84aaf8fcc ("MIPS: dts:
 intel-mips: add the AVM FRITZ!Box 7580"). The die layer's 250 kHz
 selects a timer outside the SSO block that nothing in this kernel
 programs. 10 Hz is the fastest rate that selects the block's own divided

@@ -1,0 +1,435 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 23 Nov 2026 18:02:40 +0100
+Subject: MIPS: dts: intel-mips: add the AVM FRITZ!Box 7583 VDSL
+
+The FRITZ!Box 7583 VDSL is AVM hardware revision HW260, built on the
+same GRX550 die as the FRITZ!Box 7580 and 7590. The vendor's hw260.dtsi
+includes the shared GRX550 layer grx550_common.dtsi and the lamp file
+leds-hw239.dtsi and adds nothing else. This file starts from the 7580's,
+because that one needs the fewest edits. The switch wiring, USB, the
+memory map with its reservations, the flash map and the LED enable stay
+as they are in the 7580's file. The info, power and wlan lamps and the
+dect key stay as well.
+
+Six things differ from the 7580.
+
+The revision is 260 and the sub-revision tag is 0, which is the key that
+the vendor's Fritz_Box_HW260.dts gives this board. The boot image
+carries a table of device-tree blobs keyed by hardware sub-revision. The
+boot loader takes the entry that matches the unit's value or else a
+lower one. The one unit on record reports 1 and boots the entry keyed 0.
+
+RC2 has inbound byte swapping on, which is the value that the vendor's
+grx_common.dtsi sets. The 7580's value of 0 comes from vrx318.dtsi,
+which hw225.dtsi includes and hw260.dtsi does not. The part on RC2 has
+the PCI ID 8086:09aa and no in-tree driver, so the comment names it by
+its ID.
+
+The front-panel controller's shift clock is no longer set, which leaves
+the driver's 25 MHz default that grx550_common.dtsi asks for. The 7580's
+3.125 MHz comes from hw225.dtsi, which hw260.dtsi does not include.
+
+Pin 4 of the front-panel controller drives the internet lamp and pin 6
+drives the Fon lamp, which is the order that leds-hw239.dtsi gives and
+the reverse of the 7580's.
+
+The wlan key is on gpio1 0 rather than gpio0 7, as leds-hw239.dtsi gives
+it. With the 7580's file, the wlan key reads as held down on the unit on
+record, because gpio0 7 reads low there.
+
+The third key keeps its line and its keycode and is now named connect,
+as the 08.26 copy of leds-hw239.dtsi names it.
+
+The comments follow those of seale_avm_fritz7590ax.dts, so in places
+they say more than the 7580's. The memory comment states that the full
+512 MiB is unsafe while a boot loader built for a 256 MiB board, such as
+the GRX350's, runs on the second CPU. The vendor's ngi.c denies access
+above the memory size that the second CPU's device tree declares. The
+vendor's tree for this board's second CPU, Fritz_Box_HW0260.dts,
+declares 512 MiB.
+
+Tested on one FRITZ!Box 7583 VDSL by RAM boot, by an install to flash
+from the RAM-booted image and by a sysupgrade. The tests used Ethernet
+on one LAN port, and both radios ran as access points that a scan from a
+second device saw. The flash partitions appear as described, UBI
+attaches, the six lamps and the three keys register and both USB
+controllers enumerate. Wi-Fi clients, the WAN jack, the other LAN ports,
+USB devices, the lamps and the keys were not exercised.
+
+Sources: hw260.dtsi, leds-hw239.dtsi, grx550_common.dtsi,
+grx_common.dtsi, grx550_bootcore.dtsi, Fritz_Box_HW260.dts and
+Fritz_Box_HW0260.dts under arch/mips/boot/dts/lantiq/avm/ and
+arch/mips/lantiq/grx500_bootcore/ngi.c in the vendor's 08.26 GPL release
+for the FRITZ!Box 7583 VDSL. vrx318.dtsi, hw225.dtsi and an older copy
+of leds-hw239.dtsi come from the vendor's 07.29 GPL release for the
+FRITZ!Box 7580. That older copy puts the three keys on the same lines
+and calls the third one wps. grx350_bootcore.dtsi comes from the
+vendor's 07.30 GPL release for the FRITZ!Box 7560. The flash map, the
+memory size and the sub-revision come from the unit's boot-loader
+environment. The environment sample on boxmatrix.info, page "FRITZ!Box
+7583 VDSL" as archived on 2026-01-04, reads the same values. The boot
+with the entry keyed 0 was observed on the unit. The PCI ID comes from
+this kernel running on the unit, and the level of gpio0 7 comes from the
+same kernel running with the 7580's file.
+
+Link: https://web.archive.org/web/20260104084950/https://www.boxmatrix.info/wiki/FRITZ!Box_7583_VDSL
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/Makefile b/arch/mips/boot/dts/intel-mips/Makefile
+index 556efe484752..79b01363c840 100644
+--- a/arch/mips/boot/dts/intel-mips/Makefile
++++ b/arch/mips/boot/dts/intel-mips/Makefile
+@@ -2,6 +2,7 @@
+ dtb-y	+= easy350_anywan.dtb
+ dtb-y	+= seale_avm_fritz7560.dtb
+ dtb-y	+= seale_avm_fritz7580.dtb
++dtb-y	+= seale_avm_fritz7583_vdsl.dtb
+ dtb-y	+= seale_avm_fritz7590.dtb
+ dtb-y	+= seale_avm_fritz7590ax.dtb
+ dtb-y	+= seale_avm_fritz7590ax_v2.dtb
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7583_vdsl.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7583_vdsl.dts
+new file mode 100644
+index 000000000000..47b79a91b6f5
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7583_vdsl.dts
+@@ -0,0 +1,338 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Copyright (C) 2026 Grische <github@grische.xyz>
++/*
++ * The AVM FRITZ!Box 7583 VDSL is hardware revision HW260 on the GRX550 die
++ * for HWSubRevision 0 and 1.
++ * This file holds only its board-specific data. The SoC is described in
++ * xrx500.dtsi, the board family in seale_avm.dtsi and the die variant in
++ * seale_avm_grx550.dtsi.
++ */
++/dts-v1/;
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/leds/common.h>
++
++#include "seale_avm_grx550.dtsi"
++
++/ {
++	model = "AVM FRITZ!Box 7583 VDSL";
++	compatible = "avm,fritz7583-vdsl", "intel,xrx500";
++
++	/*
++	 * The boot image carries a table of device-tree blobs keyed by
++	 * hardware sub-revision, and the boot loader looks the unit's value
++	 * up in it or takes a lower entry. This tree takes 0, the vendor's
++	 * own key for this board.
++	 */
++	avm-hw-revision {
++		compatible = "avm,avm_hw_revision";
++		revision = "260";
++		subrevision = "0";
++	};
++
++	/*
++	 * The node covers the full 512 MiB DDR part at PHYS_OFFSET.
++	 *
++	 * Only the first half of it has an uncached alias. Above
++	 * PHYS_OFFSET + SZ_256M, the KSEG1 alias of a page is a register
++	 * address rather than DRAM. ZONE_DMA is sized to the window, and
++	 * dma-direct takes every uncached coherent allocation from there.
++	 * Holding the bound therefore does not cost the board half its
++	 * memory. Cached access is good across the whole node, since KSEG0
++	 * covers all of it.
++	 *
++	 * The full width is safe only while no boot loader built for a
++	 * 256 MiB board runs on the second CPU. Such a loader denies fabric
++	 * access above PHYS_OFFSET + SZ_256M, which is the upper half of this
++	 * node. A kernel shipped in a single-kernel container leaves the
++	 * second CPU's boot loader unstarted.
++	 */
++	memory@20000000 {
++		device_type = "memory";
++		reg = <0x20000000 0x20000000>;
++	};
++
++	/*
++	 * These aliases name the boot, failsafe and upgrade lamps for
++	 * userspace. Without them, the boot-progress indication is silently
++	 * absent.
++	 */
++	aliases {
++		serial0 = &asc0;
++
++		led-boot = &led_power;
++		led-running = &led_power;
++		led-failsafe = &led_info_red;
++		led-upgrade = &led_info;
++		led-wifi = &led_wlan;
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++		/*
++		 * This property is unused while MIPS_CMDLINE_BUILTIN_EXTEND
++		 * is selected. It is present so that a board that needs its
++		 * own arguments has somewhere to put them.
++		 */
++		bootargs = "";
++	};
++
++	/*
++	 * Any region below that a device reaches through the uncached alias
++	 * must stay under PHYS_OFFSET + SZ_256M. Above that address, the
++	 * alias reaches registers, not DRAM. The seed buffer at the end is
++	 * the one region that sits higher. It may, because it is no-map and
++	 * this kernel never reaches it at all.
++	 */
++	reserved-memory {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++
++		/*
++		 * Crash persistence sits at the address the vendor's own
++		 * device tree uses for it. The vendor's node is named
++		 * ramoops@20500000, but its reg says 0x20100000. It takes
++		 * 1 MiB of the 4 MiB region below _text. The zone sizes fill
++		 * reg exactly, since fs/pstore/ram.c fails the whole probe if
++		 * they overflow it.
++		 */
++		ramoops@20100000 {
++			compatible = "ramoops";
++			reg = <0x20100000 0x100000>;
++			record-size = <0x4000>;
++			console-size = <0x80000>;
++			mem-type = <1>;
++		};
++
++		/*
++		 * This is the rest of the region that seale_avm.dtsi reserves.
++		 * The crash log above has taken its first megabyte.
++		 */
++		/delete-node/ avm-reserved@20100000;
++
++		avm-reserved@20200000 {
++			reg = <0x20200000 0x300000>;
++			no-map;
++		};
++
++		/*
++		 * This region is owned by the second CPU's boot loader. The
++		 * vendor ships a device tree of its own for that core. The
++		 * region is no-map so that this kernel never maps another
++		 * CPU's memory.
++		 */
++		cpunet@2dfc0000 {
++			reg = <0x2dfc0000 0x40000>;
++			no-map;
++		};
++
++		bootcore@2e000000 {
++			reg = <0x2e000000 0x2000000>;
++			no-map;
++		};
++
++		/*
++		 * This is a fixed-address seed buffer shared with the second
++		 * CPU. It is reserved no-map so that nothing here maps or
++		 * reads it.
++		 */
++		shm-rng-seed@3dfb0000 {
++			reg = <0x3dfb0000 0x1000>;
++			no-map;
++		};
++	};
++};
++
++/*
++ * The flash is a Toshiba BENAND part of 512 MiB with a 4 KiB page. Its
++ * geometry is self-identified. The partition map is the one the vendor boot
++ * loader installs, so a vendor recovery can hand the kernel back to the
++ * original firmware without remapping flash. The labels are ABI, because
++ * sysupgrade addresses partitions by label. They must not be renamed.
++ */
++&nand0 {
++	partitions {
++		compatible = "fixed-partitions";
++		#address-cells = <1>;
++		#size-cells = <1>;
++
++		/*
++		 * This partition holds the first-stage boot loader. It is
++		 * read-only, because overwriting it bricks the device past the
++		 * point of recovery without an external programmer.
++		 */
++		partition@0 {
++			label = "urlader";
++			reg = <0x0 0x100000>;
++			read-only;
++		};
++
++		/*
++		 * This is the AVM TFFS environment. It holds the only copy of
++		 * this unit's identity, its MAC addresses and serial number.
++		 * It is never written from Linux. Erasing it cannot be undone.
++		 */
++		partition@100000 {
++			label = "nand-tffs";
++			reg = <0x100000 0x400000>;
++			read-only;
++		};
++
++		/*
++		 * Two 8 MiB kernel slots follow, named by position. Which one
++		 * is active is boot-loader run-time state. The linux_fs_start
++		 * variable selects between them. No label may therefore claim
++		 * to be the active one.
++		 */
++		partition@500000 {
++			label = "kernel0";
++			reg = <0x500000 0x800000>;
++		};
++
++		partition@d00000 {
++			label = "kernel1";
++			reg = <0xd00000 0x800000>;
++		};
++
++		/* UBI holds rootfs and rootfs_data up to the 512 MiB mark. */
++		partition@1500000 {
++			label = "ubi";
++			reg = <0x1500000 0x1eb00000>;
++		};
++	};
++};
++
++/*
++ * RC0 and RC1 carry the two QCA9984 radios. The PCI domain numbers are
++ * ABI-visible, because userspace names the radios 0000:01:00.0 and
++ * 0001:01:00.0. RC2 carries a part with the PCI ID 8086:09aa, which has no
++ * in-tree driver. Inbound byte swapping stays on for this part.
++ */
++&pcie2 {
++	status = "okay";
++	intel,inbound-swap = <1>;
++	intel,outbound-swap = <0>;
++	reset-gpios = <&gpio0 16 GPIO_ACTIVE_LOW>;
++};
++
++/*
++ * Front-panel lamps.
++ *
++ * The shift-register controller they hang off is a GRX550 fact and lives in
++ * seale_avm_grx550.dtsi. What is board data is which of its eight pins are
++ * populated and what each one drives. All six declared here are visible
++ * lamps.
++ *
++ * No shift clock rate is stated, which leaves the driver's 25 MHz default.
++ * That is the rate the vendor's GRX550 layer asks for, and the vendor's tree
++ * for this board does not lower it.
++ *
++ * The die layer's 250 kHz update rate selects a timer outside the SSO block,
++ * which nothing in this kernel programs. Unless that timer already runs, no
++ * output word ever reaches the shift register. A 10 Hz rate is the fastest
++ * that selects the SSO block's own divided clock instead.
++ */
++&ssogpio {
++	intel,sso-update-rate-hz = <10>;
++
++	/*
++	 * The child must be named "ssoled", because the driver matches on
++	 * the node name. The LEDs carry no label property, since colour and
++	 * function compose the ABI-visible LED name.
++	 */
++	ssoled {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		/* The two halves of the bicolour info lamp. */
++		led_info: led@2 {
++			reg = <2>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = "info";
++			gpios = <&ssogpio 2 GPIO_ACTIVE_HIGH>;
++		};
++
++		led_info_red: led@3 {
++			reg = <3>;
++			color = <LED_COLOR_ID_RED>;
++			function = "info";
++			gpios = <&ssogpio 3 GPIO_ACTIVE_HIGH>;
++		};
++
++		led@4 {
++			reg = <4>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = "internet";
++			gpios = <&ssogpio 4 GPIO_ACTIVE_HIGH>;
++		};
++
++		led_wlan: led@5 {
++			reg = <5>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = LED_FUNCTION_WLAN;
++			gpios = <&ssogpio 5 GPIO_ACTIVE_HIGH>;
++		};
++
++		led@6 {
++			reg = <6>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = "fon";
++			gpios = <&ssogpio 6 GPIO_ACTIVE_HIGH>;
++		};
++
++		/*
++		 * The lamp is lit as soon as the driver probes. It is already
++		 * on when the kernel starts, and blinking it off mid-boot would
++		 * read as a failed boot. The line is active low.
++		 */
++		led_power: led@7 {
++			reg = <7>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = LED_FUNCTION_POWER;
++			gpios = <&ssogpio 7 GPIO_ACTIVE_LOW>;
++			default-state = "on";
++		};
++	};
++};
++
++/* The keys are polled, because the GPIO banks publish no irq domain. */
++/ {
++	keys {
++		compatible = "gpio-keys-polled";
++		poll-interval = <100>;
++
++		button-dect {
++			label = "dect";
++			linux,code = <KEY_PHONE>;
++			gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
++		};
++
++		button-wlan {
++			label = "wlan";
++			linux,code = <KEY_RFKILL>;
++			gpios = <&gpio1 0 GPIO_ACTIVE_LOW>;
++		};
++
++		button-connect {
++			label = "connect";
++			linux,code = <KEY_WPS_BUTTON>;
++			gpios = <&gpio0 1 GPIO_ACTIVE_LOW>;
++		};
++	};
++};
++
++/*
++ * The master LED enable is a plain GPIO rather than an SSO pin. Nothing in
++ * this tree consumes it, which is why it is hogged. The whole panel is dark
++ * while it is low.
++ */
++&gpio1 {
++	led-enable-hog {
++		gpio-hog;
++		gpios = <11 GPIO_ACTIVE_LOW>;
++		output-high;
++		line-name = "led-enable";
++	};
++};

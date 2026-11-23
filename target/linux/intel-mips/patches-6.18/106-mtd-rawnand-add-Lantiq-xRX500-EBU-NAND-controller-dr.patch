@@ -24,10 +24,10 @@ Assisted-by: Claude:claude-fable-5
 Signed-off-by: Grische <github@grische.xyz>
 
 diff --git a/drivers/mtd/nand/raw/Kconfig b/drivers/mtd/nand/raw/Kconfig
-index 7408f34f0c68..ad1fa7321060 100644
+index 2aba02ebe03e..f11f9c28ca38 100644
 --- a/drivers/mtd/nand/raw/Kconfig
 +++ b/drivers/mtd/nand/raw/Kconfig
-@@ -395,6 +395,15 @@ config MTD_NAND_INTEL_LGM
+@@ -396,6 +396,15 @@ config MTD_NAND_INTEL_LGM
  	  Enables support for NAND Flash chips on Intel's LGM SoC.
  	  NAND flash controller interfaced through the External Bus Unit.
  

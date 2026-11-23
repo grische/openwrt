@@ -66,7 +66,7 @@ index 41a00fa860c1..63718207fe06 100644
  platform-$(CONFIG_LANTIQ)		+= lantiq/
  platform-$(CONFIG_MACH_LOONGSON2EF)	+= loongson2ef/
 diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
-index a14646db07b3..c1757c30a2aa 100644
+index 78acdb02fd42..a36b39db7a79 100644
 --- a/arch/mips/Kconfig
 +++ b/arch/mips/Kconfig
 @@ -476,6 +476,34 @@ config LANTIQ
@@ -104,7 +104,7 @@ index a14646db07b3..c1757c30a2aa 100644
  config MACH_LOONGSON32
  	bool "Loongson 32-bit family of machines"
  	select MACH_GENERIC_CORE
-@@ -1064,6 +1092,7 @@ source "arch/mips/bmips/Kconfig"
+@@ -1065,6 +1093,7 @@ source "arch/mips/bmips/Kconfig"
  source "arch/mips/econet/Kconfig"
  source "arch/mips/generic/Kconfig"
  source "arch/mips/ingenic/Kconfig"

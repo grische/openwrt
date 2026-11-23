@@ -102,7 +102,7 @@ index ee9fd0150f48..f05d789716fa 100644
  # Select if the architectures provides the arch_dma_clear_uncached symbol
  # to undo an in-place page table remap for uncached access.
 diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
-index eddfc62918d9..edf3c1401292 100644
+index b19b3eae1019..0dddc481572a 100644
 --- a/arch/mips/Kconfig
 +++ b/arch/mips/Kconfig
 @@ -478,6 +478,7 @@ config LANTIQ
